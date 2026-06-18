@@ -12,4 +12,5 @@ const (
 type IRQInjector interface {
 	InjectVirtioNetIRQ() error
 	InjectVirtioBlkIRQ() error
+	InjectVirtioGPUIRQ() error
 }

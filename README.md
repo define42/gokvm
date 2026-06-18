@@ -15,6 +15,7 @@ The latest version supports the following features:
 - [x] serial console
 - [x] virtio-net (virtio 1.0, modern PCI transport)
 - [x] virtio-blk (virtio 1.0, modern PCI transport)
+- [x] virtio-gpu (virtio 1.0, 2D; frames written to PNG via `-g`)
 - [x] PVH Boot Protocol
 
 **This is an experimental project, so please do not use it in production.**

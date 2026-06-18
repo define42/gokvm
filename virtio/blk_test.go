@@ -27,6 +27,10 @@ func (c *countingInjector) InjectVirtioBlkIRQ() error {
 	return nil
 }
 
+func (c *countingInjector) InjectVirtioGPUIRQ() error {
+	return nil
+}
+
 func TestBlkGetDeviceHeader(t *testing.T) {
 	t.Parallel()
 

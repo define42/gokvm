@@ -26,6 +26,12 @@ func (m *mockInjector) InjectVirtioBlkIRQ() error {
 	return nil
 }
 
+func (m *mockInjector) InjectVirtioGPUIRQ() error {
+	m.called = true
+
+	return nil
+}
+
 // newSplitQueue builds a stand-alone split virtqueue for tests. The rings live
 // in ordinary Go memory; only descriptor data addresses point into mem.
 func newSplitQueue() *virtio.SplitQueue {

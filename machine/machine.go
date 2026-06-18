@@ -38,6 +38,7 @@ const (
 	serialIRQ    = 4
 	virtioNetIRQ = 9
 	virtioBlkIRQ = 10
+	virtioGPUIRQ = 11
 
 	pageTableBase = 0x30_000
 
@@ -240,6 +241,16 @@ func (m *Machine) AddDisk(diskPath string) error {
 
 	go v.IOThreadEntry()
 	// 00:02.0 for Virtio blk
+	m.pci.Devices = append(m.pci.Devices, v)
+
+	return nil
+}
+
+func (m *Machine) AddGPU(outputPath string) error {
+	v := virtio.NewGPU(virtioGPUIRQ, m, m.mem, virtio.NewPNGDisplay(outputPath))
+
+	go v.IOThreadEntry()
+	// 00:03.0 for Virtio gpu
 	m.pci.Devices = append(m.pci.Devices, v)
 
 	return nil
@@ -1069,6 +1080,19 @@ func (m *Machine) InjectVirtioBlkIRQ() error {
 	}
 
 	if err := kvm.IRQLineStatus(m.vmFd, virtioBlkIRQ, 1); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// InjectVirtioGPUIRQ injects a virtio gpu interrupt.
+func (m *Machine) InjectVirtioGPUIRQ() error {
+	if err := kvm.IRQLineStatus(m.vmFd, virtioGPUIRQ, 0); err != nil {
+		return err
+	}
+
+	if err := kvm.IRQLineStatus(m.vmFd, virtioGPUIRQ, 1); err != nil {
 		return err
 	}
 

@@ -22,6 +22,7 @@ type Config struct {
 	Params     string
 	TapIfName  string
 	Disk       string
+	GPU        string
 	NCPUs      int
 	MemSize    int
 	TraceCount int
@@ -54,6 +55,12 @@ func (v *VMM) Init() error {
 
 	if len(v.Disk) > 0 {
 		if err := m.AddDisk(v.Disk); err != nil {
+			return err
+		}
+	}
+
+	if len(v.GPU) > 0 {
+		if err := m.AddGPU(v.GPU); err != nil {
 			return err
 		}
 	}

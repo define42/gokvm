@@ -19,6 +19,7 @@ type BootArgs struct {
 	Params     string
 	TapIfName  string
 	Disk       string
+	GPU        string
 	TraceCount int
 }
 
@@ -42,6 +43,8 @@ func parseBootArgs(args []string) (*BootArgs, error) {
 	bootCmd.StringVar(&c.TapIfName, "t", "", `name of tap interface. `+
 		`If the string is an empty, no tap intarface is created. (default"")`)
 	bootCmd.StringVar(&c.Disk, "d", "", "path of disk file (for /dev/vda)")
+	bootCmd.StringVar(&c.GPU, "g", "", `path to write the virtio-gpu framebuffer as PNG. `+
+		`If empty, no virtio-gpu device is created. (default "")`)
 
 	bootCmd.IntVar(&c.NCPUs, "c", 1, "number of cpus")
 

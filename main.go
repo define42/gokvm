@@ -23,6 +23,7 @@ func main() {
 			Params:     bootArgs.Params,
 			TapIfName:  bootArgs.TapIfName,
 			Disk:       bootArgs.Disk,
+			GPU:        bootArgs.GPU,
 			NCPUs:      bootArgs.NCPUs,
 			MemSize:    bootArgs.MemSize,
 			TraceCount: bootArgs.TraceCount,
