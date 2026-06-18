@@ -38,7 +38,7 @@ if [ $? -ne 0 ]; then
     -files `which awk` \
     -files `which grep` \
     -files `which cut` \
-    -files "/usr/share/terminfo/l/linux-c:/usr/share/terminfo/l/linux" \
+    -files "/usr/share/terminfo/l/linux" \
     -files "/usr/share/misc/pci.ids" \
     -files "${pwd}/.bashrc:.bashrc" \
     -files "/dev/null:$md5sum" \
