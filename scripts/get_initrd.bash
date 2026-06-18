@@ -22,6 +22,14 @@ if [ $? -ne 0 ]; then
   # GOPATH needs to be set.
   # Something weird here: if I use $SHELL in this it expands to /bin/sh *in this makefile*, but not outside. WTF?
   pwd=$(pwd)
+
+  # The "linux" console terminfo entry lives in different places across distros:
+  # /lib/terminfo on Debian/Ubuntu (ncurses-base), /usr/share/terminfo on Fedora.
+  # Locate it at build time and stage it at a stable path inside the initrd so
+  # the guest's ncurses tools (clear, tic, bash) find it.
+  terminfo_linux=$(find /lib/terminfo /usr/lib/terminfo /usr/share/terminfo /etc/terminfo \
+    -path '*/l/linux' 2>/dev/null | head -n1)
+
   (cd ${GOPATH}/src/github.com/u-root/u-root && \
     u-root \
     -defaultsh `which bash` \
@@ -38,7 +46,7 @@ if [ $? -ne 0 ]; then
     -files `which awk` \
     -files `which grep` \
     -files `which cut` \
-    -files "/usr/share/terminfo/l/linux" \
+    -files "${terminfo_linux}:/usr/share/terminfo/l/linux" \
     -files "/usr/share/misc/pci.ids" \
     -files "${pwd}/.bashrc:.bashrc" \
     -files "/dev/null:$md5sum" \
