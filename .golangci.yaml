@@ -25,6 +25,7 @@ linters:
     - godoclint
     - gomodguard
     - inamedparam
+    - intrange
     - ireturn
     - mnd
     - modernize

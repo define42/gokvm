@@ -416,7 +416,6 @@ func TestIoctlStringer(t *testing.T) {
 		{name: "Last error", val: kvm.EXITINTERNALERROR, want: "EXITINTERNALERROR"},
 		{name: "Out of range error", val: kvm.ExitType(1024), want: "ExitType(1024)"},
 	} {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			got := test.val.String()

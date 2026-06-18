@@ -110,7 +110,6 @@ func TestGdtEntry(t *testing.T) {
 			},
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			res := pvh.GdtEntry(tt.flag, tt.base, tt.limit)

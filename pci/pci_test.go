@@ -27,7 +27,6 @@ func TestSizeToBits(t *testing.T) {
 			expected: 0x0,
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			if tt.expected != pci.SizeToBits(tt.input) {
@@ -171,7 +170,6 @@ func TestPciConfAddrInOut(t *testing.T) {
 			exp:  nil,
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			if err := p.PciConfAddrIn(tt.port, tt.data); !errors.Is(err, tt.exp) {
@@ -210,7 +208,6 @@ func TestPciConfDataInOut(t *testing.T) {
 			exp:  nil,
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			if err := tt.pci.PciConfDataIn(tt.port, tt.data); !errors.Is(err, tt.exp) {

@@ -45,7 +45,6 @@ func TestCapabilityStringer(t *testing.T) {
 			want:  "Capability(255)",
 		},
 	} {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			if test.value.String() != test.want {
