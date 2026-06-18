@@ -1,8 +1,6 @@
 package virtio
 
 import (
-	"bytes"
-	"encoding/binary"
 	"errors"
 	"io"
 	"log"
@@ -11,7 +9,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"unsafe"
 
 	"github.com/bobuhiro11/gokvm/pci"
 )
@@ -25,23 +22,34 @@ var (
 )
 
 const (
-	NetIOPortStart = 0x6200
-	NetIOPortSize  = 0x100
+	// netHdrLen is sizeof(struct virtio_net_hdr_v1). Under
+	// VIRTIO_F_VERSION_1 the header is always 12 bytes (it carries
+	// num_buffers unconditionally), unlike the 10-byte legacy header.
+	netHdrLen = 12
+
+	// Virtqueue indices.
+	netRxQueue   = 0
+	netTxQueue   = 1
+	netNumQueues = 2
+
+	// NetMMIOBase is the guest-physical base of the net device's memory
+	// BAR. It sits in the 32-bit MMIO hole above the (small) guest RAM;
+	// the pci layer follows any reassignment the guest performs.
+	NetMMIOBase = 0xd000_0000
 )
 
-type netHdr struct {
-	commonHeader commonHeader
-	_            netHeader
-}
+// Net is a modern PCI device exposing capabilities and a memory BAR.
+var _ pci.CapsAndMMIO = (*Net)(nil)
 
+// Net is a modern (virtio 1.0) network device.
 type Net struct {
-	Hdr netHdr
-
-	VirtQueue    [2]*VirtQueue
-	Mem          []byte
-	LastAvailIdx [2]uint16
+	*ModernTransport
 
 	tap io.ReadWriter
+
+	// VirtQueue holds the split virtqueues once the driver enables them.
+	VirtQueue    [netNumQueues]*SplitQueue
+	LastAvailIdx [netNumQueues]uint16
 
 	txKick    chan interface{}
 	rxKick    chan os.Signal
@@ -52,31 +60,23 @@ type Net struct {
 	IRQInjector IRQInjector
 }
 
-func (h netHdr) Bytes() ([]byte, error) {
-	buf := new(bytes.Buffer)
-
-	if err := binary.Write(buf, binary.LittleEndian, h); err != nil {
-		return []byte{}, err
-	}
-
-	return buf.Bytes(), nil
-}
-
-type netHeader struct {
-	_ [6]uint8 // mac
-	_ uint16   // netStatus
-	_ uint16   // maxVirtQueuePairs
-}
-
 func (v *Net) GetDeviceHeader() pci.DeviceHeader {
 	return pci.DeviceHeader{
-		DeviceID:    0x1000,
+		// 0x1040 + virtio device id (1 = net). The 0x1041 id marks a
+		// non-transitional device, so the driver uses the modern
+		// interface and requires VIRTIO_F_VERSION_1.
+		DeviceID:    0x1041,
 		VendorID:    0x1AF4,
 		HeaderType:  0,
 		SubsystemID: 1, // Network Card
-		Command:     1, // Enable IO port
+		// Memory space enable | bus master.
+		Command: 0x6,
+		// Bit 4: capabilities list present.
+		Status:              0x10,
+		CapabilitiesPointer: capCommonAt,
 		BAR: [6]uint32{
-			NetIOPortStart | 0x1,
+			// BAR0: 32-bit non-prefetchable memory BAR (low nibble 0).
+			uint32(NetMMIOBase),
 		},
 		// https://github.com/torvalds/linux/blob/fb3b0673b7d5b477ed104949450cd511337ba3c6/drivers/pci/setup-irq.c#L30-L55
 		InterruptPin: 1,
@@ -85,30 +85,45 @@ func (v *Net) GetDeviceHeader() pci.DeviceHeader {
 	}
 }
 
-func (v *Net) Read(port uint64, bytes []byte) error {
-	offset := int(port - NetIOPortStart)
+// ModernDevice implementation.
 
-	if int(v.Hdr.commonHeader.queueSEL) >= len(v.VirtQueue) {
-		v.Hdr.commonHeader.queueNUM = 0
-	} else {
-		v.Hdr.commonHeader.queueNUM = QueueSize
+// DeviceFeatures advertises no device-specific features; the guest assigns a
+// random MAC and assumes the link is always up. VIRTIO_F_VERSION_1 is added by
+// the transport.
+func (v *Net) DeviceFeatures() uint64 { return 0 }
+
+func (v *Net) NumQueues() int { return netNumQueues }
+
+// DeviceConfigLen covers struct virtio_net_config (mac, status,
+// max_virtqueue_pairs). The fields are unused since no features expose them,
+// but the region is still described by the device-cfg capability.
+func (v *Net) DeviceConfigLen() int { return 12 }
+
+func (v *Net) ReadDeviceConfig(offset uint64, data []byte) { zero(data) }
+
+func (v *Net) WriteDeviceConfig(offset uint64, data []byte) {}
+
+func (v *Net) QueueReady(idx int, q *SplitQueue) {
+	if idx < 0 || idx >= netNumQueues {
+		return
 	}
 
-	b, err := v.Hdr.Bytes()
-	if err != nil {
-		return err
+	v.VirtQueue[idx] = q
+}
+
+func (v *Net) Notify(idx int) {
+	switch idx {
+	case netRxQueue:
+		// RX queue kick: silently drop. RX is driven by SIGIO.
+	case netTxQueue:
+		// TX queue kick: non-blocking send.
+		select {
+		case v.txKick <- true:
+		default:
+		}
+	default:
+		log.Printf("virtio-net: unexpected queue %d", idx)
 	}
-
-	l := len(bytes)
-	copy(bytes[:l], b[offset:offset+l])
-
-	// ISR is at offset 19 in the virtio common header.
-	// Per the virtio spec, reading ISR clears it.
-	if offset <= 19 && offset+l > 19 {
-		v.Hdr.commonHeader.isr = 0
-	}
-
-	return nil
 }
 
 func (v *Net) RxThreadEntry() {
@@ -139,29 +154,33 @@ func (v *Net) Rx() error {
 
 	packet = packet[:n]
 
-	// append struct virtio_net_hdr
-	packet = append(make([]byte, 10), packet...)
+	// Prepend struct virtio_net_hdr_v1. With VIRTIO_NET_F_MRG_RXBUF not
+	// negotiated, num_buffers (bytes 10:12) must be 1.
+	hdr := make([]byte, netHdrLen)
+	hdr[10] = 1
+	packet = append(hdr, packet...)
 
-	sel := 0
+	const sel = netRxQueue
 
-	if v.VirtQueue[sel] == nil {
+	q := v.VirtQueue[sel]
+	if q == nil {
 		return ErrVQNotInit
 	}
 
-	availRing := &v.VirtQueue[sel].AvailRing
-	usedRing := &v.VirtQueue[sel].UsedRing
+	avail := q.Avail
+	used := q.Used
 
-	if v.LastAvailIdx[sel] == LoadU16(&availRing.Idx) {
+	if v.LastAvailIdx[sel] == LoadU16(&avail.Idx) {
 		return ErrNoRxBuf
 	}
 
 	const NONE = uint16(256)
 	headDescID := NONE
 	prevDescID := NONE
-	uidx := LoadU16(&usedRing.Idx)
+	uidx := LoadU16(&used.Idx)
 
 	for len(packet) > 0 {
-		descID := availRing.Ring[v.LastAvailIdx[sel]%QueueSize]
+		descID := avail.Ring[v.LastAvailIdx[sel]%QueueSize]
 
 		// head of vring chain
 		if headDescID == NONE {
@@ -171,11 +190,11 @@ func (v *Net) Rx() error {
 			// index of the descriptor chain and the
 			// number of bytes that were written to
 			// memory as part of serving the request.
-			usedRing.Ring[uidx%QueueSize].Idx = uint32(headDescID)
-			usedRing.Ring[uidx%QueueSize].Len = 0
+			used.Ring[uidx%QueueSize].ID = uint32(headDescID)
+			used.Ring[uidx%QueueSize].Len = 0
 		}
 
-		desc := &v.VirtQueue[sel].DescTable[descID]
+		desc := &q.Desc[descID]
 		l := uint32(len(packet))
 
 		if l > desc.Len {
@@ -187,22 +206,20 @@ func (v *Net) Rx() error {
 		packet = packet[l:]
 		desc.Len = l
 
-		usedRing.Ring[uidx%QueueSize].Len += l
+		used.Ring[uidx%QueueSize].Len += l
 
 		if prevDescID != NONE {
-			v.VirtQueue[sel].DescTable[prevDescID].Flags |= 0x1
-			v.VirtQueue[sel].DescTable[prevDescID].Next = descID
+			q.Desc[prevDescID].Flags |= descFNext
+			q.Desc[prevDescID].Next = descID
 		}
 
 		prevDescID = descID
 		v.LastAvailIdx[sel]++
 	}
 
-	StoreAddU16(&usedRing.Idx, 1)
+	StoreAddU16(&used.Idx, 1)
 
-	v.Hdr.commonHeader.isr = 0x1
-
-	return v.IRQInjector.InjectVirtioNetIRQ()
+	return v.Interrupt()
 }
 
 func (v *Net) TxThreadEntry() {
@@ -224,117 +241,74 @@ func (v *Net) TxThreadEntry() {
 		case <-ticker.C:
 			for v.Tx() == nil {
 			}
-
-			if v.Hdr.commonHeader.isr != 0 {
-				_ = v.IRQInjector.InjectVirtioNetIRQ()
-			}
 		}
 	}
 }
 
 func (v *Net) Tx() error {
-	const sel = 1
+	const sel = netTxQueue
 
-	if v.VirtQueue[sel] == nil {
+	q := v.VirtQueue[sel]
+	if q == nil {
 		return ErrVQNotInit
 	}
 
-	availRing := &v.VirtQueue[sel].AvailRing
-	usedRing := &v.VirtQueue[sel].UsedRing
+	avail := q.Avail
+	used := q.Used
 
-	if v.LastAvailIdx[sel] == LoadU16(&availRing.Idx) {
+	if v.LastAvailIdx[sel] == LoadU16(&avail.Idx) {
 		return ErrNoTxPacket
 	}
 
-	for v.LastAvailIdx[sel] != LoadU16(&availRing.Idx) {
+	for v.LastAvailIdx[sel] != LoadU16(&avail.Idx) {
 		buf := []byte{}
-		descID := availRing.Ring[v.LastAvailIdx[sel]%QueueSize]
+		descID := avail.Ring[v.LastAvailIdx[sel]%QueueSize]
 
-		uidx := LoadU16(&usedRing.Idx)
-		usedRing.Ring[uidx%QueueSize].Idx = uint32(descID)
-		usedRing.Ring[uidx%QueueSize].Len = 0
+		uidx := LoadU16(&used.Idx)
+		used.Ring[uidx%QueueSize].ID = uint32(descID)
+		used.Ring[uidx%QueueSize].Len = 0
 
 		for {
-			desc := v.VirtQueue[sel].DescTable[descID]
+			desc := q.Desc[descID]
 
 			b := make([]byte, desc.Len)
 			copy(b, v.Mem[desc.Addr:desc.Addr+uint64(desc.Len)])
 
 			buf = append(buf, b...)
 
-			usedRing.Ring[uidx%QueueSize].Len += desc.Len
+			used.Ring[uidx%QueueSize].Len += desc.Len
 
-			if desc.Flags&0x1 != 0 {
+			if desc.Flags&descFNext != 0 {
 				descID = desc.Next
 			} else {
 				break
 			}
 		}
 
-		// Skip struct virtio_net_hdr
+		// Skip struct virtio_net_hdr_v1.
 		// refs https://github.com/torvalds/linux/blob/38f80f42/include/uapi/linux/virtio_net.h#L178-L191
-		buf = buf[10:]
+		buf = buf[netHdrLen:]
 
 		if _, err := v.tap.Write(buf); err != nil {
 			return err
 		}
 
-		StoreAddU16(&usedRing.Idx, 1)
+		StoreAddU16(&used.Idx, 1)
 		v.LastAvailIdx[sel]++
 	}
 
-	v.Hdr.commonHeader.isr = 0x1
-
-	return v.IRQInjector.InjectVirtioNetIRQ()
+	return v.Interrupt()
 }
 
-func (v *Net) Write(port uint64, bytes []byte) error {
-	offset := int(port - NetIOPortStart)
+// Read and Write satisfy pci.Device. A modern device has no IO-port BAR, so
+// these are no-ops.
+func (v *Net) Read(port uint64, bytes []byte) error { return nil }
 
-	switch offset {
-	case 8:
-		// Queue PFN is aligned to page (4096 bytes)
-		sel := v.Hdr.commonHeader.queueSEL
-		if int(sel) >= len(v.VirtQueue) {
-			break
-		}
+func (v *Net) Write(port uint64, bytes []byte) error { return nil }
 
-		physAddr := uint32(pci.BytesToNum(bytes) * 4096)
-		v.VirtQueue[sel] = (*VirtQueue)(unsafe.Pointer(&v.Mem[physAddr]))
-	case 14:
-		v.Hdr.commonHeader.queueSEL = uint16(pci.BytesToNum(bytes))
-	case 16:
-		queueIdx := pci.BytesToNum(bytes)
-		switch queueIdx {
-		case 0:
-			// RX queue kick: silently drop.
-			// RX is driven by SIGIO signals.
-		case 1:
-			// TX queue kick: non-blocking send.
-			select {
-			case v.txKick <- true:
-			default:
-			}
-		default:
-			log.Printf(
-				"virtio-net: unexpected queue %d",
-				queueIdx,
-			)
-		}
-	case 19:
-	default:
-	}
+func (v *Net) IOPort() uint64 { return 0 }
 
-	return nil
-}
-
-func (v *Net) IOPort() uint64 {
-	return NetIOPortStart
-}
-
-func (v *Net) Size() uint64 {
-	return NetIOPortSize
-}
+func (v *Net) Size() uint64 { return 0 }
 
 func (v *Net) Close() error {
 	log.Println("virtio-net: Close called")
@@ -351,22 +325,17 @@ func (v *Net) Close() error {
 
 func NewNet(irq uint8, irqInjector IRQInjector, tap io.ReadWriter, mem []byte) *Net {
 	res := &Net{
-		Hdr: netHdr{
-			commonHeader: commonHeader{
-				queueNUM: QueueSize,
-				isr:      0x0,
-			},
-		},
-		irq:          irq,
-		IRQInjector:  irqInjector,
-		txKick:       make(chan interface{}, QueueSize),
-		rxKick:       make(chan os.Signal, 1),
-		done:         make(chan struct{}),
-		tap:          tap,
-		Mem:          mem,
-		VirtQueue:    [2]*VirtQueue{},
-		LastAvailIdx: [2]uint16{0, 0},
+		irq:         irq,
+		IRQInjector: irqInjector,
+		txKick:      make(chan interface{}, QueueSize),
+		rxKick:      make(chan os.Signal, 1),
+		done:        make(chan struct{}),
+		tap:         tap,
 	}
+
+	res.ModernTransport = NewModernTransport(res, mem, func() error {
+		return irqInjector.InjectVirtioNetIRQ()
+	})
 
 	signal.Notify(res.rxKick, syscall.SIGIO)
 

@@ -44,28 +44,54 @@ type Device interface {
 	Size() uint64
 }
 
+// CapsAndMMIO is implemented by PCI devices that expose a capabilities list
+// and decode a memory BAR (i.e. modern virtio devices). The base address of
+// the BAR is owned by the pci package; the device works purely in
+// BAR-relative offsets and never needs to know where the BAR was mapped.
+type CapsAndMMIO interface {
+	Device
+
+	// Capabilities returns config-space bytes starting at offset 0x40,
+	// i.e. the PCI capabilities list pointed to by CapabilitiesPointer.
+	Capabilities() []byte
+
+	// MMIOBARIndex is the index (0-5) of the memory BAR carrying the
+	// device's MMIO structures.
+	MMIOBARIndex() int
+
+	// MMIOSize is the size in bytes of that memory BAR.
+	MMIOSize() uint64
+
+	// MMIO services a guest memory access within the BAR. offset is
+	// relative to the start of the BAR. For reads (isWrite false) the
+	// handler fills data; for writes it consumes data.
+	MMIO(offset uint64, data []byte, isWrite bool)
+}
+
 type DeviceHeader struct {
-	VendorID      uint16
-	DeviceID      uint16
-	Command       uint16
-	_             uint16   // status
-	_             uint8    // revisonID
-	_             [3]uint8 // classCode
-	_             uint8    // cacheLineSize
-	_             uint8    // latencyTimer
-	HeaderType    uint8
-	_             uint8 // bist
-	BAR           [6]uint32
-	_             uint32 // cardbusCISPointer
-	_             uint16 // subsystemVendorID
-	SubsystemID   uint16
-	_             uint32   // expansionROMBaseAddress
-	_             uint8    // capabilitiesPointer
-	_             [7]uint8 // reserved
-	InterruptLine uint8
-	InterruptPin  uint8
-	_             uint8 // minGnt
-	_             uint8 // maxLat
+	VendorID uint16
+	DeviceID uint16
+	Command  uint16
+	// Status bit 4 (0x10) advertises a PCI capabilities list; modern
+	// virtio devices set it together with CapabilitiesPointer.
+	Status              uint16
+	_                   uint8    // revisonID
+	_                   [3]uint8 // classCode
+	_                   uint8    // cacheLineSize
+	_                   uint8    // latencyTimer
+	HeaderType          uint8
+	_                   uint8 // bist
+	BAR                 [6]uint32
+	_                   uint32 // cardbusCISPointer
+	_                   uint16 // subsystemVendorID
+	SubsystemID         uint16
+	_                   uint32 // expansionROMBaseAddress
+	CapabilitiesPointer uint8  // offset of the first PCI capability
+	_                   [7]uint8
+	InterruptLine       uint8
+	InterruptPin        uint8
+	_                   uint8 // minGnt
+	_                   uint8 // maxLat
 }
 
 func (h DeviceHeader) Bytes() ([]byte, error) {
@@ -79,13 +105,109 @@ func (h DeviceHeader) Bytes() ([]byte, error) {
 }
 
 type PCI struct {
-	addr        address
-	isBAR0Probe bool
-	Devices     []Device
+	addr    address
+	Devices []Device
+
+	// A single size-probe can be in flight at a time: the guest writes
+	// 0xffffffff to a BAR then immediately reads it back. probeSlot is -1
+	// when no probe is pending.
+	probeSlot int
+	probeBar  int
+
+	// barOverride records guest-assigned base addresses for the memory
+	// BARs of modern (CapsAndMMIO) devices, keyed by slot then BAR index.
+	barOverride map[int]map[int]uint32
 }
 
 func New(devices ...Device) *PCI {
-	return &PCI{Devices: devices}
+	return &PCI{
+		Devices:     devices,
+		probeSlot:   -1,
+		barOverride: map[int]map[int]uint32{},
+	}
+}
+
+// barAtOffset returns the BAR index (0-5) addressed by a config-space byte
+// offset, or -1 if the offset is not within the BAR registers (0x10-0x27).
+func barAtOffset(offset int) int {
+	if offset < 0x10 || offset >= 0x28 {
+		return -1
+	}
+
+	return offset/4 - 4
+}
+
+// barSize returns the size of a device's BAR. Modern devices report the
+// size of their memory BAR; every device reports its legacy IO BAR as BAR0.
+func (p *PCI) barSize(slot, bar int) uint64 {
+	if cm, ok := p.Devices[slot].(CapsAndMMIO); ok && bar == cm.MMIOBARIndex() {
+		return cm.MMIOSize()
+	}
+
+	if bar == 0 {
+		return p.Devices[slot].Size()
+	}
+
+	return 0
+}
+
+// barBase returns the guest-physical base address a device's BAR currently
+// decodes at, with the low type bits masked off. It honors a guest-assigned
+// override when present, otherwise the value baked into the device header.
+func (p *PCI) barBase(slot, bar int) uint64 {
+	raw := p.Devices[slot].GetDeviceHeader().BAR[bar]
+	if v, ok := p.barOverride[slot][bar]; ok {
+		raw = v
+	}
+
+	if raw&0x1 == 0x1 {
+		return uint64(raw &^ 0x3) // IO space BAR
+	}
+
+	return uint64(raw &^ 0xf) // memory space BAR
+}
+
+// configSpace builds the 256-byte PCI configuration space image for a slot:
+// the 64-byte header followed by the device's capability list, with any
+// guest-assigned BAR overrides applied.
+func (p *PCI) configSpace(slot int) ([]byte, error) {
+	b, err := p.Devices[slot].GetDeviceHeader().Bytes()
+	if err != nil {
+		return nil, err
+	}
+
+	cfg := make([]byte, 256)
+	copy(cfg, b)
+
+	if cm, ok := p.Devices[slot].(CapsAndMMIO); ok {
+		copy(cfg[0x40:], cm.Capabilities())
+	}
+
+	for bar, v := range p.barOverride[slot] {
+		copy(cfg[0x10+bar*4:], NumToBytes(v))
+	}
+
+	return cfg, nil
+}
+
+// LookupMMIO finds the modern device whose memory BAR decodes addr and
+// returns it together with the BAR-relative offset.
+func (p *PCI) LookupMMIO(addr uint64) (CapsAndMMIO, uint64, bool) {
+	for slot, dev := range p.Devices {
+		cm, ok := dev.(CapsAndMMIO)
+		if !ok {
+			continue
+		}
+
+		base := p.barBase(slot, cm.MMIOBARIndex())
+		size := cm.MMIOSize()
+
+		if size > 0 && addr >= base && addr < base+size {
+			return cm, addr - base, true
+		}
+	}
+
+	return nil, 0, false
 }
 
 func (p *PCI) PciConfDataIn(port uint64, values []byte) error {
@@ -112,17 +234,16 @@ func (p *PCI) PciConfDataIn(port uint64, values []byte) error {
 		return nil
 	}
 
-	// Probing BAR0 Size
-	if bar := offset/4 - 4; bar == 0 && p.isBAR0Probe {
-		size := p.Devices[slot].Size()
-		copy(values[:4], NumToBytes(SizeToBits(size)))
+	// Reply to a pending BAR size probe with the size mask.
+	if bar := barAtOffset(offset); bar >= 0 && p.probeSlot == slot && p.probeBar == bar {
+		copy(values[:4], NumToBytes(SizeToBits(p.barSize(slot, bar))))
 
-		p.isBAR0Probe = false
+		p.probeSlot, p.probeBar = -1, 0
 
 		return nil
 	}
 
-	b, err := p.Devices[slot].GetDeviceHeader().Bytes()
+	b, err := p.configSpace(slot)
 	if err != nil {
 		return err
 	}
@@ -154,11 +275,28 @@ func (p *PCI) PciConfDataOut(port uint64, values []byte) error {
 		return nil
 	}
 
-	// Probing BAR0 Size
-	if bar := offset/4 - 4; bar == 0 && BytesToNum(values) == 0xffffffff {
-		p.isBAR0Probe = true
+	bar := barAtOffset(offset)
+	if bar < 0 || len(values) != 4 {
+		return nil
+	}
+
+	// 0xffffffff arms a size probe; the next read of this BAR returns the
+	// size mask instead of the address.
+	if BytesToNum(values) == 0xffffffff {
+		p.probeSlot, p.probeBar = slot, bar
 
 		return nil
+	}
+
+	// Capture guest-assigned base addresses for modern devices' memory
+	// BARs so reads return the assigned value and MMIO decoding follows
+	// the driver. Legacy IO BARs keep their header-baked address.
+	if cm, ok := p.Devices[slot].(CapsAndMMIO); ok && bar == cm.MMIOBARIndex() {
+		if p.barOverride[slot] == nil {
+			p.barOverride[slot] = map[int]uint32{}
+		}
+
+		p.barOverride[slot][bar] = uint32(BytesToNum(values))
 	}
 
 	return nil

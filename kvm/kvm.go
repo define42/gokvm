@@ -156,6 +156,20 @@ func (r *RunData) IO() (uint64, uint64, uint64, uint64, uint64) {
 	return direction, size, port, count, offset
 }
 
+// MMIO interprets a KVM_EXIT_MMIO request. The kvm_run mmio struct overlays
+// RunData.Data as: phys_addr (Data[0]), data[8] (Data[1]), then len and
+// is_write packed into Data[2]. The returned byte slice aliases the kvm_run
+// data buffer directly, so for reads the handler writes the result into it
+// and KVM picks it up once the ioctl returns.
+func (r *RunData) MMIO() (uint64, []byte, bool) {
+	physAddr := r.Data[0]
+	length := uint32(r.Data[2])
+	isWrite := uint8(r.Data[2]>>32) != 0
+	data := (*(*[8]byte)(unsafe.Pointer(&r.Data[1])))[:length:length]
+
+	return physAddr, data, isWrite
+}
+
 // GetAPIVersion gets the qemu API version, which changes rarely if at all.
 func GetAPIVersion(kvmFd uintptr) (uintptr, error) {
 	return Ioctl(kvmFd, IIO(kvmGetAPIVersion), uintptr(0))

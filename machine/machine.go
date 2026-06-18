@@ -893,6 +893,17 @@ func (m *Machine) RunOnce(cpu int) (bool, error) {
 		}
 
 		return true, err
+	case kvm.EXITMMIO:
+		physAddr, data, isWrite := m.runs[cpu].MMIO()
+
+		if dev, offset, ok := m.pci.LookupMMIO(physAddr); ok {
+			dev.MMIO(offset, data, isWrite)
+		} else {
+			log.Printf("unhandled MMIO @%#x len=%d write=%v",
+				physAddr, len(data), isWrite)
+		}
+
+		return true, err
 	case kvm.EXITUNKNOWN:
 		return true, err
 	case kvm.EXITINTR:
@@ -908,7 +919,6 @@ func (m *Machine) RunOnce(cpu int) (bool, error) {
 		kvm.EXITHYPERCALL,
 		kvm.EXITINTERNALERROR,
 		kvm.EXITIRQWINDOWOPEN,
-		kvm.EXITMMIO,
 		kvm.EXITNMI,
 		kvm.EXITS390RESET,
 		kvm.EXITS390SIEIC,
