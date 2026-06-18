@@ -330,12 +330,13 @@ func (m *Machine) LoadPVH(kern, initrd *os.File, cmdline string) error {
 	ripAddr := fwElf.Entry
 
 	for _, entry := range fwElf.Progs {
-		if entry.Type == elf.PT_LOAD {
+		switch entry.Type {
+		case elf.PT_LOAD:
 			_, err := entry.ReadAt(m.mem[entry.Paddr:], 0)
 			if err != nil && !errors.Is(err, io.EOF) {
 				return err
 			}
-		} else if entry.Type == elf.PT_NOTE {
+		case elf.PT_NOTE:
 			if entry.Filesz == 0 {
 				return errPTNoteHasNoFSize
 			}
@@ -345,9 +346,9 @@ func (m *Machine) LoadPVH(kern, initrd *os.File, cmdline string) error {
 			if fwElf.Entry != uint64(addr) {
 				ripAddr = uint64(addr)
 			}
+		default:
+			// Other program header types are not loaded.
 		}
-
-		continue
 	}
 
 	for _, cpu := range m.vcpuFds {

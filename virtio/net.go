@@ -152,13 +152,12 @@ func (v *Net) Rx() error {
 		return ErrNoRxPacket
 	}
 
-	packet = packet[:n]
-
 	// Prepend struct virtio_net_hdr_v1. With VIRTIO_NET_F_MRG_RXBUF not
 	// negotiated, num_buffers (bytes 10:12) must be 1.
-	hdr := make([]byte, netHdrLen)
-	hdr[10] = 1
-	packet = append(hdr, packet...)
+	frame := make([]byte, netHdrLen+n)
+	frame[10] = 1
+	copy(frame[netHdrLen:], packet[:n])
+	packet = frame
 
 	const sel = netRxQueue
 
@@ -238,9 +237,13 @@ func (v *Net) TxThreadEntry() {
 		case <-v.txKick:
 			for v.Tx() == nil {
 			}
+
+			_ = v.ReinjectIfPending()
 		case <-ticker.C:
 			for v.Tx() == nil {
 			}
+
+			_ = v.ReinjectIfPending()
 		}
 	}
 }

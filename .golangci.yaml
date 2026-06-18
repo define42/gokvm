@@ -1,31 +1,82 @@
-# N.B. the golangci-lint recommends you not enable --enable-all (which begs the
-# question of why it's there in the first place) as upgrades to golangci-lint
-# can break your CI!
+# golangci-lint v2 configuration.
+#
+# Philosophy (unchanged from the v1 config): enable everything, then disable
+# the stylistic/opinionated linters this project does not enforce. The v2
+# `default: all` set is much larger than v1's enable-all, so this disable list
+# grew when bumping to golangci-lint v2 (e.g. wsl_v5, funcorder, godoclint,
+# modernize, ...). Bug-catching linters (staticcheck, gosec, govet, ...) stay
+# on.
+version: "2"
 linters:
-  enable-all: true
+  default: all
   disable:
-    - gomnd
-    - wrapcheck
-    - maligned
-    - forbidigo
-    - funlen
-    - gocognit
-    - ifshort
-    - varnamelen
-    - nonamedreturns
     - cyclop
-    - errname
-    - exhaustivestruct
-    - exhaustruct
-    - forcetypeassert
-    - wastedassign
-    - ireturn
-    - revive
-    - golint
-    - scopelint
-    - interfacer
-    - dupl
     - depguard
+    - dupl
+    - embeddedstructfieldcheck
+    - errname
+    - exhaustruct
+    - forbidigo
+    - forcetypeassert
+    - funcorder
+    - funlen
+    - goconst
+    - gocognit
+    - godoclint
+    - gomodguard
+    - inamedparam
+    - ireturn
+    - mnd
+    - modernize
+    - noctx
+    - noinlineerr
     - nolintlint
-    - nosnakecase
+    - nonamedreturns
+    - perfsprint
+    - prealloc
+    - predeclared
+    - recvcheck
+    - revive
     - tagalign
+    - testpackage
+    - usetesting
+    - varnamelen
+    - wastedassign
+    - wrapcheck
+    - wsl
+    - wsl_v5
+  settings:
+    gosec:
+      # G115 (integer overflow on type conversion) is pervasive and
+      # unavoidable in low-level register/BAR/size arithmetic. Exclude that
+      # single rule but keep the rest of gosec enabled.
+      excludes:
+        - G115
+    exhaustive:
+      # A default case counts as handling the remaining enum values, so
+      # switches over large stdlib enums (e.g. elf.ProgType) need not list
+      # every case.
+      default-signifies-exhaustive: true
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  enable:
+    - gci
+    - gofmt
+    - gofumpt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

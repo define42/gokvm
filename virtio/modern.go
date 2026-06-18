@@ -181,6 +181,17 @@ func (t *ModernTransport) Interrupt() error {
 	return t.inject()
 }
 
+// ReinjectIfPending re-asserts the interrupt when ISR is still set, i.e. the
+// driver has not yet read (and thereby acknowledged) it. Device IO threads
+// call this periodically so a missed interrupt does not stall the queue.
+func (t *ModernTransport) ReinjectIfPending() error {
+	if atomic.LoadUint32(&t.isr) != 0 {
+		return t.inject()
+	}
+
+	return nil
+}
+
 // virtioCap builds a struct virtio_pci_cap of the given length.
 func virtioCap(capLen, cfgType, next uint8, offset, length uint32) []byte {
 	b := make([]byte, capLen)

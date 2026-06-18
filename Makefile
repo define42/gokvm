@@ -1,4 +1,4 @@
-GOLANGCI_LINT_VERSION = v1.54.2
+GOLANGCI_LINT_VERSION = v2.12.2
 
 export GOPATH := $(shell go env GOPATH)
 export PATH := $(GOPATH)/bin:$(PATH)
@@ -19,7 +19,7 @@ gokvm: $(wildcard *.go) $(wildcard */*.go)
 	go build .
 
 golangci-lint:
-	curl --retry 5 -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
+	curl --retry 5 -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/$(GOLANGCI_LINT_VERSION)/install.sh \
 		| sh -s -- -b . $(GOLANGCI_LINT_VERSION)
 
 vda.img:

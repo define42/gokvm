@@ -13,8 +13,8 @@ The latest version supports the following features:
 - [x] kvm acceleration
 - [x] multi processors
 - [x] serial console
-- [x] virtio-net
-- [x] virtio-blk
+- [x] virtio-net (virtio 1.0, modern PCI transport)
+- [x] virtio-blk (virtio 1.0, modern PCI transport)
 - [x] PVH Boot Protocol
 
 **This is an experimental project, so please do not use it in production.**

@@ -1,7 +1,6 @@
 package virtio
 
 import (
-	"bytes"
 	"encoding/binary"
 	"log"
 	"os"
@@ -13,10 +12,15 @@ import (
 )
 
 const (
-	BlkIOPortStart = 0x6300
-	BlkIOPortSize  = 0x100
-
 	SectorSize = 512
+
+	blkNumQueues = 1
+	blkQueue     = 0
+
+	// BlkMMIOBase is the guest-physical base of the block device's memory
+	// BAR. It sits in the 32-bit MMIO hole, distinct from the net device's
+	// region; the pci layer follows any reassignment the guest performs.
+	BlkMMIOBase = 0xd001_0000
 )
 
 // LoadU16 reads a uint16 through a non-inlined function
@@ -37,13 +41,19 @@ func StoreAddU16(p *uint16, delta uint16) {
 	*p += delta
 }
 
-type Blk struct {
-	file *os.File
-	Hdr  blkHdr
+// Blk is a modern (virtio 1.0) block device.
+var _ pci.CapsAndMMIO = (*Blk)(nil)
 
-	VirtQueue    [1]*VirtQueue
-	Mem          []byte
-	LastAvailIdx [1]uint16
+type Blk struct {
+	*ModernTransport
+
+	file *os.File
+
+	// capacity is the device size in 512-byte sectors.
+	capacity uint64
+
+	VirtQueue    [blkNumQueues]*SplitQueue
+	LastAvailIdx [blkNumQueues]uint16
 
 	kick      chan interface{}
 	done      chan struct{}
@@ -53,34 +63,23 @@ type Blk struct {
 	IRQInjector IRQInjector
 }
 
-type blkHdr struct {
-	commonHeader commonHeader
-	blkHeader    blkHeader
-}
-
-func (h blkHdr) Bytes() ([]byte, error) {
-	buf := new(bytes.Buffer)
-
-	if err := binary.Write(buf, binary.LittleEndian, h); err != nil {
-		return []byte{}, err
-	}
-
-	return buf.Bytes(), nil
-}
-
-type blkHeader struct {
-	capacity uint64
-}
-
 func (v *Blk) GetDeviceHeader() pci.DeviceHeader {
 	return pci.DeviceHeader{
-		DeviceID:    0x1001,
+		// 0x1040 + virtio device id (2 = block). The 0x1042 id marks a
+		// non-transitional device, so the driver uses the modern
+		// interface and requires VIRTIO_F_VERSION_1.
+		DeviceID:    0x1042,
 		VendorID:    0x1AF4,
 		HeaderType:  0,
 		SubsystemID: 2, // Block Device
-		Command:     1, // Enable IO port
+		// Memory space enable | bus master.
+		Command: 0x6,
+		// Bit 4: capabilities list present.
+		Status:              0x10,
+		CapabilitiesPointer: capCommonAt,
 		BAR: [6]uint32{
-			BlkIOPortStart | 0x1,
+			// BAR0: 32-bit non-prefetchable memory BAR (low nibble 0).
+			uint32(BlkMMIOBase),
 		},
 		// https://github.com/torvalds/linux/blob/fb3b0673b7d5b477ed104949450cd511337ba3c6/drivers/pci/setup-irq.c#L30-L55
 		InterruptPin: 1,
@@ -89,30 +88,52 @@ func (v *Blk) GetDeviceHeader() pci.DeviceHeader {
 	}
 }
 
-func (v *Blk) Read(port uint64, bytes []byte) error {
-	offset := int(port - BlkIOPortStart)
+// ModernDevice implementation.
 
-	if int(v.Hdr.commonHeader.queueSEL) >= len(v.VirtQueue) {
-		v.Hdr.commonHeader.queueNUM = 0
-	} else {
-		v.Hdr.commonHeader.queueNUM = QueueSize
+// DeviceFeatures advertises no device-specific features; VIRTIO_F_VERSION_1 is
+// added by the transport.
+func (v *Blk) DeviceFeatures() uint64 { return 0 }
+
+func (v *Blk) NumQueues() int { return blkNumQueues }
+
+// DeviceConfigLen covers struct virtio_blk_config.capacity (the only field the
+// driver reads without further feature negotiation).
+func (v *Blk) DeviceConfigLen() int { return 8 }
+
+// ReadDeviceConfig serves struct virtio_blk_config: capacity (le64, in
+// 512-byte sectors) at offset 0.
+func (v *Blk) ReadDeviceConfig(offset uint64, data []byte) {
+	var cfg [8]byte
+
+	binary.LittleEndian.PutUint64(cfg[:], v.capacity)
+	zero(data)
+
+	if offset >= uint64(len(cfg)) {
+		return
 	}
 
-	b, err := v.Hdr.Bytes()
-	if err != nil {
-		return err
+	end := offset + uint64(len(data))
+	if end > uint64(len(cfg)) {
+		end = uint64(len(cfg))
 	}
 
-	l := len(bytes)
-	copy(bytes[:l], b[offset:offset+l])
+	copy(data, cfg[offset:end])
+}
 
-	// ISR is at offset 19 in the virtio common header.
-	// Per the virtio spec, reading ISR clears it.
-	if offset <= 19 && offset+l > 19 {
-		v.Hdr.commonHeader.isr = 0
+func (v *Blk) WriteDeviceConfig(offset uint64, data []byte) {}
+
+func (v *Blk) QueueReady(idx int, q *SplitQueue) {
+	if idx == blkQueue {
+		v.VirtQueue[idx] = q
 	}
+}
 
-	return nil
+func (v *Blk) Notify(idx int) {
+	// Non-blocking kick; the IO thread also polls on a ticker.
+	select {
+	case v.kick <- true:
+	default:
+	}
 }
 
 func (v *Blk) IOThreadEntry() {
@@ -132,16 +153,12 @@ func (v *Blk) IOThreadEntry() {
 			for v.IO() == nil {
 			}
 
-			if v.Hdr.commonHeader.isr != 0 {
-				_ = v.IRQInjector.InjectVirtioBlkIRQ()
-			}
+			_ = v.ReinjectIfPending()
 		case <-ticker.C:
 			for v.IO() == nil {
 			}
 
-			if v.Hdr.commonHeader.isr != 0 {
-				_ = v.IRQInjector.InjectVirtioBlkIRQ()
-			}
+			_ = v.ReinjectIfPending()
 		}
 	}
 }
@@ -153,40 +170,37 @@ type BlkReq struct {
 }
 
 func (v *Blk) IO() error {
-	sel := uint16(0)
+	const sel = blkQueue
 
-	if v.VirtQueue[sel] == nil {
+	q := v.VirtQueue[sel]
+	if q == nil {
 		return ErrVQNotInit
 	}
 
-	availRing := &v.VirtQueue[sel].AvailRing
-	usedRing := &v.VirtQueue[sel].UsedRing
+	avail := q.Avail
+	used := q.Used
 
-	if v.LastAvailIdx[sel] == LoadU16(&availRing.Idx) {
+	if v.LastAvailIdx[sel] == LoadU16(&avail.Idx) {
 		return ErrNoTxPacket
 	}
 
-	log.Printf("virtio-blk IO: avail=%d last=%d",
-		LoadU16(&availRing.Idx), v.LastAvailIdx[sel])
+	for v.LastAvailIdx[sel] != LoadU16(&avail.Idx) {
+		descID := avail.Ring[v.LastAvailIdx[sel]%QueueSize]
 
-	for v.LastAvailIdx[sel] != LoadU16(&availRing.Idx) {
-		descID := availRing.Ring[v.LastAvailIdx[sel]%QueueSize]
-
-		// This structure is holding both the index of
-		// the descriptor chain and the number of bytes
-		// written to memory as part of serving the
-		// request.
-		uidx := LoadU16(&usedRing.Idx)
-		usedRing.Ring[uidx%QueueSize].Idx = uint32(descID)
-		usedRing.Ring[uidx%QueueSize].Len = 0
+		// This structure holds both the index of the descriptor
+		// chain and the number of bytes written to memory as part
+		// of serving the request.
+		uidx := LoadU16(&used.Idx)
+		used.Ring[uidx%QueueSize].ID = uint32(descID)
+		used.Ring[uidx%QueueSize].Len = 0
 
 		var buf [3][]byte
 
 		for i := 0; i < 3; i++ {
-			desc := v.VirtQueue[sel].DescTable[descID]
+			desc := q.Desc[descID]
 			buf[i] = v.Mem[desc.Addr : desc.Addr+uint64(desc.Len)]
 
-			usedRing.Ring[uidx%QueueSize].Len += desc.Len
+			used.Ring[uidx%QueueSize].Len += desc.Len
 			descID = desc.Next
 		}
 
@@ -195,12 +209,8 @@ func (v *Blk) IO() error {
 		// buf[2] contains a status field.
 		//
 		// refs https://wiki.osdev.org/Virtio#Block_Device_Packets
-		blkReq := *((*BlkReq)(unsafe.Pointer(&buf[0][0])))
+		blkReq := *(*BlkReq)(unsafe.Pointer(&buf[0][0]))
 		data := buf[1]
-
-		log.Printf("virtio-blk IO: type=%d sector=%d"+
-			" len=%d", blkReq.Type, blkReq.Sector,
-			len(data))
 
 		var ioErr error
 
@@ -227,64 +237,22 @@ func (v *Blk) IO() error {
 			buf[2][0] = 0 // VIRTIO_BLK_S_OK
 		}
 
-		StoreAddU16(&usedRing.Idx, 1)
+		StoreAddU16(&used.Idx, 1)
 		v.LastAvailIdx[sel]++
 	}
 
-	v.Hdr.commonHeader.isr = 0x1
-	if err := v.IRQInjector.InjectVirtioBlkIRQ(); err != nil {
-		return err
-	}
-
-	return nil
+	return v.Interrupt()
 }
 
-func (v *Blk) Write(port uint64, bytes []byte) error {
-	offset := int(port - BlkIOPortStart)
+// Read and Write satisfy pci.Device. A modern device has no IO-port BAR, so
+// these are no-ops.
+func (v *Blk) Read(port uint64, bytes []byte) error { return nil }
 
-	switch offset {
-	case 8:
-		// Queue PFN is aligned to page (4096 bytes)
-		sel := v.Hdr.commonHeader.queueSEL
-		if int(sel) >= len(v.VirtQueue) {
-			break
-		}
+func (v *Blk) Write(port uint64, bytes []byte) error { return nil }
 
-		physAddr := uint32(pci.BytesToNum(bytes) * 4096)
-		v.VirtQueue[sel] = (*VirtQueue)(
-			unsafe.Pointer(&v.Mem[physAddr]))
+func (v *Blk) IOPort() uint64 { return 0 }
 
-		log.Printf("virtio-blk: queue %d PFN set,"+
-			" physAddr=0x%x", sel, physAddr)
-	case 14:
-		v.Hdr.commonHeader.queueSEL = uint16(pci.BytesToNum(bytes))
-	case 16:
-		select {
-		case v.kick <- true:
-			log.Println("virtio-blk: kick sent")
-		default:
-			if v.VirtQueue[0] != nil {
-				log.Printf("virtio-blk: kick dropped"+
-					" (avail=%d last=%d)",
-					LoadU16(
-						&v.VirtQueue[0].AvailRing.Idx),
-					v.LastAvailIdx[0])
-			}
-		}
-	case 19:
-	default:
-	}
-
-	return nil
-}
-
-func (v *Blk) IOPort() uint64 {
-	return BlkIOPortStart
-}
-
-func (v *Blk) Size() uint64 {
-	return BlkIOPortSize
-}
+func (v *Blk) Size() uint64 { return 0 }
 
 func (v *Blk) Close() error {
 	log.Println("virtio-blk: Close called")
@@ -304,27 +272,18 @@ func NewBlk(path string, irq uint8, irqInjector IRQInjector, mem []byte) (*Blk, 
 		return nil, err
 	}
 
-	fileSize := uint64(fileInfo.Size())
-
 	res := &Blk{
-		Hdr: blkHdr{
-			commonHeader: commonHeader{
-				queueNUM: QueueSize,
-				isr:      0x0,
-			},
-			blkHeader: blkHeader{
-				capacity: fileSize / SectorSize,
-			},
-		},
-		file:         file,
-		irq:          irq,
-		IRQInjector:  irqInjector,
-		kick:         make(chan interface{}, QueueSize),
-		done:         make(chan struct{}),
-		Mem:          mem,
-		VirtQueue:    [1]*VirtQueue{},
-		LastAvailIdx: [1]uint16{0},
+		file:        file,
+		capacity:    uint64(fileInfo.Size()) / SectorSize,
+		irq:         irq,
+		IRQInjector: irqInjector,
+		kick:        make(chan interface{}, QueueSize),
+		done:        make(chan struct{}),
 	}
+
+	res.ModernTransport = NewModernTransport(res, mem, func() error {
+		return irqInjector.InjectVirtioBlkIRQ()
+	})
 
 	return res, nil
 }

@@ -84,11 +84,11 @@ func (v *VMM) Setup() error {
 	}
 
 	if isPVH {
-		if err := v.Machine.LoadPVH(kern, initrd, v.Params); err != nil {
+		if err := v.LoadPVH(kern, initrd, v.Params); err != nil {
 			return err
 		}
 	} else {
-		if err := v.Machine.LoadLinux(kern, initrd, v.Params); err != nil {
+		if err := v.LoadLinux(kern, initrd, v.Params); err != nil {
 			return err
 		}
 	}
