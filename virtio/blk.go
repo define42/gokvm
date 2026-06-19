@@ -3,11 +3,11 @@ package virtio
 import (
 	"encoding/binary"
 	"log"
-	"os"
 	"sync"
 	"time"
 	"unsafe"
 
+	"github.com/bobuhiro11/gokvm/disk"
 	"github.com/bobuhiro11/gokvm/pci"
 )
 
@@ -47,7 +47,7 @@ var _ pci.CapsAndMMIO = (*Blk)(nil)
 type Blk struct {
 	*ModernTransport
 
-	file *os.File
+	image disk.Image
 
 	// capacity is the device size in 512-byte sectors.
 	capacity uint64
@@ -215,18 +215,18 @@ func (v *Blk) IO() error {
 		var ioErr error
 
 		if blkReq.Type&0x1 == 0x1 {
-			_, ioErr = v.file.WriteAt(
+			_, ioErr = v.image.WriteAt(
 				data,
 				int64(blkReq.Sector*SectorSize),
 			)
 		} else {
-			_, ioErr = v.file.ReadAt(
+			_, ioErr = v.image.ReadAt(
 				data,
 				int64(blkReq.Sector*SectorSize),
 			)
 
 			if ioErr == nil {
-				ioErr = v.file.Sync()
+				ioErr = v.image.Sync()
 			}
 		}
 
@@ -258,23 +258,18 @@ func (v *Blk) Close() error {
 	log.Println("virtio-blk: Close called")
 	v.closeOnce.Do(func() { close(v.done) })
 
-	return v.file.Close()
+	return v.image.Close()
 }
 
 func NewBlk(path string, irq uint8, irqInjector IRQInjector, mem []byte) (*Blk, error) {
-	file, err := os.OpenFile(path, os.O_RDWR, 0o644)
-	if err != nil {
-		return nil, err
-	}
-
-	fileInfo, err := file.Stat()
+	image, err := disk.Open(path)
 	if err != nil {
 		return nil, err
 	}
 
 	res := &Blk{
-		file:        file,
-		capacity:    uint64(fileInfo.Size()) / SectorSize,
+		image:       image,
+		capacity:    uint64(image.Size()) / SectorSize,
 		irq:         irq,
 		IRQInjector: irqInjector,
 		kick:        make(chan interface{}, QueueSize),

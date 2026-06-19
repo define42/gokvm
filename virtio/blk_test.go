@@ -3,6 +3,9 @@ package virtio_test
 import (
 	"bytes"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -160,6 +163,65 @@ func TestIO(t *testing.T) {
 	}
 
 	// Verify status byte is VIRTIO_BLK_S_OK (0).
+	if mem[0x700] != 0 {
+		t.Fatalf("status: expected 0, got %d", mem[0x700])
+	}
+
+	// The ext2 superblock magic (0xef53) lives at offset 0x38 of sector 2.
+	expected := []byte{0x53, 0xef}
+	actual := mem[0x438:0x43a]
+
+	if !bytes.Equal(expected, actual) {
+		t.Fatalf("expected: %v, actual: %v", expected, actual)
+	}
+}
+
+func TestIOWithQCOW2(t *testing.T) {
+	t.Parallel()
+
+	if _, err := os.Stat("../vda.img"); os.IsNotExist(err) {
+		t.Skipf("../vda.img does not exist, skipping")
+	}
+
+	qcow2Path := filepath.Join(t.TempDir(), "vda.qcow2")
+	runQEMUImg(t, "convert", "-f", "raw", "-O", "qcow2", "../vda.img", qcow2Path)
+
+	mem := make([]byte, 0x1000000)
+
+	v, err := virtio.NewBlk(qcow2Path, 10, &mockInjector{}, mem)
+	if err != nil {
+		t.Fatalf("err: %v\n", err)
+	}
+
+	q := newSplitQueue()
+	q.Avail.Idx = 1
+
+	// desc[0]: blk request header
+	q.Desc[0].Addr = 0
+	q.Desc[0].Len = 16
+	q.Desc[0].Next = 1
+
+	blkReq := (*virtio.BlkReq)(unsafe.Pointer(&mem[0]))
+	blkReq.Type = 0
+	blkReq.Sector = 2
+
+	// desc[1]: data buffer
+	q.Desc[1].Addr = 0x400
+	q.Desc[1].Len = 0x200
+	q.Desc[1].Next = 2
+
+	// desc[2]: status byte
+	q.Desc[2].Addr = 0x700
+	q.Desc[2].Len = 1
+
+	mem[0x700] = 0xFF // poison status byte
+
+	v.VirtQueue[0] = q
+
+	if err := v.IO(); err != nil {
+		t.Fatalf("err: %v\n", err)
+	}
+
 	if mem[0x700] != 0 {
 		t.Fatalf("status: expected 0, got %d", mem[0x700])
 	}
@@ -550,5 +612,20 @@ func TestLoadU16StoreAddU16(t *testing.T) {
 
 	if got < 5 {
 		t.Fatalf("value went backwards: %d", got)
+	}
+}
+
+func runQEMUImg(t *testing.T, args ...string) {
+	t.Helper()
+
+	qemuImg, err := exec.LookPath("qemu-img")
+	if err != nil {
+		t.Skip("qemu-img is not installed")
+	}
+
+	cmd := exec.Command(qemuImg, args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("qemu-img %s: %v\n%s", strings.Join(args, " "), err, out)
 	}
 }
