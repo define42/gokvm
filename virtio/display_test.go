@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/bobuhiro11/gokvm/virtio"
 )
@@ -64,6 +65,9 @@ func TestVNCDisplayHandshakeAndRawFramebuffer(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer d.Close()
+
+	input := &mockVNCInput{events: make(chan vncInputEvent, 3)}
+	d.SetInput(input)
 
 	img := image.NewRGBA(image.Rect(0, 0, 2, 1))
 	img.Pix[0], img.Pix[1], img.Pix[2], img.Pix[3] = 0xff, 0, 0, 0xff
@@ -155,6 +159,74 @@ func TestVNCDisplayHandshakeAndRawFramebuffer(t *testing.T) {
 	if !bytes.Equal(pixels, want) {
 		t.Fatalf("pixels: got %v, want %v", pixels, want)
 	}
+
+	writeAll(t, conn, []byte{
+		4,    // KeyEvent
+		1,    // down
+		0, 0, // padding
+		0, 0, 0, 'a',
+	})
+	writeAll(t, conn, []byte{
+		4,    // KeyEvent
+		0,    // up
+		0, 0, // padding
+		0, 0, 0, 'a',
+	})
+	writeAll(t, conn, []byte{
+		5,     // PointerEvent
+		0x05,  // left + right buttons
+		0, 12, // x
+		0, 34, // y
+	})
+
+	first := readInputEvent(t, input.events)
+	if first.kind != "key" || !first.down || first.keysym != 'a' {
+		t.Fatalf("first input event: got %+v", first)
+	}
+
+	second := readInputEvent(t, input.events)
+	if second.kind != "key" || second.down || second.keysym != 'a' {
+		t.Fatalf("second input event: got %+v", second)
+	}
+
+	third := readInputEvent(t, input.events)
+	if third.kind != "pointer" || third.buttonMask != 0x05 || third.x != 12 || third.y != 34 {
+		t.Fatalf("third input event: got %+v", third)
+	}
+}
+
+type vncInputEvent struct {
+	kind       string
+	down       bool
+	keysym     uint32
+	buttonMask uint8
+	x          uint16
+	y          uint16
+}
+
+type mockVNCInput struct {
+	events chan vncInputEvent
+}
+
+func (m *mockVNCInput) KeyEvent(down bool, keysym uint32) {
+	m.events <- vncInputEvent{kind: "key", down: down, keysym: keysym}
+}
+
+func (m *mockVNCInput) PointerEvent(buttonMask uint8, x, y uint16) {
+	m.events <- vncInputEvent{kind: "pointer", buttonMask: buttonMask, x: x, y: y}
+}
+
+func readInputEvent(t *testing.T, events <-chan vncInputEvent) vncInputEvent {
+	t.Helper()
+
+	select {
+	case event := <-events:
+		return event
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for VNC input event")
+	}
+
+	return vncInputEvent{}
 }
 
 func readN(t *testing.T, r io.Reader, n int) []byte {

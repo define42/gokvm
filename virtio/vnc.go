@@ -48,6 +48,12 @@ type vncFrame struct {
 	seq    uint64
 }
 
+// VNCInput receives input events decoded from RFB client messages.
+type VNCInput interface {
+	KeyEvent(down bool, keysym uint32)
+	PointerEvent(buttonMask uint8, x, y uint16)
+}
+
 // VNCDisplay exposes flushed virtio-gpu frames over the RFB/VNC protocol.
 type VNCDisplay struct {
 	listener net.Listener
@@ -63,6 +69,7 @@ type VNCDisplay struct {
 
 	conns map[net.Conn]struct{}
 	wg    sync.WaitGroup
+	input VNCInput
 }
 
 // NewVNCDisplay starts a VNC server listening on addr, such as ":5900".
@@ -90,6 +97,13 @@ func NewVNCDisplay(addr string) (*VNCDisplay, error) {
 // Addr returns the address the VNC server is listening on.
 func (d *VNCDisplay) Addr() string {
 	return d.listener.Addr().String()
+}
+
+// SetInput attaches an input sink for VNC keyboard and pointer events.
+func (d *VNCDisplay) SetInput(input VNCInput) {
+	d.mu.Lock()
+	d.input = input
+	d.mu.Unlock()
 }
 
 func (d *VNCDisplay) Flush(width, height int, img *image.RGBA) error {
@@ -224,13 +238,19 @@ func (d *VNCDisplay) serveConn(conn net.Conn) error {
 
 			lastSeq = frame.seq
 		case rfbMsgKeyEvent:
-			if err := discardFull(conn, 7); err != nil {
+			event, err := readKeyEvent(conn)
+			if err != nil {
 				return err
 			}
+
+			d.sendKeyEvent(event.down, event.keysym)
 		case rfbMsgPointerEvent:
-			if err := discardFull(conn, 5); err != nil {
+			event, err := readPointerEvent(conn)
+			if err != nil {
 				return err
 			}
+
+			d.sendPointerEvent(event.buttonMask, event.x, event.y)
 		case rfbMsgClientCutText:
 			if err := readClientCutText(conn); err != nil {
 				return err
@@ -273,6 +293,26 @@ func (d *VNCDisplay) handshake(conn net.Conn) error {
 	_, err := io.ReadFull(conn, clientInit[:])
 
 	return err
+}
+
+func (d *VNCDisplay) sendKeyEvent(down bool, keysym uint32) {
+	d.mu.Lock()
+	input := d.input
+	d.mu.Unlock()
+
+	if input != nil {
+		input.KeyEvent(down, keysym)
+	}
+}
+
+func (d *VNCDisplay) sendPointerEvent(buttonMask uint8, x, y uint16) {
+	d.mu.Lock()
+	input := d.input
+	d.mu.Unlock()
+
+	if input != nil {
+		input.PointerEvent(buttonMask, x, y)
+	}
 }
 
 func (d *VNCDisplay) snapshot() vncFrame {
@@ -321,6 +361,17 @@ type framebufferUpdateRequest struct {
 	height      uint16
 }
 
+type keyEvent struct {
+	down   bool
+	keysym uint32
+}
+
+type pointerEvent struct {
+	buttonMask uint8
+	x          uint16
+	y          uint16
+}
+
 func readFramebufferUpdateRequest(r io.Reader) (framebufferUpdateRequest, error) {
 	var b [9]byte
 	if _, err := io.ReadFull(r, b[:]); err != nil {
@@ -333,6 +384,31 @@ func readFramebufferUpdateRequest(r io.Reader) (framebufferUpdateRequest, error)
 		y:           binary.BigEndian.Uint16(b[3:5]),
 		width:       binary.BigEndian.Uint16(b[5:7]),
 		height:      binary.BigEndian.Uint16(b[7:9]),
+	}, nil
+}
+
+func readKeyEvent(r io.Reader) (keyEvent, error) {
+	var b [7]byte
+	if _, err := io.ReadFull(r, b[:]); err != nil {
+		return keyEvent{}, err
+	}
+
+	return keyEvent{
+		down:   b[0] != 0,
+		keysym: binary.BigEndian.Uint32(b[3:7]),
+	}, nil
+}
+
+func readPointerEvent(r io.Reader) (pointerEvent, error) {
+	var b [5]byte
+	if _, err := io.ReadFull(r, b[:]); err != nil {
+		return pointerEvent{}, err
+	}
+
+	return pointerEvent{
+		buttonMask: b[0],
+		x:          binary.BigEndian.Uint16(b[1:3]),
+		y:          binary.BigEndian.Uint16(b[3:5]),
 	}, nil
 }
 

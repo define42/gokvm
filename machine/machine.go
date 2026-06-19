@@ -35,10 +35,12 @@ const (
 	initrdAddr  = 0xf000000
 	highMemBase = 0x100000
 
-	serialIRQ    = 4
-	virtioNetIRQ = 9
-	virtioBlkIRQ = 10
-	virtioGPUIRQ = 11
+	serialIRQ      = 4
+	ps2KeyboardIRQ = 1
+	ps2MouseIRQ    = 12
+	virtioNetIRQ   = 9
+	virtioBlkIRQ   = 10
+	virtioGPUIRQ   = 11
 
 	pageTableBase = 0x30_000
 
@@ -266,6 +268,13 @@ func (m *Machine) AddGPUDisplay(display virtio.Display) error {
 	m.pci.Devices = append(m.pci.Devices, v)
 
 	return nil
+}
+
+func (m *Machine) AddPS2Input() virtio.VNCInput {
+	dev := iodev.NewPS2Controller(m.InjectPS2KeyboardIRQ, m.InjectPS2MouseIRQ)
+	m.AddDevice(dev)
+
+	return dev
 }
 
 // Translate translates a virtual address for all active CPUs
@@ -1066,6 +1075,32 @@ func (m *Machine) InjectSerialIRQ() error {
 	}
 
 	if err := kvm.IRQLineStatus(m.vmFd, serialIRQ, 1); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// InjectPS2KeyboardIRQ injects a keyboard controller interrupt.
+func (m *Machine) InjectPS2KeyboardIRQ() error {
+	if err := kvm.IRQLineStatus(m.vmFd, ps2KeyboardIRQ, 0); err != nil {
+		return err
+	}
+
+	if err := kvm.IRQLineStatus(m.vmFd, ps2KeyboardIRQ, 1); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// InjectPS2MouseIRQ injects a mouse controller interrupt.
+func (m *Machine) InjectPS2MouseIRQ() error {
+	if err := kvm.IRQLineStatus(m.vmFd, ps2MouseIRQ, 0); err != nil {
+		return err
+	}
+
+	if err := kvm.IRQLineStatus(m.vmFd, ps2MouseIRQ, 1); err != nil {
 		return err
 	}
 

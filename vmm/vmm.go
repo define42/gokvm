@@ -62,7 +62,12 @@ func (v *VMM) Init() error {
 	}
 
 	if len(v.GPU) > 0 || len(v.VNC) > 0 {
-		display, err := v.display()
+		var input virtio.VNCInput
+		if len(v.VNC) > 0 {
+			input = m.AddPS2Input()
+		}
+
+		display, err := v.display(input)
 		if err != nil {
 			return err
 		}
@@ -77,7 +82,7 @@ func (v *VMM) Init() error {
 	return nil
 }
 
-func (v *VMM) display() (virtio.Display, error) {
+func (v *VMM) display(input virtio.VNCInput) (virtio.Display, error) {
 	var displays []virtio.Display
 
 	if len(v.GPU) > 0 {
@@ -94,6 +99,7 @@ func (v *VMM) display() (virtio.Display, error) {
 			return nil, err
 		}
 
+		display.SetInput(input)
 		log.Printf("VNC listening on %s", display.Addr())
 		displays = append(displays, display)
 	}
