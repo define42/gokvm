@@ -2,6 +2,7 @@ package virtio
 
 import (
 	"encoding/binary"
+	"errors"
 	"log"
 	"sync"
 	"time"
@@ -13,6 +14,8 @@ import (
 
 const (
 	SectorSize = 512
+
+	blkFeatureRO = 1 << 5
 
 	blkNumQueues = 1
 	blkQueue     = 0
@@ -44,6 +47,8 @@ func StoreAddU16(p *uint16, delta uint16) {
 // Blk is a modern (virtio 1.0) block device.
 var _ pci.CapsAndMMIO = (*Blk)(nil)
 
+var errReadOnlyBlk = errors.New("virtio-blk: write to read-only device")
+
 type Blk struct {
 	*ModernTransport
 
@@ -51,6 +56,7 @@ type Blk struct {
 
 	// capacity is the device size in 512-byte sectors.
 	capacity uint64
+	readOnly bool
 
 	VirtQueue    [blkNumQueues]*SplitQueue
 	LastAvailIdx [blkNumQueues]uint16
@@ -90,9 +96,15 @@ func (v *Blk) GetDeviceHeader() pci.DeviceHeader {
 
 // ModernDevice implementation.
 
-// DeviceFeatures advertises no device-specific features; VIRTIO_F_VERSION_1 is
-// added by the transport.
-func (v *Blk) DeviceFeatures() uint64 { return 0 }
+// DeviceFeatures advertises device-specific block features; VIRTIO_F_VERSION_1
+// is added by the transport.
+func (v *Blk) DeviceFeatures() uint64 {
+	if v.readOnly {
+		return blkFeatureRO
+	}
+
+	return 0
+}
 
 func (v *Blk) NumQueues() int { return blkNumQueues }
 
@@ -214,13 +226,12 @@ func (v *Blk) IO() error {
 
 		var ioErr error
 
-		if blkReq.Type&0x1 == 0x1 {
+		isWrite := blkReq.Type&0x1 == 0x1
+		switch {
+		case isWrite && v.readOnly:
+			ioErr = errReadOnlyBlk
+		case isWrite:
 			_, ioErr = v.image.WriteAt(
-				data,
-				int64(blkReq.Sector*SectorSize),
-			)
-		} else {
-			_, ioErr = v.image.ReadAt(
 				data,
 				int64(blkReq.Sector*SectorSize),
 			)
@@ -228,6 +239,11 @@ func (v *Blk) IO() error {
 			if ioErr == nil {
 				ioErr = v.image.Sync()
 			}
+		default:
+			_, ioErr = v.image.ReadAt(
+				data,
+				int64(blkReq.Sector*SectorSize),
+			)
 		}
 
 		// Write status byte per virtio spec.
@@ -267,9 +283,23 @@ func NewBlk(path string, irq uint8, irqInjector IRQInjector, mem []byte) (*Blk, 
 		return nil, err
 	}
 
+	return newBlk(image, false, irq, irqInjector, mem), nil
+}
+
+func NewReadOnlyBlk(path string, irq uint8, irqInjector IRQInjector, mem []byte) (*Blk, error) {
+	image, err := disk.OpenReadOnly(path)
+	if err != nil {
+		return nil, err
+	}
+
+	return newBlk(image, true, irq, irqInjector, mem), nil
+}
+
+func newBlk(image disk.Image, readOnly bool, irq uint8, irqInjector IRQInjector, mem []byte) *Blk {
 	res := &Blk{
 		image:       image,
 		capacity:    uint64(image.Size()) / SectorSize,
+		readOnly:    readOnly,
 		irq:         irq,
 		IRQInjector: irqInjector,
 		kick:        make(chan interface{}, QueueSize),
@@ -280,5 +310,5 @@ func NewBlk(path string, irq uint8, irqInjector IRQInjector, mem []byte) (*Blk, 
 		return irqInjector.InjectVirtioBlkIRQ()
 	})
 
-	return res, nil
+	return res
 }

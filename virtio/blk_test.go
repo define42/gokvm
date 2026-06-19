@@ -112,6 +112,64 @@ func TestBlkDeviceConfigCapacity(t *testing.T) {
 	}
 }
 
+func TestReadOnlyBlkRejectsWrites(t *testing.T) {
+	t.Parallel()
+
+	f, err := os.CreateTemp("", "blk-ro-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer os.Remove(f.Name())
+
+	if _, err := f.Write(make([]byte, 2*virtio.SectorSize)); err != nil {
+		t.Fatal(err)
+	}
+
+	f.Close()
+
+	mem := make([]byte, 0x10000)
+	v, err := virtio.NewReadOnlyBlk(f.Name(), 10, &mockInjector{}, mem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.Close()
+
+	const virtioBlkFeatureRO = uint64(1 << 5)
+	if features := v.DeviceFeatures(); features&virtioBlkFeatureRO == 0 {
+		t.Fatalf("DeviceFeatures: missing read-only bit in 0x%x", features)
+	}
+
+	q := newSplitQueue()
+	q.Avail.Idx = 1
+
+	q.Desc[0].Addr = 0x1000
+	q.Desc[0].Len = 16
+	q.Desc[0].Next = 1
+
+	blkReq := (*virtio.BlkReq)(unsafe.Pointer(&mem[0x1000]))
+	blkReq.Type = 1 // write
+	blkReq.Sector = 0
+
+	q.Desc[1].Addr = 0x2000
+	q.Desc[1].Len = virtio.SectorSize
+	q.Desc[1].Next = 2
+
+	q.Desc[2].Addr = 0x3000
+	q.Desc[2].Len = 1
+
+	mem[0x3000] = 0
+	v.VirtQueue[0] = q
+
+	if err := v.IO(); err != nil {
+		t.Fatal(err)
+	}
+
+	if mem[0x3000] != 1 {
+		t.Fatalf("status: got %d, want VIRTIO_BLK_S_IOERR", mem[0x3000])
+	}
+}
+
 func TestIO(t *testing.T) {
 	t.Parallel()
 

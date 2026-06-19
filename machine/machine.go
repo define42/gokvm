@@ -151,6 +151,7 @@ type Machine struct {
 	devices        []iodev.Device
 	ioportHandlers [0x10000][2]func(port uint64, bytes []byte) error
 	stopped        uint32
+	vesaEnabled    bool
 }
 
 // Close stops vCPU goroutines and releases PCI device
@@ -252,6 +253,18 @@ func (m *Machine) AddDisk(diskPath string) error {
 
 	go v.IOThreadEntry()
 	// 00:02.0 for Virtio blk
+	m.pci.Devices = append(m.pci.Devices, v)
+
+	return nil
+}
+
+func (m *Machine) AddReadOnlyDisk(diskPath string) error {
+	v, err := virtio.NewReadOnlyBlk(diskPath, virtioBlkIRQ, m, m.mem)
+	if err != nil {
+		return err
+	}
+
+	go v.IOThreadEntry()
 	m.pci.Devices = append(m.pci.Devices, v)
 
 	return nil
@@ -547,11 +560,29 @@ func (m *Machine) LoadLinux(kernel, initrd io.ReaderAt, params string) error {
 		bootparam.MBBIOSEnd-bootparam.MBBIOSBegin,
 		bootparam.E820Reserved,
 	)
-	bootParam.AddE820Entry(
-		highMemBase,
-		uint64(len(m.mem)-highMemBase),
-		bootparam.E820Ram,
-	)
+	if m.vesaEnabled && vesaFramebufferEnd <= uint64(len(m.mem)) {
+		bootParam.AddE820Entry(
+			highMemBase,
+			vesaFramebufferBase-highMemBase,
+			bootparam.E820Ram,
+		)
+		bootParam.AddE820Entry(
+			vesaFramebufferBase,
+			vesaFramebufferReserveSize,
+			bootparam.E820Reserved,
+		)
+		bootParam.AddE820Entry(
+			vesaFramebufferEnd,
+			uint64(len(m.mem))-vesaFramebufferEnd,
+			bootparam.E820Ram,
+		)
+	} else {
+		bootParam.AddE820Entry(
+			highMemBase,
+			uint64(len(m.mem)-highMemBase),
+			bootparam.E820Ram,
+		)
+	}
 
 	bootParam.Hdr.VidMode = 0xFFFF                                                                  // Proto ALL
 	bootParam.Hdr.TypeOfLoader = 0xFF                                                               // Proto 2.00+
@@ -630,6 +661,9 @@ func (m *Machine) LoadLinux(kernel, initrd io.ReaderAt, params string) error {
 	m.AddDevice(iodev.NewCMOS(0xC000_0000, 0x0))
 	m.AddDevice(&iodev.Noop{Port: 0x80, Psize: 0xA0})
 	m.initIOPortHandlers()
+	if m.vesaEnabled {
+		m.installVESABIOS()
+	}
 
 	return nil
 }
@@ -1014,6 +1048,14 @@ func (m *Machine) initIOPortHandlers() {
 		return nil
 	}
 
+	funcInAbsent := func(port uint64, bytes []byte) error {
+		for i := range bytes {
+			bytes[i] = 0xff
+		}
+
+		return nil
+	}
+
 	funcError := func(port uint64, bytes []byte) error {
 		return fmt.Errorf("%w: unexpected io port 0x%x", kvm.ErrUnexpectedExitReason, port)
 	}
@@ -1055,21 +1097,18 @@ func (m *Machine) initIOPortHandlers() {
 		return nil
 	}
 
-	m.registerIOPortHandler(0, 0x10000, funcError, funcError)    // default handler
-	m.registerIOPortHandler(0xcf9, 0xcfa, funcNone, funcOutbCF9) // CF9
-	m.registerIOPortHandler(0x3c0, 0x3db, funcNone, funcNone)    // VGA
-	m.registerIOPortHandler(0x3b4, 0x3b6, funcNone, funcNone)    // VGA
-	m.registerIOPortHandler(0x2f8, 0x300, funcNone, funcNone)    // Serial port 2
-	m.registerIOPortHandler(0x3e8, 0x3f0, funcNone, funcNone)    // Serial port 3
-	m.registerIOPortHandler(0x2e8, 0x2f0, funcNone, funcNone)    // Serial port 4
-	m.registerIOPortHandler(0x170, 0x3f8, funcNone, funcNone)    // Legacy ISA/gameport/PNP/ATA probe ports
-	m.registerIOPortHandler(0xcfe, 0xcff, funcNone, funcNone)    // unknown
-	m.registerIOPortHandler(0xcfa, 0xcfc, funcNone, funcNone)    // unknown
-	m.registerIOPortHandler(0xc000, 0xd000, funcNone, funcNone)  // PCI Configuration Space Access Mechanism #2
-	m.registerIOPortHandler(0x279, 0x27a, funcNone, funcNone)    // ISA Plug and Play address port
-	m.registerIOPortHandler(0xa79, 0xa7a, funcNone, funcNone)    // ISA Plug and Play write-data port
-	m.registerIOPortHandler(0x60, 0x70, funcInbPS2, funcNone)    // PS/2 Keyboard (Always 8042 Chip)
-	m.registerIOPortHandler(0xed, 0xee, funcNone, funcNone)      // 0xed is the new standard delay port.
+	m.registerIOPortHandler(0, 0x10000, funcError, funcError)     // default handler
+	m.registerIOPortHandler(0xcf9, 0xcfa, funcNone, funcOutbCF9)  // CF9
+	m.registerIOPortHandler(0x170, 0x3f8, funcInAbsent, funcNone) // Absent legacy ISA/gameport/PNP/ATA ports
+	m.registerIOPortHandler(0x3c0, 0x3db, funcNone, funcNone)     // VGA
+	m.registerIOPortHandler(0x3b4, 0x3b6, funcNone, funcNone)     // VGA
+	m.registerIOPortHandler(0xcfe, 0xcff, funcNone, funcNone)     // unknown
+	m.registerIOPortHandler(0xcfa, 0xcfc, funcNone, funcNone)     // unknown
+	m.registerIOPortHandler(0xc000, 0xd000, funcNone, funcNone)   // PCI Configuration Space Access Mechanism #2
+	m.registerIOPortHandler(0x279, 0x27a, funcNone, funcNone)     // ISA Plug and Play address port
+	m.registerIOPortHandler(0xa79, 0xa7a, funcNone, funcNone)     // ISA Plug and Play write-data port
+	m.registerIOPortHandler(0x60, 0x70, funcInbPS2, funcNone)     // PS/2 Keyboard (Always 8042 Chip)
+	m.registerIOPortHandler(0xed, 0xee, funcNone, funcNone)       // 0xed is the new standard delay port.
 
 	// Serial port 1
 	m.registerIOPortHandler(serial.COM1Addr, serial.COM1Addr+8, m.serial.In, m.serial.Out)

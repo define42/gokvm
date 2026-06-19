@@ -3,6 +3,7 @@ package vmm
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/bobuhiro11/gokvm/iso9660"
@@ -23,7 +25,8 @@ import (
 var errDownloadISO = errors.New("download ISO failed")
 
 const isoCompatibilityParams = "console=tty0 console=ttyS0 earlyprintk=serial " +
-	"noapic noacpi notsc nowatchdog nmi_watchdog=0 mitigations=off " +
+	"desktop=flwm icons=wbar xvesa=1024x768x32 " +
+	"noapic noacpi nortc notsc nowatchdog nmi_watchdog=0 mitigations=off " +
 	"lapic tsc_early_khz=2000 pci=realloc=off virtio_pci.force_legacy=1"
 
 // Config defines the configuration of the
@@ -52,6 +55,7 @@ type VMM struct {
 	serialOutput io.Writer
 	vncDisplay   *virtio.VNCDisplay
 	vncInput     virtio.VNCInput
+	isoCleanup   func()
 }
 
 func New(c Config) *VMM {
@@ -97,6 +101,7 @@ func (v *VMM) Init() error {
 		}
 
 		if len(v.ISO) > 0 && v.vncDisplay != nil {
+			m.EnableVESA(v.vncDisplay)
 			m.StartVGATextFallback(v.vncDisplay)
 		}
 	}
@@ -182,7 +187,13 @@ func (v *VMM) setupISO() error {
 	if err != nil {
 		return err
 	}
-	defer cleanup()
+
+	cleanupOnError := true
+	defer func() {
+		if cleanupOnError {
+			cleanup()
+		}
+	}()
 
 	info, err := isoFile.Stat()
 	if err != nil {
@@ -206,6 +217,19 @@ func (v *VMM) setupISO() error {
 
 	log.Printf("ISO boot: kernel=%s initrd=%s", files.KernelPath, files.InitrdPath)
 
+	if err := v.AddReadOnlyDisk(isoFile.Name()); err != nil {
+		return fmt.Errorf("attach ISO media: %w", err)
+	}
+	log.Printf("ISO media attached as read-only virtio-blk: %s", isoFile.Name())
+
+	if v.VNC != "" && hasTinyCoreGUI(isoReader) {
+		files.Initrd, err = addTinyCoreVNCAutostart(files.Initrd)
+		if err != nil {
+			return err
+		}
+		log.Printf("ISO boot: added TinyCore VNC desktop autostart overlay")
+	}
+
 	kern := bytes.NewReader(files.Kernel)
 	initrd := readerAtOrNil(files.Initrd)
 
@@ -224,6 +248,8 @@ func (v *VMM) setupISO() error {
 
 	v.attachSerialOutput()
 	v.attachSerialInput()
+	v.isoCleanup = cleanup
+	cleanupOnError = false
 
 	return nil
 }
@@ -406,8 +432,177 @@ func serialBytesForKeysym(keysym uint32) []byte {
 	}
 }
 
+func hasTinyCoreGUI(r *iso9660.Reader) bool {
+	if _, err := r.ReadFile("/cde/onboot.lst"); err != nil {
+		return false
+	}
+
+	if _, err := r.ReadFile("/cde/optional/Xvesa.tcz"); err != nil {
+		return false
+	}
+
+	return true
+}
+
+func addTinyCoreVNCAutostart(initrd []byte) ([]byte, error) {
+	const autologin = `#!/bin/sh
+if [ -f /var/log/autologin ]; then
+	exec /sbin/getty 38400 tty1
+fi
+touch /var/log/autologin
+TCUSER="$(cat /etc/sysconfig/tcuser 2>/dev/null || echo tc)"
+if command -v Xvesa >/dev/null 2>&1 && \
+	command -v flwm >/dev/null 2>&1 && \
+	[ -f /etc/sysconfig/Xserver ] && \
+	[ ! -f /etc/sysconfig/text ]; then
+	[ -s /etc/sysconfig/desktop ] || echo flwm > /etc/sysconfig/desktop
+	[ -s /etc/sysconfig/icons ] || echo wbar > /etc/sysconfig/icons
+	for file in .xsession .setbackground .Xdefaults; do
+		if [ ! -e /home/"$TCUSER"/"$file" ] && [ -e /etc/skel/"$file" ]; then
+			cp /etc/skel/"$file" /home/"$TCUSER"/
+			chown "$TCUSER":staff /home/"$TCUSER"/"$file" 2>/dev/null || chown "$TCUSER" /home/"$TCUSER"/"$file"
+		fi
+	done
+	cat > /tmp/gokvm-vnc-session <<'EOF'
+#!/bin/sh
+export DISPLAY=:0.0
+export DESKTOP=flwm
+export ICONS=wbar
+Xvesa -br -screen 1024x768x32 -2button -mouse /dev/input/mice,5 -nolisten tcp -I >/tmp/Xvesa.log 2>&1 &
+XPID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+	waitforX >/dev/null 2>&1 && break
+	sleep 0.2
+done
+flwm >/tmp/flwm.log 2>&1 &
+[ -x "$HOME/.setbackground" ] && "$HOME/.setbackground" >/tmp/background.log 2>&1
+wbar.sh >/tmp/wbar.log 2>&1 &
+wait "$XPID"
+EOF
+	chmod 755 /tmp/gokvm-vnc-session
+	chown "$TCUSER":staff /tmp/gokvm-vnc-session 2>/dev/null || chown "$TCUSER" /tmp/gokvm-vnc-session
+	exec su "$TCUSER" -c /tmp/gokvm-vnc-session
+fi
+exec login -f "$TCUSER"
+`
+
+	return appendInitramfsFile(initrd, "sbin/autologin", []byte(autologin), 0o100755)
+}
+
+func appendInitramfsFile(initrd []byte, name string, data []byte, mode uint32) ([]byte, error) {
+	raw := initrd
+	compressed := len(initrd) >= 2 && initrd[0] == 0x1f && initrd[1] == 0x8b
+	if compressed {
+		zr, err := gzip.NewReader(bytes.NewReader(initrd))
+		if err != nil {
+			return nil, fmt.Errorf("initramfs gzip: %w", err)
+		}
+
+		raw, err = io.ReadAll(zr)
+		closeErr := zr.Close()
+		if err != nil {
+			return nil, fmt.Errorf("initramfs decompress: %w", err)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("initramfs gzip close: %w", closeErr)
+		}
+	}
+
+	if trimmed, ok := trimNewcTrailer(raw); ok {
+		raw = trimmed
+	}
+
+	buf := bytes.NewBuffer(make([]byte, 0, len(raw)+len(data)+512))
+	buf.Write(raw)
+	writeNewcEntry(buf, name, mode, data)
+	writeNewcEntry(buf, "TRAILER!!!", 0, nil)
+
+	if !compressed {
+		return buf.Bytes(), nil
+	}
+
+	var out bytes.Buffer
+	zw := gzip.NewWriter(&out)
+	if _, err := zw.Write(buf.Bytes()); err != nil {
+		return nil, fmt.Errorf("initramfs recompress: %w", err)
+	}
+	if err := zw.Close(); err != nil {
+		return nil, fmt.Errorf("initramfs gzip finish: %w", err)
+	}
+
+	return out.Bytes(), nil
+}
+
+func trimNewcTrailer(data []byte) ([]byte, bool) {
+	for off := 0; off+110 <= len(data); {
+		if string(data[off:off+6]) != "070701" {
+			return nil, false
+		}
+
+		filesize, ok := parseNewcHex(data[off+54 : off+62])
+		if !ok {
+			return nil, false
+		}
+
+		namesize, ok := parseNewcHex(data[off+94 : off+102])
+		if !ok || namesize == 0 {
+			return nil, false
+		}
+
+		nameStart := off + 110
+		nameEnd := nameStart + int(namesize)
+		if nameEnd > len(data) {
+			return nil, false
+		}
+
+		name := string(bytes.TrimRight(data[nameStart:nameEnd], "\x00"))
+		next := align4(nameEnd) + align4(int(filesize))
+		if next > len(data) {
+			return nil, false
+		}
+
+		if name == "TRAILER!!!" {
+			return data[:off], true
+		}
+
+		off = next
+	}
+
+	return nil, false
+}
+
+func writeNewcEntry(buf *bytes.Buffer, name string, mode uint32, data []byte) {
+	namesize := len(name) + 1
+	fmt.Fprintf(buf,
+		"070701%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x",
+		1, mode, 0, 0, 1, 0, len(data), 0, 0, 0, 0, namesize, 0,
+	)
+	buf.WriteString(name)
+	buf.WriteByte(0)
+	padBuffer(buf)
+	buf.Write(data)
+	padBuffer(buf)
+}
+
+func parseNewcHex(data []byte) (uint64, bool) {
+	v, err := strconv.ParseUint(string(data), 16, 64)
+
+	return v, err == nil
+}
+
+func align4(n int) int {
+	return (n + 3) &^ 3
+}
+
+func padBuffer(buf *bytes.Buffer) {
+	for buf.Len()%4 != 0 {
+		buf.WriteByte(0)
+	}
+}
+
 func (v *VMM) Boot() error {
 	var err error
+	defer v.cleanupISO()
 
 	trace := v.TraceCount > 0
 	if err := v.SingleStep(trace); err != nil {
@@ -464,4 +659,13 @@ func (v *VMM) Boot() error {
 	fmt.Printf("All cpus done\n\r")
 
 	return nil
+}
+
+func (v *VMM) cleanupISO() {
+	if v.isoCleanup == nil {
+		return
+	}
+
+	v.isoCleanup()
+	v.isoCleanup = nil
 }

@@ -89,6 +89,7 @@ type VNCDisplay struct {
 	textMu       sync.Mutex
 	textConsole  *vncTextConsole
 	textDisabled bool
+	serialMuted  bool
 }
 
 // NewVNCDisplay starts a VNC server listening on addr, such as ":5900".
@@ -159,7 +160,7 @@ func (d *VNCDisplay) flush(width, height int, img *image.RGBA) error {
 // Write mirrors serial console bytes into VNC until virtio-gpu flushes a frame.
 func (d *VNCDisplay) Write(p []byte) (int, error) {
 	d.textMu.Lock()
-	if d.textDisabled {
+	if d.textDisabled || d.serialMuted {
 		d.textMu.Unlock()
 
 		return len(p), nil
@@ -221,10 +222,69 @@ func (d *VNCDisplay) StartVGATextFallback(mem []byte) {
 			}
 
 			rendered = true
+			d.muteSerialFallback()
 			img := renderVGAText(snap)
 			_ = d.flush(img.Bounds().Dx(), img.Bounds().Dy(), img)
 		}
 	}()
+}
+
+// StartLinearFramebufferFallback renders a guest linear BGRX framebuffer into
+// VNC until a real virtio-gpu frame is flushed.
+func (d *VNCDisplay) StartLinearFramebufferFallback(mem []byte, base, width, height, stride int) {
+	if base < 0 || width <= 0 || height <= 0 || stride < width*4 {
+		return
+	}
+
+	size := stride * height
+	if len(mem) < base+size {
+		return
+	}
+
+	go func() {
+		ticker := time.NewTicker(33 * time.Millisecond)
+		defer ticker.Stop()
+
+		var last []byte
+		rendered := false
+
+		for {
+			select {
+			case <-d.done:
+				return
+			case <-ticker.C:
+			}
+
+			d.textMu.Lock()
+			disabled := d.textDisabled
+			d.textMu.Unlock()
+			if disabled {
+				return
+			}
+
+			snap := make([]byte, size)
+			copy(snap, mem[base:base+size])
+			if bytes.Equal(snap, last) {
+				continue
+			}
+
+			last = snap
+			if !rendered && framebufferBlank(snap) {
+				continue
+			}
+
+			rendered = true
+			d.muteSerialFallback()
+			img := renderLinearFramebuffer(snap, width, height, stride)
+			_ = d.flush(width, height, img)
+		}
+	}()
+}
+
+func (d *VNCDisplay) muteSerialFallback() {
+	d.textMu.Lock()
+	d.serialMuted = true
+	d.textMu.Unlock()
 }
 
 func (d *VNCDisplay) Close() error {
@@ -939,4 +999,30 @@ func vgaColor(idx byte) color.Color {
 	}
 
 	return palette[idx&0x0f]
+}
+
+func renderLinearFramebuffer(frame []byte, width, height, stride int) *image.RGBA {
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			src := y*stride + x*4
+			dst := img.PixOffset(x, y)
+			img.Pix[dst+0] = frame[src+2]
+			img.Pix[dst+1] = frame[src+1]
+			img.Pix[dst+2] = frame[src+0]
+			img.Pix[dst+3] = 0xff
+		}
+	}
+
+	return img
+}
+
+func framebufferBlank(frame []byte) bool {
+	for _, b := range frame {
+		if b != 0 {
+			return false
+		}
+	}
+
+	return true
 }

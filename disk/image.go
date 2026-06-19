@@ -19,12 +19,21 @@ type Image interface {
 const qcow2Magic = "QFI\xfb"
 
 type rawImage struct {
-	file *os.File
-	size int64
+	file     *os.File
+	size     int64
+	readOnly bool
 }
 
 func Open(path string) (Image, error) {
-	file, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	return open(path, os.O_RDWR, false)
+}
+
+func OpenReadOnly(path string) (Image, error) {
+	return open(path, os.O_RDONLY, true)
+}
+
+func open(path string, flag int, readOnly bool) (Image, error) {
+	file, err := os.OpenFile(path, flag, 0o644)
 	if err != nil {
 		return nil, err
 	}
@@ -49,8 +58,9 @@ func Open(path string) (Image, error) {
 	}
 
 	return &rawImage{
-		file: file,
-		size: info.Size(),
+		file:     file,
+		size:     info.Size(),
+		readOnly: readOnly,
 	}, nil
 }
 
@@ -67,6 +77,10 @@ func (r *rawImage) Size() int64 {
 }
 
 func (r *rawImage) Sync() error {
+	if r.readOnly {
+		return nil
+	}
+
 	return r.file.Sync()
 }
 

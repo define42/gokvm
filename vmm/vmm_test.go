@@ -1,6 +1,9 @@
 package vmm
 
 import (
+	"bytes"
+	"compress/gzip"
+	"io"
 	"strings"
 	"testing"
 )
@@ -14,8 +17,12 @@ func TestISOCmdlineAddsCompatibilityParams(t *testing.T) {
 		"console=tty0",
 		"console=ttyS0",
 		"earlyprintk=serial",
+		"desktop=flwm",
+		"icons=wbar",
+		"xvesa=1024x768x32",
 		"noapic",
 		"noacpi",
+		"nortc",
 		"notsc",
 		"pci=realloc=off",
 		"virtio_pci.force_legacy=1",
@@ -43,6 +50,66 @@ func TestISOCmdlineDoesNotDuplicateExistingParams(t *testing.T) {
 
 	if !hasField(cmdline, "pci=nomsi") {
 		t.Fatalf("cmdline %q should keep ISO pci= parameter", cmdline)
+	}
+}
+
+func TestAddTinyCoreVNCAutostart(t *testing.T) {
+	t.Parallel()
+
+	var raw bytes.Buffer
+	writeNewcEntry(&raw, "TRAILER!!!", 0, nil)
+
+	var compressed bytes.Buffer
+	zw := gzip.NewWriter(&compressed)
+	if _, err := zw.Write(raw.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	patched, err := addTinyCoreVNCAutostart(compressed.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	zr, err := gzip.NewReader(bytes.NewReader(patched))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer zr.Close()
+
+	data, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Contains(data, []byte("sbin/autologin")) {
+		t.Fatalf("patched initramfs does not contain autologin overlay")
+	}
+
+	if !bytes.Contains(data, []byte("echo flwm > /etc/sysconfig/desktop")) {
+		t.Fatalf("patched initramfs does not seed TinyCore desktop")
+	}
+
+	if !bytes.Contains(data, []byte("echo wbar > /etc/sysconfig/icons")) {
+		t.Fatalf("patched initramfs does not seed TinyCore icons")
+	}
+
+	if bytes.Contains(data, []byte("Xvesa -listmodes")) {
+		t.Fatalf("patched initramfs still contains diagnostic Xvesa mode probe")
+	}
+
+	if !bytes.Contains(data, []byte("/tmp/gokvm-vnc-session")) {
+		t.Fatalf("patched initramfs does not create the VNC session script")
+	}
+
+	if !bytes.Contains(data, []byte("flwm >/tmp/flwm.log")) {
+		t.Fatalf("patched initramfs does not start flwm")
+	}
+
+	if !bytes.Contains(data, []byte("wbar.sh >/tmp/wbar.log")) {
+		t.Fatalf("patched initramfs does not start wbar")
 	}
 }
 

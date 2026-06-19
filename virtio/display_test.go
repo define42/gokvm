@@ -320,6 +320,75 @@ func TestVNCDisplayVGATextFallback(t *testing.T) {
 	}
 }
 
+func TestVNCDisplayLinearFramebufferFallback(t *testing.T) {
+	t.Parallel()
+
+	d, err := virtio.NewVNCDisplay("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	mem := make([]byte, 0x1000)
+	d.StartLinearFramebufferFallback(mem, 0x100, 2, 1, 8)
+	copy(mem[0x100:], []byte{0x10, 0x20, 0x30, 0x00, 0x40, 0x50, 0x60, 0x00})
+
+	conn, err := net.Dial("tcp", d.Addr())
+	if err != nil {
+		if errors.Is(err, syscall.ENETUNREACH) {
+			t.Skipf("loopback is unreachable in this network namespace: %v", err)
+		}
+
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	version := readN(t, conn, 12)
+	writeAll(t, conn, version)
+	readN(t, conn, 2)
+	writeAll(t, conn, []byte{1})
+	readN(t, conn, 4)
+	writeAll(t, conn, []byte{1})
+	serverInit := readN(t, conn, 24)
+	width := binary.BigEndian.Uint16(serverInit[0:2])
+	height := binary.BigEndian.Uint16(serverInit[2:4])
+	nameLen := binary.BigEndian.Uint32(serverInit[20:24])
+	readN(t, conn, int(nameLen))
+
+	deadline := time.After(2 * time.Second)
+	for {
+		writeAll(t, conn, []byte{
+			3,    // FramebufferUpdateRequest
+			0,    // incremental = false
+			0, 0, // x
+			0, 0, // y
+			byte(width >> 8), byte(width),
+			byte(height >> 8), byte(height),
+		})
+
+		header := readN(t, conn, 4)
+		rects := binary.BigEndian.Uint16(header[2:4])
+		if rects == 0 {
+			continue
+		}
+
+		rect := readN(t, conn, 12)
+		rectWidth := binary.BigEndian.Uint16(rect[4:6])
+		rectHeight := binary.BigEndian.Uint16(rect[6:8])
+		pixels := readN(t, conn, int(rectWidth)*int(rectHeight)*4)
+		if bytes.Count(pixels, []byte{0}) != len(pixels) {
+			return
+		}
+
+		select {
+		case <-deadline:
+			t.Fatal("linear framebuffer fallback did not render BGRX pixels")
+		default:
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+}
+
 type vncInputEvent struct {
 	kind       string
 	down       bool
