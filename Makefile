@@ -1,10 +1,12 @@
 GOLANGCI_LINT_VERSION = v2.12.2
 
-export GOPATH := $(shell go env GOPATH)
+GO ?= $(shell go env GOROOT)/bin/go
+
+export GOPATH := $(shell $(GO) env GOPATH)
 export PATH := $(GOPATH)/bin:$(PATH)
 
 $(GOPATH)/bin/stringer:
-	go install golang.org/x/tools/cmd/stringer@latest
+	$(GO) install golang.org/x/tools/cmd/stringer@latest
 
 $(GOPATH)/src/github.com/u-root/u-root:
 	git clone --depth=1 --branch v0.16.0 \
@@ -12,11 +14,11 @@ $(GOPATH)/src/github.com/u-root/u-root:
 
 $(GOPATH)/bin/u-root: $(GOPATH)/src/github.com/u-root/u-root
 	cd $(GOPATH)/src/github.com/u-root/u-root \
-	  && go install .
+	  && $(GO) install .
 
 gokvm: $(wildcard *.go) $(wildcard */*.go)
 	$(MAKE) generate
-	go build .
+	$(GO) build .
 
 golangci-lint:
 	curl --retry 5 -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/$(GOLANGCI_LINT_VERSION)/install.sh \
@@ -62,25 +64,25 @@ bzImage_PVH vmlinux_PVH CLOUDHV.fd: linux_pvh.config ./scripts/get_kernel.bash
 .PHONY: run
 run: initrd bzImage
 	$(MAKE) generate
-	go run . boot -c 4 -i "./initrd"
+	$(GO) run . boot -c 4 -i "./initrd"
 
 .PHONY: runpvh
 runpvh: initrd vmlinux_PVH
 	$(MAKE) generate
-	go run . boot -c 4 -k "./vmlinuz_PVH" -i "./initrd"
+	$(GO) run . boot -c 4 -k "./vmlinuz_PVH" -i "./initrd"
 
 .PHONY: run-system-kernel
 run-system-kernel:
 	$(MAKE) generate
 	# Implemented based on fedora's default path.
 	# Other distributions need to be considered.
-	go run . boot -k $(shell ls -t /boot/vmlinuz*.x86_64 | head -n 1) \
+	$(GO) run . boot -k $(shell ls -t /boot/vmlinuz*.x86_64 | head -n 1) \
 		-p "console=ttyS0 pci=off earlyprintk=serial nokaslr rdinit=/bin/sh" \
 		-i $(shell ls -t /boot/initramfs*.x86_64.img | head -n 1)
 
 .PHONY: generate
 generate: $(GOPATH)/bin/stringer
-	go generate ./...
+	$(GO) generate ./...
 
 .PHONY: golangci
 golangci: golangci-lint
@@ -91,8 +93,8 @@ golangci: golangci-lint
 test: bzImage vmlinux vmlinux_PVH initrd vda.img CLOUDHV.fd
 	$(MAKE) generate
 	$(MAKE) golangci
-	unshare --user --net --map-root-user go test -timeout 30m -coverprofile c.out ./...
-	go mod tidy && git diff --no-patch --exit-code go.sum
+	unshare --user --net --map-root-user $(GO) test -timeout 30m -coverprofile c.out ./...
+	$(GO) mod tidy && git diff --no-patch --exit-code go.sum
 
 .PHONY: clean
 clean:

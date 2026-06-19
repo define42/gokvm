@@ -49,6 +49,7 @@ if [ $? -ne 0 ]; then
     -files "${terminfo_linux}:/usr/share/terminfo/l/linux" \
     -files "/usr/share/misc/pci.ids" \
     -files "${pwd}/.bashrc:.bashrc" \
+    -files "${pwd}/.bashrc:bbin/uinit" \
     -files "/dev/null:$md5sum" \
     core boot github.com/u-root/u-root/cmds/exp/srvfiles)
 fi

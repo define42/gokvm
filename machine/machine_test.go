@@ -27,6 +27,8 @@ type syncBuf struct {
 	buf bytes.Buffer
 }
 
+const guestNetworkTimeout = 5 * time.Minute
+
 func (b *syncBuf) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -41,11 +43,11 @@ func (b *syncBuf) String() string {
 	return b.buf.String()
 }
 
-// waitForPing polls ping every 2s up to 300s until it succeeds.
+// waitForPing polls ping every 2s until it succeeds.
 func waitForPing(t *testing.T, ip string) {
 	t.Helper()
 
-	deadline := time.Now().Add(300 * time.Second)
+	deadline := time.Now().Add(guestNetworkTimeout)
 
 	for {
 		out, err := exec.Command(
@@ -59,22 +61,21 @@ func waitForPing(t *testing.T, ip string) {
 		}
 
 		if time.Now().After(deadline) {
-			t.Fatalf("ping %s timed out after 300s: %s",
-				ip, out)
+			t.Fatalf("ping %s timed out after %s: %s",
+				ip, guestNetworkTimeout, out)
 		}
 
 		time.Sleep(2 * time.Second)
 	}
 }
 
-// waitForHTTP polls curl every 2s up to 300s until
-// the response body equals expected.
+// waitForHTTP polls curl every 2s until the response body equals expected.
 func waitForHTTP(
 	t *testing.T, url, expected string,
 ) string {
 	t.Helper()
 
-	deadline := time.Now().Add(300 * time.Second)
+	deadline := time.Now().Add(guestNetworkTimeout)
 
 	attempt := 0
 
@@ -104,8 +105,8 @@ func waitForHTTP(
 		if time.Now().After(deadline) {
 			t.Fatalf(
 				"curl %s timed out after %d attempts"+
-					" (300s): last body=%q err=%v",
-				url, attempt, body, err)
+					" (%s): last body=%q err=%v",
+				url, attempt, guestNetworkTimeout, body, err)
 		}
 
 		time.Sleep(2 * time.Second)
@@ -179,8 +180,8 @@ func testNewAndLoadLinux(t *testing.T, kernel, tap, guestIPv4, hostIPv4, prefixL
 		t.Fatal(err)
 	}
 
-	param := fmt.Sprintf(`console=ttyS0 earlyprintk=serial noapic noacpi notsc nosmp `+
-		`lapic tsc_early_khz=2000 pci=realloc=off virtio_pci.force_legacy=1 `+
+	param := fmt.Sprintf(`console=ttyS0 earlyprintk=serial noapic noacpi nosmp `+
+		`lapic pci=realloc=off virtio_pci.force_legacy=1 `+
 		`rdinit=/init init=/init gokvm.ipv4_addr=%s/%s`, guestIPv4, prefixLen)
 
 	kern, err := os.Open(kernel)

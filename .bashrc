@@ -53,8 +53,10 @@ fi
 
 # Start HTTP server AFTER mount so the first 200 OK
 # response already contains the mounted content.
-srvfiles -h 0.0.0.0 -p 80 > /tmp/srvfiles.log 2>&1 &
-echo "srvfiles started as PID=$!"
-ps
+echo "starting srvfiles"
+if [ "${0##*/}" = "uinit" ]; then
+  exec /bbin/srvfiles -h 0.0.0.0 -p 80 -d /
+fi
+/bbin/srvfiles -h 0.0.0.0 -p 80 -d / &
 
 echo 'loading .bashrc finished.'
