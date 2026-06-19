@@ -8,6 +8,7 @@ const (
 
 	ps2ACK     = byte(0xfa)
 	ps2BATPass = byte(0xaa)
+	ps2Resend  = byte(0xfe)
 
 	ps2StatusOutputFull = byte(1 << 0)
 	ps2StatusSystemFlag = byte(1 << 2)
@@ -32,6 +33,8 @@ const (
 	ps2ExpectNone ps2Expect = iota
 	ps2ExpectControllerConfig
 	ps2ExpectKeyboardParam
+	ps2ExpectKeyboardOutput
+	ps2ExpectMouseOutput
 	ps2ExpectMouseCommand
 )
 
@@ -48,6 +51,9 @@ type PS2Controller struct {
 	mouseEnabled    bool
 	mouseReporting  bool
 	mouseParam      bool
+	mouseParamCmd   byte
+	mouseID         byte
+	mouseSamples    [3]byte
 
 	mouseButtons uint8
 	mouseX       uint16
@@ -172,9 +178,10 @@ func (p *PS2Controller) PointerEvent(buttonMask uint8, x, y uint16) {
 	buttons := ps2Buttons(buttonMask)
 	oldButtons := p.mouseButtons
 	p.mouseButtons = buttons
+	mouseID := p.mouseID
 	p.mu.Unlock()
 
-	p.enqueueMouseMotion(buttons, oldButtons, dx, dy)
+	p.enqueueMouseMotion(buttons, oldButtons, dx, dy, int(mouseID), ps2WheelDelta(buttonMask))
 }
 
 func (p *PS2Controller) writeCommand(cmd byte) {
@@ -213,6 +220,14 @@ func (p *PS2Controller) writeCommand(cmd byte) {
 		p.mu.Lock()
 		p.expect = ps2ExpectMouseCommand
 		p.mu.Unlock()
+	case 0xd2: // Next data byte appears in the keyboard output buffer.
+		p.mu.Lock()
+		p.expect = ps2ExpectKeyboardOutput
+		p.mu.Unlock()
+	case 0xd3: // Next data byte appears in the aux output buffer.
+		p.mu.Lock()
+		p.expect = ps2ExpectMouseOutput
+		p.mu.Unlock()
 	default:
 	}
 }
@@ -232,6 +247,10 @@ func (p *PS2Controller) writeData(v byte) {
 		p.mu.Unlock()
 	case ps2ExpectKeyboardParam:
 		p.enqueue([]byte{ps2ACK}, false)
+	case ps2ExpectKeyboardOutput:
+		p.enqueue([]byte{v}, false)
+	case ps2ExpectMouseOutput:
+		p.enqueue([]byte{v}, true)
 	case ps2ExpectMouseCommand:
 		p.handleMouseCommand(v)
 	default:
@@ -270,7 +289,12 @@ func (p *PS2Controller) handleKeyboardCommand(cmd byte) {
 func (p *PS2Controller) handleMouseCommand(cmd byte) {
 	p.mu.Lock()
 	if p.mouseParam {
+		paramCmd := p.mouseParamCmd
 		p.mouseParam = false
+		p.mouseParamCmd = 0
+		if paramCmd == 0xf3 {
+			p.recordMouseSampleLocked(cmd)
+		}
 		p.mu.Unlock()
 		p.enqueue([]byte{ps2ACK}, true)
 
@@ -280,12 +304,21 @@ func (p *PS2Controller) handleMouseCommand(cmd byte) {
 
 	switch cmd {
 	case 0xff: // Reset.
+		p.mu.Lock()
+		p.mouseReporting = false
+		p.mouseID = 0
+		p.mouseSamples = [3]byte{}
+		p.mu.Unlock()
 		p.enqueue([]byte{ps2ACK, ps2BATPass, 0x00}, true)
 	case 0xf2: // Get device ID: standard PS/2 mouse.
-		p.enqueue([]byte{ps2ACK, 0x00}, true)
+		p.mu.Lock()
+		id := p.mouseID
+		p.mu.Unlock()
+		p.enqueue([]byte{ps2ACK, id}, true)
 	case 0xf3, 0xe8: // Set sample rate / resolution, then parameter byte.
 		p.mu.Lock()
 		p.mouseParam = true
+		p.mouseParamCmd = cmd
 		p.mu.Unlock()
 		p.enqueue([]byte{ps2ACK}, true)
 	case 0xf4: // Enable data reporting.
@@ -300,8 +333,23 @@ func (p *PS2Controller) handleMouseCommand(cmd byte) {
 		p.enqueue([]byte{ps2ACK}, true)
 	case 0xe9: // Status request.
 		p.enqueue([]byte{ps2ACK, 0x00, 0x02, 100}, true)
-	default:
+	case 0xe6, 0xe7, 0xea, 0xec, 0xee, 0xf0, 0xf6:
+		if cmd == 0xf6 {
+			p.mu.Lock()
+			p.mouseReporting = false
+			p.mu.Unlock()
+		}
 		p.enqueue([]byte{ps2ACK}, true)
+	case 0xeb: // Read data.
+		p.mu.Lock()
+		buttons := p.mouseButtons
+		p.mu.Unlock()
+		p.mu.Lock()
+		mouseID := int(p.mouseID)
+		p.mu.Unlock()
+		p.enqueue(append([]byte{ps2ACK}, ps2MousePacket(buttons, 0, 0, mouseID, 0)...), true)
+	default:
+		p.enqueue([]byte{ps2Resend}, true)
 	}
 }
 
@@ -364,19 +412,34 @@ func (p *PS2Controller) injectIRQ(aux bool) {
 	}
 }
 
-func (p *PS2Controller) enqueueMouseMotion(buttons, oldButtons uint8, dx, dy int) {
-	for dx != 0 || dy != 0 || buttons != oldButtons {
+func (p *PS2Controller) recordMouseSampleLocked(sample byte) {
+	p.mouseSamples[0] = p.mouseSamples[1]
+	p.mouseSamples[1] = p.mouseSamples[2]
+	p.mouseSamples[2] = sample
+
+	switch p.mouseSamples {
+	case [3]byte{200, 100, 80}:
+		p.mouseID = 3
+	case [3]byte{200, 200, 80}:
+		p.mouseID = 4
+	}
+}
+
+func (p *PS2Controller) enqueueMouseMotion(buttons, oldButtons uint8, dx, dy int, mouseID, wheel int) {
+	for dx != 0 || dy != 0 || wheel != 0 || buttons != oldButtons {
 		chunkX := clampMouseDelta(dx)
 		chunkY := clampMouseDelta(dy)
-		p.enqueue(ps2MousePacket(buttons, chunkX, chunkY), true)
+		chunkWheel := clampMouseWheel(wheel)
+		p.enqueue(ps2MousePacket(buttons, chunkX, chunkY, mouseID, chunkWheel), true)
 
 		dx -= chunkX
 		dy -= chunkY
+		wheel -= chunkWheel
 		oldButtons = buttons
 	}
 }
 
-func ps2MousePacket(buttons uint8, dx, dy int) []byte {
+func ps2MousePacket(buttons uint8, dx, dy int, mouseID, wheel int) []byte {
 	flags := 0x08 | buttons&0x07
 	if dx < 0 {
 		flags |= 0x10
@@ -385,7 +448,12 @@ func ps2MousePacket(buttons uint8, dx, dy int) []byte {
 		flags |= 0x20
 	}
 
-	return []byte{flags, byte(int8(dx)), byte(int8(dy))}
+	packet := []byte{flags, byte(int8(dx)), byte(int8(dy))}
+	if mouseID == 3 || mouseID == 4 {
+		packet = append(packet, byte(int8(wheel)))
+	}
+
+	return packet
 }
 
 func ps2Buttons(mask uint8) uint8 {
@@ -404,6 +472,17 @@ func ps2Buttons(mask uint8) uint8 {
 	return buttons
 }
 
+func ps2WheelDelta(mask uint8) int {
+	switch {
+	case mask&0x08 != 0:
+		return 1
+	case mask&0x10 != 0:
+		return -1
+	default:
+		return 0
+	}
+}
+
 func clampMouseDelta(v int) int {
 	if v > 127 {
 		return 127
@@ -411,6 +490,18 @@ func clampMouseDelta(v int) int {
 
 	if v < -127 {
 		return -127
+	}
+
+	return v
+}
+
+func clampMouseWheel(v int) int {
+	if v > 7 {
+		return 7
+	}
+
+	if v < -8 {
+		return -8
 	}
 
 	return v

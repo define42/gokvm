@@ -468,7 +468,7 @@ if command -v Xvesa >/dev/null 2>&1 && \
 export DISPLAY=:0.0
 export DESKTOP=flwm
 export ICONS=wbar
-Xvesa -br -screen 1024x768x32 -2button -mouse /dev/input/mice,5 -nolisten tcp -I >/tmp/Xvesa.log 2>&1 &
+Xvesa -br -screen 1024x768x32 -mouse /dev/input/mice,5 -nolisten tcp -I >/tmp/Xvesa.log 2>&1 &
 XPID=$!
 for _ in 1 2 3 4 5 6 7 8 9 10; do
 	waitforX >/dev/null 2>&1 && break

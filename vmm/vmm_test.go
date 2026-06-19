@@ -100,6 +100,10 @@ func TestAddTinyCoreVNCAutostart(t *testing.T) {
 		t.Fatalf("patched initramfs still contains diagnostic Xvesa mode probe")
 	}
 
+	if !bytes.Contains(data, []byte("-mouse /dev/input/mice,5")) {
+		t.Fatalf("patched initramfs does not use TinyCore's mouse input protocol")
+	}
+
 	if !bytes.Contains(data, []byte("/tmp/gokvm-vnc-session")) {
 		t.Fatalf("patched initramfs does not create the VNC session script")
 	}
