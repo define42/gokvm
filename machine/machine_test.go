@@ -179,8 +179,8 @@ func testNewAndLoadLinux(t *testing.T, kernel, tap, guestIPv4, hostIPv4, prefixL
 		t.Fatal(err)
 	}
 
-	param := fmt.Sprintf(`console=ttyS0 earlyprintk=serial noapic noacpi notsc nosmp `+
-		`lapic tsc_early_khz=2000 pci=realloc=off virtio_pci.force_legacy=1 `+
+	param := fmt.Sprintf(`console=ttyS0 earlyprintk=serial noapic noacpi nosmp `+
+		`lapic pci=realloc=off virtio_pci.force_legacy=1 `+
 		`rdinit=/init init=/init gokvm.ipv4_addr=%s/%s`, guestIPv4, prefixLen)
 
 	kern, err := os.Open(kernel)
