@@ -34,6 +34,7 @@ const (
 
 	initrdAddr  = 0xf000000
 	highMemBase = 0x100000
+	bootStack   = 0x80000
 
 	serialIRQ      = 4
 	ps2KeyboardIRQ = 1
@@ -275,6 +276,10 @@ func (m *Machine) AddPS2Input() virtio.VNCInput {
 	m.AddDevice(dev)
 
 	return dev
+}
+
+func (m *Machine) StartVGATextFallback(display *virtio.VNCDisplay) {
+	display.StartVGATextFallback(m.mem)
 }
 
 // Translate translates a virtual address for all active CPUs
@@ -683,7 +688,24 @@ func (m *Machine) initRegs(vcpufd uintptr, rip, bp uint64) error {
 	// Clear all FLAGS bits, except bit 1 which is always set.
 	regs.RFLAGS = 2
 	regs.RIP = rip
-	// Create stack which will grow down.
+
+	regs.RAX = 0
+	regs.RBX = 0
+	regs.RCX = 0
+	regs.RDX = 0
+	regs.RDI = 0
+	regs.RBP = 0
+	regs.RSP = bootStack
+	regs.R8 = 0
+	regs.R9 = 0
+	regs.R10 = 0
+	regs.R11 = 0
+	regs.R12 = 0
+	regs.R13 = 0
+	regs.R14 = 0
+	regs.R15 = 0
+
+	// Linux's 32-bit boot protocol receives the boot params address in ESI.
 	regs.RSI = bp
 
 	if err := kvm.SetRegs(vcpufd, regs); err != nil {
@@ -1040,9 +1062,12 @@ func (m *Machine) initIOPortHandlers() {
 	m.registerIOPortHandler(0x2f8, 0x300, funcNone, funcNone)    // Serial port 2
 	m.registerIOPortHandler(0x3e8, 0x3f0, funcNone, funcNone)    // Serial port 3
 	m.registerIOPortHandler(0x2e8, 0x2f0, funcNone, funcNone)    // Serial port 4
+	m.registerIOPortHandler(0x170, 0x3f8, funcNone, funcNone)    // Legacy ISA/gameport/PNP/ATA probe ports
 	m.registerIOPortHandler(0xcfe, 0xcff, funcNone, funcNone)    // unknown
 	m.registerIOPortHandler(0xcfa, 0xcfc, funcNone, funcNone)    // unknown
 	m.registerIOPortHandler(0xc000, 0xd000, funcNone, funcNone)  // PCI Configuration Space Access Mechanism #2
+	m.registerIOPortHandler(0x279, 0x27a, funcNone, funcNone)    // ISA Plug and Play address port
+	m.registerIOPortHandler(0xa79, 0xa7a, funcNone, funcNone)    // ISA Plug and Play write-data port
 	m.registerIOPortHandler(0x60, 0x70, funcInbPS2, funcNone)    // PS/2 Keyboard (Always 8042 Chip)
 	m.registerIOPortHandler(0xed, 0xee, funcNone, funcNone)      // 0xed is the new standard delay port.
 

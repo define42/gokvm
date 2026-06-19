@@ -2,6 +2,7 @@
 package virtio
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"image"
@@ -10,6 +11,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 
 	"golang.org/x/image/font"
 	"golang.org/x/image/font/basicfont"
@@ -35,6 +37,10 @@ const (
 	vncTextRows      = 40
 	vncTextCellW     = 7
 	vncTextCellH     = 13
+
+	vgaTextBase = 0xb8000
+	vgaTextCols = 80
+	vgaTextRows = 25
 )
 
 type rfbPixelFormat struct {
@@ -172,6 +178,53 @@ func (d *VNCDisplay) Write(p []byte) (int, error) {
 	}
 
 	return len(p), nil
+}
+
+// StartVGATextFallback renders legacy VGA text memory into VNC until a real
+// virtio-gpu frame is flushed.
+func (d *VNCDisplay) StartVGATextFallback(mem []byte) {
+	const textSize = vgaTextCols * vgaTextRows * 2
+	if len(mem) < vgaTextBase+textSize {
+		return
+	}
+
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+
+		var last []byte
+		rendered := false
+
+		for {
+			select {
+			case <-d.done:
+				return
+			case <-ticker.C:
+			}
+
+			d.textMu.Lock()
+			disabled := d.textDisabled
+			d.textMu.Unlock()
+			if disabled {
+				return
+			}
+
+			snap := make([]byte, textSize)
+			copy(snap, mem[vgaTextBase:vgaTextBase+textSize])
+			if bytes.Equal(snap, last) {
+				continue
+			}
+
+			last = snap
+			if !rendered && vgaTextBlank(snap) {
+				continue
+			}
+
+			rendered = true
+			img := renderVGAText(snap)
+			_ = d.flush(img.Bounds().Dx(), img.Bounds().Dy(), img)
+		}
+	}()
 }
 
 func (d *VNCDisplay) Close() error {
@@ -824,4 +877,66 @@ func (c *vncTextConsole) render() *image.RGBA {
 	}
 
 	return img
+}
+
+func renderVGAText(text []byte) *image.RGBA {
+	img := image.NewRGBA(image.Rect(0, 0, vgaTextCols*vncTextCellW, vgaTextRows*vncTextCellH))
+	drawer := font.Drawer{
+		Dst:  img,
+		Face: basicfont.Face7x13,
+	}
+
+	for y := 0; y < vgaTextRows; y++ {
+		for x := 0; x < vgaTextCols; x++ {
+			off := (y*vgaTextCols + x) * 2
+			ch := text[off]
+			if ch < 0x20 || ch >= 0x7f {
+				ch = ' '
+			}
+
+			if ch == ' ' {
+				continue
+			}
+
+			drawer.Dot = fixed.P(x*vncTextCellW, y*vncTextCellH+11)
+			drawer.Src = image.NewUniform(vgaColor(text[off+1] & 0x0f))
+			drawer.DrawString(string([]byte{ch}))
+		}
+	}
+
+	return img
+}
+
+func vgaTextBlank(text []byte) bool {
+	for i := 0; i+1 < len(text); i += 2 {
+		ch := text[i]
+		if ch != 0 && ch != ' ' {
+			return false
+		}
+	}
+
+	return true
+}
+
+func vgaColor(idx byte) color.Color {
+	palette := [...]color.RGBA{
+		{R: 0x00, G: 0x00, B: 0x00, A: 0xff},
+		{R: 0x00, G: 0x00, B: 0xaa, A: 0xff},
+		{R: 0x00, G: 0xaa, B: 0x00, A: 0xff},
+		{R: 0x00, G: 0xaa, B: 0xaa, A: 0xff},
+		{R: 0xaa, G: 0x00, B: 0x00, A: 0xff},
+		{R: 0xaa, G: 0x00, B: 0xaa, A: 0xff},
+		{R: 0xaa, G: 0x55, B: 0x00, A: 0xff},
+		{R: 0xaa, G: 0xaa, B: 0xaa, A: 0xff},
+		{R: 0x55, G: 0x55, B: 0x55, A: 0xff},
+		{R: 0x55, G: 0x55, B: 0xff, A: 0xff},
+		{R: 0x55, G: 0xff, B: 0x55, A: 0xff},
+		{R: 0x55, G: 0xff, B: 0xff, A: 0xff},
+		{R: 0xff, G: 0x55, B: 0x55, A: 0xff},
+		{R: 0xff, G: 0x55, B: 0xff, A: 0xff},
+		{R: 0xff, G: 0xff, B: 0x55, A: 0xff},
+		{R: 0xff, G: 0xff, B: 0xff, A: 0xff},
+	}
+
+	return palette[idx&0x0f]
 }

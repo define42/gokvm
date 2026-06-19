@@ -22,6 +22,10 @@ import (
 
 var errDownloadISO = errors.New("download ISO failed")
 
+const isoCompatibilityParams = "console=tty0 console=ttyS0 earlyprintk=serial " +
+	"noapic noacpi notsc nowatchdog nmi_watchdog=0 mitigations=off " +
+	"lapic tsc_early_khz=2000 pci=realloc=off virtio_pci.force_legacy=1"
+
 // Config defines the configuration of the
 // virtual machine, as determined by flags.
 type Config struct {
@@ -90,6 +94,10 @@ func (v *VMM) Init() error {
 
 		if err := m.AddGPUDisplay(display); err != nil {
 			return err
+		}
+
+		if len(v.ISO) > 0 && v.vncDisplay != nil {
+			m.StartVGATextFallback(v.vncDisplay)
 		}
 	}
 
@@ -283,15 +291,43 @@ func readerAtOrNil(data []byte) io.ReaderAt {
 
 func isoCmdline(cmdline string) string {
 	fields := strings.Fields(cmdline)
-	for _, field := range fields {
-		if strings.HasPrefix(field, "console=") {
-			return strings.Join(fields, " ")
+
+	compatFields := strings.Fields(isoCompatibilityParams)
+	merged := make([]string, 0, len(compatFields)+len(fields))
+	for _, param := range compatFields {
+		if !hasKernelParam(fields, param) {
+			merged = append(merged, param)
 		}
 	}
 
-	fields = append([]string{"console=tty0", "console=ttyS0"}, fields...)
+	merged = append(merged, fields...)
 
-	return strings.Join(fields, " ")
+	return strings.Join(merged, " ")
+}
+
+func hasKernelParam(fields []string, param string) bool {
+	paramName := kernelParamName(param)
+	for _, field := range fields {
+		if paramName == "console" {
+			if field == param {
+				return true
+			}
+
+			continue
+		}
+
+		if kernelParamName(field) == paramName {
+			return true
+		}
+	}
+
+	return false
+}
+
+func kernelParamName(field string) string {
+	name, _, _ := strings.Cut(field, "=")
+
+	return name
 }
 
 func (v *VMM) attachSerialOutput() {
