@@ -1,10 +1,16 @@
 package virtio_test
 
 import (
+	"bytes"
+	"encoding/binary"
+	"errors"
 	"image"
 	"image/png"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/bobuhiro11/gokvm/virtio"
@@ -47,5 +53,125 @@ func TestPNGDisplayFlush(t *testing.T) {
 	r, g, b, a := got.At(0, 0).RGBA()
 	if uint8(r>>8) != 0x10 || uint8(g>>8) != 0x20 || uint8(b>>8) != 0x30 || uint8(a>>8) != 0xff {
 		t.Fatalf("pixel(0,0): got (%d,%d,%d,%d) want (16,32,48,255)", r>>8, g>>8, b>>8, a>>8)
+	}
+}
+
+func TestVNCDisplayHandshakeAndRawFramebuffer(t *testing.T) {
+	t.Parallel()
+
+	d, err := virtio.NewVNCDisplay("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	img := image.NewRGBA(image.Rect(0, 0, 2, 1))
+	img.Pix[0], img.Pix[1], img.Pix[2], img.Pix[3] = 0xff, 0, 0, 0xff
+	img.Pix[4], img.Pix[5], img.Pix[6], img.Pix[7] = 0, 0xff, 0, 0xff
+
+	if err := d.Flush(2, 1, img); err != nil {
+		t.Fatal(err)
+	}
+
+	conn, err := net.Dial("tcp", d.Addr())
+	if err != nil {
+		if errors.Is(err, syscall.ENETUNREACH) {
+			t.Skipf("loopback is unreachable in this network namespace: %v", err)
+		}
+
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	version := readN(t, conn, 12)
+	if string(version) != "RFB 003.008\n" {
+		t.Fatalf("version: got %q", version)
+	}
+
+	writeAll(t, conn, version)
+
+	securityTypes := readN(t, conn, 2)
+	if !bytes.Equal(securityTypes, []byte{1, 1}) {
+		t.Fatalf("security types: got %v, want [1 1]", securityTypes)
+	}
+
+	writeAll(t, conn, []byte{1})
+
+	securityResult := readN(t, conn, 4)
+	if binary.BigEndian.Uint32(securityResult) != 0 {
+		t.Fatalf("security result: got %v, want OK", securityResult)
+	}
+
+	writeAll(t, conn, []byte{1}) // ClientInit: shared flag.
+
+	serverInit := readN(t, conn, 24)
+	if w := binary.BigEndian.Uint16(serverInit[0:2]); w != 2 {
+		t.Fatalf("server width: got %d, want 2", w)
+	}
+
+	if h := binary.BigEndian.Uint16(serverInit[2:4]); h != 1 {
+		t.Fatalf("server height: got %d, want 1", h)
+	}
+
+	nameLen := binary.BigEndian.Uint32(serverInit[20:24])
+	name := readN(t, conn, int(nameLen))
+	if string(name) != "gokvm" {
+		t.Fatalf("server name: got %q, want gokvm", name)
+	}
+
+	request := []byte{
+		3,    // FramebufferUpdateRequest
+		0,    // incremental = false
+		0, 0, // x
+		0, 0, // y
+		0, 2, // width
+		0, 1, // height
+	}
+	writeAll(t, conn, request)
+
+	header := readN(t, conn, 4)
+	if !bytes.Equal(header, []byte{0, 0, 0, 1}) {
+		t.Fatalf("framebuffer update header: got %v, want one rectangle", header)
+	}
+
+	rect := readN(t, conn, 12)
+	if x := binary.BigEndian.Uint16(rect[0:2]); x != 0 {
+		t.Fatalf("rect x: got %d, want 0", x)
+	}
+
+	if w := binary.BigEndian.Uint16(rect[4:6]); w != 2 {
+		t.Fatalf("rect width: got %d, want 2", w)
+	}
+
+	if enc := binary.BigEndian.Uint32(rect[8:12]); enc != 0 {
+		t.Fatalf("rect encoding: got %d, want raw", enc)
+	}
+
+	pixels := readN(t, conn, 8)
+	want := []byte{
+		0, 0, 0xff, 0, // red in default little-endian true-color format.
+		0, 0xff, 0, 0, // green
+	}
+	if !bytes.Equal(pixels, want) {
+		t.Fatalf("pixels: got %v, want %v", pixels, want)
+	}
+}
+
+func readN(t *testing.T, r io.Reader, n int) []byte {
+	t.Helper()
+
+	b := make([]byte, n)
+	if _, err := io.ReadFull(r, b); err != nil {
+		t.Fatal(err)
+	}
+
+	return b
+}
+
+func writeAll(t *testing.T, w io.Writer, b []byte) {
+	t.Helper()
+
+	if _, err := w.Write(b); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -20,6 +20,7 @@ type BootArgs struct {
 	TapIfName  string
 	Disk       string
 	GPU        string
+	VNC        string
 	TraceCount int
 }
 
@@ -45,6 +46,8 @@ func parseBootArgs(args []string) (*BootArgs, error) {
 	bootCmd.StringVar(&c.Disk, "d", "", "path of disk file (for /dev/vda)")
 	bootCmd.StringVar(&c.GPU, "g", "", `path to write the virtio-gpu framebuffer as PNG. `+
 		`If empty, no virtio-gpu device is created. (default "")`)
+	bootCmd.StringVar(&c.VNC, "vnc", "", `VNC listen address for virtio-gpu, for example ":5900". `+
+		`If empty, no VNC server is created. (default "")`)
 
 	bootCmd.IntVar(&c.NCPUs, "c", 1, "number of cpus")
 

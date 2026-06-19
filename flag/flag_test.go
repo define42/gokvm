@@ -55,6 +55,8 @@ func TestParseBootArgs(t *testing.T) {
 		"2",
 		"-d",
 		"disk_path",
+		"-vnc",
+		"127.0.0.1:5900",
 		"-m",
 		"1G",
 		"-T",
@@ -88,6 +90,10 @@ func TestParseBootArgs(t *testing.T) {
 
 	if c.Disk != "disk_path" {
 		t.Errorf("invalid path of disk file: got %v, want %v", c.Disk, "disk_path")
+	}
+
+	if c.VNC != "127.0.0.1:5900" {
+		t.Errorf("invalid VNC listen address: got %v, want %v", c.VNC, "127.0.0.1:5900")
 	}
 
 	if c.NCPUs != 2 {
@@ -145,6 +151,10 @@ func TestParseBootArgsWithDefaults(t *testing.T) {
 
 	if c.Disk != "" {
 		t.Errorf("invalid path of disk file: got %v, want %v", c.Disk, "disk_path")
+	}
+
+	if c.VNC != "" {
+		t.Errorf("invalid VNC listen address: got %v, want empty", c.VNC)
 	}
 
 	if c.NCPUs != 1 {

@@ -255,7 +255,11 @@ func (m *Machine) AddDisk(diskPath string) error {
 }
 
 func (m *Machine) AddGPU(outputPath string) error {
-	v := virtio.NewGPU(virtioGPUIRQ, m, m.mem, virtio.NewPNGDisplay(outputPath))
+	return m.AddGPUDisplay(virtio.NewPNGDisplay(outputPath))
+}
+
+func (m *Machine) AddGPUDisplay(display virtio.Display) error {
+	v := virtio.NewGPU(virtioGPUIRQ, m, m.mem, display)
 
 	go v.IOThreadEntry()
 	// 00:03.0 for Virtio gpu

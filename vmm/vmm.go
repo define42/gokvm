@@ -9,6 +9,7 @@ import (
 	"github.com/bobuhiro11/gokvm/machine"
 	"github.com/bobuhiro11/gokvm/pvh"
 	"github.com/bobuhiro11/gokvm/term"
+	"github.com/bobuhiro11/gokvm/virtio"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -23,6 +24,7 @@ type Config struct {
 	TapIfName  string
 	Disk       string
 	GPU        string
+	VNC        string
 	NCPUs      int
 	MemSize    int
 	TraceCount int
@@ -59,8 +61,13 @@ func (v *VMM) Init() error {
 		}
 	}
 
-	if len(v.GPU) > 0 {
-		if err := m.AddGPU(v.GPU); err != nil {
+	if len(v.GPU) > 0 || len(v.VNC) > 0 {
+		display, err := v.display()
+		if err != nil {
+			return err
+		}
+
+		if err := m.AddGPUDisplay(display); err != nil {
 			return err
 		}
 	}
@@ -68,6 +75,34 @@ func (v *VMM) Init() error {
 	v.Machine = m
 
 	return nil
+}
+
+func (v *VMM) display() (virtio.Display, error) {
+	var displays []virtio.Display
+
+	if len(v.GPU) > 0 {
+		displays = append(displays, virtio.NewPNGDisplay(v.GPU))
+	}
+
+	if len(v.VNC) > 0 {
+		display, err := virtio.NewVNCDisplay(v.VNC)
+		if err != nil {
+			for _, d := range displays {
+				_ = d.Close()
+			}
+
+			return nil, err
+		}
+
+		log.Printf("VNC listening on %s", display.Addr())
+		displays = append(displays, display)
+	}
+
+	if len(displays) == 1 {
+		return displays[0], nil
+	}
+
+	return virtio.NewMultiDisplay(displays...), nil
 }
 
 func (v *VMM) Setup() error {

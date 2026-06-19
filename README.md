@@ -31,6 +31,7 @@ You can use existing bzImage and initrd, or you can create them using the Makefi
 ```bash
 tar zxvf gokvm*.tar.gz
 ./gokvm boot -k ./bzImage -i ./initrd  # To exit, press Ctrl-a x.
+./gokvm boot -k ./bzImage -i ./initrd -vnc :5900  # Enable virtio-gpu over VNC.
 ```
 
 ## Go package
@@ -63,4 +64,3 @@ Thanks to the many useful resources on KVM, this project was able to boot Linux 
 - [ハイパーバイザの作り方～ちゃんと理解する仮想化技術～ 第１２回 virtioによる準仮想化デバイス その２「Virtqueueとvirtio-netの実現」](https://syuu1228.github.io/howto_implement_hypervisor/part12.html)
 - [Xen PVH boot protocol](https://github.com/mirage/xen/blob/master/docs/misc/hvmlite.markdown)
 - [Cloud Hypervisor](https://github.com/cloud-hypervisor/cloud-hypervisor)
-

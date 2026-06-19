@@ -24,6 +24,7 @@ func main() {
 			TapIfName:  bootArgs.TapIfName,
 			Disk:       bootArgs.Disk,
 			GPU:        bootArgs.GPU,
+			VNC:        bootArgs.VNC,
 			NCPUs:      bootArgs.NCPUs,
 			MemSize:    bootArgs.MemSize,
 			TraceCount: bootArgs.TraceCount,

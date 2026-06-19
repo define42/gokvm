@@ -8,8 +8,7 @@ import (
 )
 
 // Display is the sink virtio-gpu presents flushed frames to. Implementations
-// must be safe for the single GPU IO goroutine to call; a future VNC backend
-// can slot in behind the same interface.
+// must be safe for the single GPU IO goroutine to call.
 type Display interface {
 	// Flush is called on RESOURCE_FLUSH with the scanout's current frame.
 	// The image is owned by the caller only for the duration of the call.
@@ -58,3 +57,35 @@ func (d *PNGDisplay) Flush(width, height int, img *image.RGBA) error {
 }
 
 func (d *PNGDisplay) Close() error { return nil }
+
+// MultiDisplay fans out each flushed frame to multiple displays.
+type MultiDisplay struct {
+	displays []Display
+}
+
+// NewMultiDisplay returns a Display that flushes to each provided display.
+func NewMultiDisplay(displays ...Display) *MultiDisplay {
+	return &MultiDisplay{displays: displays}
+}
+
+func (d *MultiDisplay) Flush(width, height int, img *image.RGBA) error {
+	for _, display := range d.displays {
+		if err := display.Flush(width, height, img); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (d *MultiDisplay) Close() error {
+	var firstErr error
+
+	for _, display := range d.displays {
+		if err := display.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	return firstErr
+}
