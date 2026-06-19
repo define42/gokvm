@@ -317,7 +317,7 @@ func (m *Machine) RunData() []*kvm.RunData {
 	return m.runs
 }
 
-func (m *Machine) LoadPVH(kern, initrd *os.File, cmdline string) error {
+func (m *Machine) LoadPVH(kern, initrd io.ReaderAt, cmdline string) error {
 	// Set EDBA-Pointer
 	edbaval := uint32(bootparam.EBDAStart >> 4)
 	edbabytes := make([]byte, 4)

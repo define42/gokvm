@@ -5,10 +5,15 @@ import (
 	"encoding/binary"
 	"fmt"
 	"image"
+	"image/color"
 	"io"
 	"log"
 	"net"
 	"sync"
+
+	"golang.org/x/image/font"
+	"golang.org/x/image/font/basicfont"
+	"golang.org/x/image/math/fixed"
 )
 
 const (
@@ -26,6 +31,10 @@ const (
 
 	vncDefaultWidth  = 1024
 	vncDefaultHeight = 768
+	vncTextCols      = 100
+	vncTextRows      = 40
+	vncTextCellW     = 7
+	vncTextCellH     = 13
 )
 
 type rfbPixelFormat struct {
@@ -70,6 +79,10 @@ type VNCDisplay struct {
 	conns map[net.Conn]struct{}
 	wg    sync.WaitGroup
 	input VNCInput
+
+	textMu       sync.Mutex
+	textConsole  *vncTextConsole
+	textDisabled bool
 }
 
 // NewVNCDisplay starts a VNC server listening on addr, such as ":5900".
@@ -107,6 +120,14 @@ func (d *VNCDisplay) SetInput(input VNCInput) {
 }
 
 func (d *VNCDisplay) Flush(width, height int, img *image.RGBA) error {
+	d.textMu.Lock()
+	d.textDisabled = true
+	d.textMu.Unlock()
+
+	return d.flush(width, height, img)
+}
+
+func (d *VNCDisplay) flush(width, height int, img *image.RGBA) error {
 	if width <= 0 || height <= 0 {
 		return nil
 	}
@@ -127,6 +148,30 @@ func (d *VNCDisplay) Flush(width, height int, img *image.RGBA) error {
 	d.mu.Unlock()
 
 	return nil
+}
+
+// Write mirrors serial console bytes into VNC until virtio-gpu flushes a frame.
+func (d *VNCDisplay) Write(p []byte) (int, error) {
+	d.textMu.Lock()
+	if d.textDisabled {
+		d.textMu.Unlock()
+
+		return len(p), nil
+	}
+
+	if d.textConsole == nil {
+		d.textConsole = newVNCTextConsole(vncTextCols, vncTextRows)
+	}
+
+	d.textConsole.write(p)
+	img := d.textConsole.render()
+	d.textMu.Unlock()
+
+	if err := d.flush(img.Bounds().Dx(), img.Bounds().Dy(), img); err != nil {
+		return 0, err
+	}
+
+	return len(p), nil
 }
 
 func (d *VNCDisplay) Close() error {
@@ -625,4 +670,158 @@ func putPixel(dst []byte, pixel uint32, bigEndian bool) {
 			binary.LittleEndian.PutUint32(dst, pixel)
 		}
 	}
+}
+
+type vncTextConsole struct {
+	cols int
+	rows int
+
+	cells [][]rune
+	row   int
+	col   int
+
+	escape []byte
+}
+
+func newVNCTextConsole(cols, rows int) *vncTextConsole {
+	c := &vncTextConsole{
+		cols:  cols,
+		rows:  rows,
+		cells: make([][]rune, rows),
+	}
+	for y := range c.cells {
+		c.cells[y] = make([]rune, cols)
+		for x := range c.cells[y] {
+			c.cells[y][x] = ' '
+		}
+	}
+
+	return c
+}
+
+func (c *vncTextConsole) write(p []byte) {
+	for _, b := range p {
+		c.putByte(b)
+	}
+}
+
+func (c *vncTextConsole) putByte(b byte) {
+	if len(c.escape) > 0 {
+		c.putEscapeByte(b)
+
+		return
+	}
+
+	switch b {
+	case 0x1b:
+		c.escape = []byte{b}
+	case '\r':
+		c.col = 0
+	case '\n':
+		c.newline()
+	case '\b':
+		if c.col > 0 {
+			c.col--
+		}
+	case '\t':
+		for {
+			c.putRune(' ')
+			if c.col%8 == 0 {
+				break
+			}
+		}
+	default:
+		if b >= 0x20 && b < 0x7f {
+			c.putRune(rune(b))
+		}
+	}
+}
+
+func (c *vncTextConsole) putEscapeByte(b byte) {
+	c.escape = append(c.escape, b)
+	if len(c.escape) == 2 && b != '[' {
+		c.escape = nil
+
+		return
+	}
+
+	if len(c.escape) < 3 {
+		return
+	}
+
+	if b < 0x40 || b > 0x7e {
+		return
+	}
+
+	c.handleCSI(string(c.escape[2:len(c.escape)-1]), b)
+	c.escape = nil
+}
+
+func (c *vncTextConsole) handleCSI(params string, final byte) {
+	switch final {
+	case 'H', 'f':
+		c.row, c.col = 0, 0
+	case 'J':
+		if params == "" || params == "2" {
+			c.clear()
+		}
+	case 'K':
+		for x := c.col; x < c.cols; x++ {
+			c.cells[c.row][x] = ' '
+		}
+	case 'm', 'h', 'l':
+		// Styling and terminal mode toggles are ignored by the fallback.
+	default:
+	}
+}
+
+func (c *vncTextConsole) putRune(r rune) {
+	if c.col >= c.cols {
+		c.newline()
+	}
+
+	c.cells[c.row][c.col] = r
+	c.col++
+}
+
+func (c *vncTextConsole) newline() {
+	c.col = 0
+	c.row++
+	if c.row < c.rows {
+		return
+	}
+
+	copy(c.cells, c.cells[1:])
+	c.cells[c.rows-1] = make([]rune, c.cols)
+	for x := range c.cells[c.rows-1] {
+		c.cells[c.rows-1][x] = ' '
+	}
+
+	c.row = c.rows - 1
+}
+
+func (c *vncTextConsole) clear() {
+	for y := range c.cells {
+		for x := range c.cells[y] {
+			c.cells[y][x] = ' '
+		}
+	}
+
+	c.row, c.col = 0, 0
+}
+
+func (c *vncTextConsole) render() *image.RGBA {
+	img := image.NewRGBA(image.Rect(0, 0, c.cols*vncTextCellW, c.rows*vncTextCellH))
+	drawer := font.Drawer{
+		Dst:  img,
+		Src:  image.NewUniform(color.RGBA{R: 0xe8, G: 0xea, B: 0xed, A: 0xff}),
+		Face: basicfont.Face7x13,
+	}
+
+	for y, row := range c.cells {
+		drawer.Dot = fixed.P(0, y*vncTextCellH+11)
+		drawer.DrawString(string(row))
+	}
+
+	return img
 }

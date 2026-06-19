@@ -195,6 +195,62 @@ func TestVNCDisplayHandshakeAndRawFramebuffer(t *testing.T) {
 	}
 }
 
+func TestVNCDisplaySerialFallback(t *testing.T) {
+	t.Parallel()
+
+	d, err := virtio.NewVNCDisplay("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	if _, err := d.Write([]byte("TinyCore booting\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	conn, err := net.Dial("tcp", d.Addr())
+	if err != nil {
+		if errors.Is(err, syscall.ENETUNREACH) {
+			t.Skipf("loopback is unreachable in this network namespace: %v", err)
+		}
+
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	version := readN(t, conn, 12)
+	writeAll(t, conn, version)
+	readN(t, conn, 2) // security types
+	writeAll(t, conn, []byte{1})
+	readN(t, conn, 4) // security result
+	writeAll(t, conn, []byte{1})
+	serverInit := readN(t, conn, 24)
+	width := binary.BigEndian.Uint16(serverInit[0:2])
+	height := binary.BigEndian.Uint16(serverInit[2:4])
+	nameLen := binary.BigEndian.Uint32(serverInit[20:24])
+	readN(t, conn, int(nameLen))
+
+	writeAll(t, conn, []byte{
+		3,    // FramebufferUpdateRequest
+		0,    // incremental = false
+		0, 0, // x
+		0, 0, // y
+		byte(width >> 8), byte(width),
+		byte(height >> 8), byte(height),
+	})
+
+	header := readN(t, conn, 4)
+	if binary.BigEndian.Uint16(header[2:4]) != 1 {
+		t.Fatalf("rectangles: got %v, want one rectangle", header)
+	}
+
+	readN(t, conn, 12)
+	pixels := readN(t, conn, int(width)*int(height)*4)
+	if bytes.Count(pixels, []byte{0}) == len(pixels) {
+		t.Fatal("serial fallback frame is blank")
+	}
+}
+
 type vncInputEvent struct {
 	kind       string
 	down       bool

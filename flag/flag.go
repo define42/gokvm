@@ -16,7 +16,9 @@ type BootArgs struct {
 	NCPUs      int
 	Dev        string
 	Initrd     string
+	ISO        string
 	Params     string
+	ParamsSet  bool
 	TapIfName  string
 	Disk       string
 	GPU        string
@@ -31,8 +33,9 @@ func parseBootArgs(args []string) (*BootArgs, error) {
 	bootCmd.StringVar(&c.Dev, "D", "/dev/kvm", "path of kvm device")
 	bootCmd.StringVar(&c.Kernel, "k", "./bzImage", "kernel image path")
 	bootCmd.StringVar(&c.Initrd, "i", "", "initrd path")
+	bootCmd.StringVar(&c.ISO, "iso", "", "ISO image path or http(s) URL to boot")
 	//  refs: commit 1621292e73770aabbc146e72036de5e26f901e86 in kvmtool
-	bootCmd.StringVar(&c.Params, "p", `console=ttyS0 earlyprintk=serial `+
+	bootCmd.StringVar(&c.Params, "p", `console=tty0 console=ttyS0 earlyprintk=serial `+
 		`noapic noacpi notsc nowatchdog `+
 		`nmi_watchdog=0 debug apic=debug show_lapic=all mitigations=off `+
 		`lapic tsc_early_khz=2000 `+
@@ -61,6 +64,11 @@ func parseBootArgs(args []string) (*BootArgs, error) {
 	if err = bootCmd.Parse(args); err != nil {
 		return nil, err
 	}
+	bootCmd.Visit(func(f *flag.Flag) {
+		if f.Name == "p" {
+			c.ParamsSet = true
+		}
+	})
 
 	if c.MemSize, err = ParseSize(*msize, "g"); err != nil {
 		return nil, err

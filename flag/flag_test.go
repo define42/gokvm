@@ -47,6 +47,8 @@ func TestParseBootArgs(t *testing.T) {
 		"initrd_path",
 		"-k",
 		"kernel_path",
+		"-iso",
+		"iso_path",
 		"-p",
 		"params",
 		"-t",
@@ -80,8 +82,16 @@ func TestParseBootArgs(t *testing.T) {
 		t.Error("invalid initrd path")
 	}
 
+	if c.ISO != "iso_path" {
+		t.Errorf("invalid ISO path: got %v, want iso_path", c.ISO)
+	}
+
 	if c.Params != "params" {
 		t.Error("invalid kernel command-line parameters")
+	}
+
+	if !c.ParamsSet {
+		t.Error("kernel command-line should be marked explicitly set")
 	}
 
 	if c.TapIfName != "tap_if_name" {
@@ -134,7 +144,11 @@ func TestParseBootArgsWithDefaults(t *testing.T) {
 		t.Error("invalid initrd path")
 	}
 
-	if c.Params != `console=ttyS0 earlyprintk=serial `+
+	if c.ISO != "" {
+		t.Error("invalid ISO path")
+	}
+
+	if c.Params != `console=tty0 console=ttyS0 earlyprintk=serial `+
 		`noapic noacpi notsc nowatchdog `+
 		`nmi_watchdog=0 debug apic=debug show_lapic=all mitigations=off `+
 		`lapic tsc_early_khz=2000 `+
@@ -147,6 +161,10 @@ func TestParseBootArgsWithDefaults(t *testing.T) {
 
 	if c.TapIfName != "" {
 		t.Error("invalid name of tap interface")
+	}
+
+	if c.ParamsSet {
+		t.Error("kernel command-line should not be marked explicitly set")
 	}
 
 	if c.Disk != "" {

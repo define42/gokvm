@@ -7,3 +7,5 @@ require (
 	golang.org/x/sync v0.7.0
 	golang.org/x/sys v0.11.0
 )
+
+require golang.org/x/image v0.18.0

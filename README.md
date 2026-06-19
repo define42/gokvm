@@ -32,7 +32,18 @@ You can use existing bzImage and initrd, or you can create them using the Makefi
 tar zxvf gokvm*.tar.gz
 ./gokvm boot -k ./bzImage -i ./initrd  # To exit, press Ctrl-a x.
 ./gokvm boot -k ./bzImage -i ./initrd -vnc :5900  # Enable virtio-gpu over VNC.
+./gokvm boot -iso ./TinyCore-current.iso -vnc :5900  # Boot kernel/initrd from an ISO.
+./gokvm boot -iso http://www.tinycorelinux.net/17.x/x86/release/TinyCore-current.iso -vnc :5900
 ```
+
+The bundled kernel config enables virtio-gpu and framebuffer console support, so
+VNC shows the Linux framebuffer console once the guest probes the GPU. If you
+use a different kernel, make sure it has `CONFIG_DRM_VIRTIO_GPU`,
+`CONFIG_DRM_FBDEV_EMULATION`, and `CONFIG_FRAMEBUFFER_CONSOLE` built in.
+
+ISO boot support extracts Linux boot files from ISO9660 media and uses gokvm's
+direct Linux loader. It supports common syslinux/isolinux and GRUB configs, but
+does not emulate BIOS/UEFI El Torito boot.
 
 ## Go package
 

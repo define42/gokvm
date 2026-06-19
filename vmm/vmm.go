@@ -2,16 +2,25 @@ package vmm
 
 import (
 	"bufio"
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
+	"net/url"
 	"os"
+	"strings"
 
+	"github.com/bobuhiro11/gokvm/iso9660"
 	"github.com/bobuhiro11/gokvm/machine"
 	"github.com/bobuhiro11/gokvm/pvh"
 	"github.com/bobuhiro11/gokvm/term"
 	"github.com/bobuhiro11/gokvm/virtio"
 	"golang.org/x/sync/errgroup"
 )
+
+var errDownloadISO = errors.New("download ISO failed")
 
 // Config defines the configuration of the
 // virtual machine, as determined by flags.
@@ -20,7 +29,9 @@ type Config struct {
 	Dev        string
 	Kernel     string
 	Initrd     string
+	ISO        string
 	Params     string
+	ParamsSet  bool
 	TapIfName  string
 	Disk       string
 	GPU        string
@@ -33,6 +44,10 @@ type Config struct {
 type VMM struct {
 	*machine.Machine
 	Config
+
+	serialOutput io.Writer
+	vncDisplay   *virtio.VNCDisplay
+	vncInput     virtio.VNCInput
 }
 
 func New(c Config) *VMM {
@@ -65,6 +80,7 @@ func (v *VMM) Init() error {
 		var input virtio.VNCInput
 		if len(v.VNC) > 0 {
 			input = m.AddPS2Input()
+			v.vncInput = input
 		}
 
 		display, err := v.display(input)
@@ -100,6 +116,8 @@ func (v *VMM) display(input virtio.VNCInput) (virtio.Display, error) {
 		}
 
 		display.SetInput(input)
+		v.serialOutput = display
+		v.vncDisplay = display
 		log.Printf("VNC listening on %s", display.Addr())
 		displays = append(displays, display)
 	}
@@ -112,6 +130,10 @@ func (v *VMM) display(input virtio.VNCInput) (virtio.Display, error) {
 }
 
 func (v *VMM) Setup() error {
+	if v.ISO != "" {
+		return v.setupISO()
+	}
+
 	var initrd *os.File
 	// Kernel arg required to load kernel or firmware image
 	kern, err := os.Open(v.Kernel)
@@ -141,7 +163,211 @@ func (v *VMM) Setup() error {
 		}
 	}
 
+	v.attachSerialOutput()
+	v.attachSerialInput()
+
 	return nil
+}
+
+func (v *VMM) setupISO() error {
+	isoFile, cleanup, err := openISOSource(v.ISO)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	info, err := isoFile.Stat()
+	if err != nil {
+		return err
+	}
+
+	isoReader, err := iso9660.NewReader(isoFile, info.Size())
+	if err != nil {
+		return err
+	}
+
+	files, err := iso9660.LoadBootFiles(isoReader)
+	if err != nil {
+		return err
+	}
+
+	params := v.Params
+	if !v.ParamsSet {
+		params = isoCmdline(files.Cmdline)
+	}
+
+	log.Printf("ISO boot: kernel=%s initrd=%s", files.KernelPath, files.InitrdPath)
+
+	kern := bytes.NewReader(files.Kernel)
+	initrd := readerAtOrNil(files.Initrd)
+
+	isPVH, err := pvh.CheckPVH(kern)
+	if err != nil {
+		return err
+	}
+
+	if isPVH {
+		if err := v.LoadPVH(kern, initrd, params); err != nil {
+			return err
+		}
+	} else if err := v.LoadLinux(kern, initrd, params); err != nil {
+		return err
+	}
+
+	v.attachSerialOutput()
+	v.attachSerialInput()
+
+	return nil
+}
+
+func openISOSource(source string) (*os.File, func(), error) {
+	u, err := url.Parse(source)
+	if err == nil && (u.Scheme == "http" || u.Scheme == "https") {
+		return downloadISO(source)
+	}
+
+	file, err := os.Open(source)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return file, func() { _ = file.Close() }, nil
+}
+
+func downloadISO(source string) (*os.File, func(), error) {
+	resp, err := http.Get(source) //nolint:gosec // User-supplied boot media URL.
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return nil, nil, fmt.Errorf("%w %s: %s", errDownloadISO, source, resp.Status)
+	}
+
+	file, err := os.CreateTemp("", "gokvm-*.iso")
+	if err != nil {
+		return nil, nil, err
+	}
+
+	cleanup := func() {
+		name := file.Name()
+		_ = file.Close()
+		_ = os.Remove(name)
+	}
+
+	if _, err := io.Copy(file, resp.Body); err != nil {
+		cleanup()
+
+		return nil, nil, err
+	}
+
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		cleanup()
+
+		return nil, nil, err
+	}
+
+	log.Printf("downloaded ISO %s to %s", source, file.Name())
+
+	return file, cleanup, nil
+}
+
+func readerAtOrNil(data []byte) io.ReaderAt {
+	if len(data) == 0 {
+		return nil
+	}
+
+	return bytes.NewReader(data)
+}
+
+func isoCmdline(cmdline string) string {
+	fields := strings.Fields(cmdline)
+	for _, field := range fields {
+		if strings.HasPrefix(field, "console=") {
+			return strings.Join(fields, " ")
+		}
+	}
+
+	fields = append([]string{"console=tty0", "console=ttyS0"}, fields...)
+
+	return strings.Join(fields, " ")
+}
+
+func (v *VMM) attachSerialOutput() {
+	if v.serialOutput == nil || v.GetSerial() == nil {
+		return
+	}
+
+	v.GetSerial().SetOutput(io.MultiWriter(os.Stdout, v.serialOutput))
+}
+
+func (v *VMM) attachSerialInput() {
+	if v.ISO == "" || v.vncDisplay == nil || v.GetSerial() == nil {
+		return
+	}
+
+	v.vncDisplay.SetInput(&serialMirrorInput{
+		primary: v.vncInput,
+		serial:  v.GetSerial().GetInputChan(),
+		inject:  v.InjectSerialIRQ,
+	})
+}
+
+type serialMirrorInput struct {
+	primary virtio.VNCInput
+	serial  chan<- byte
+	inject  func() error
+}
+
+func (s *serialMirrorInput) KeyEvent(down bool, keysym uint32) {
+	if s.primary != nil {
+		s.primary.KeyEvent(down, keysym)
+	}
+
+	if !down || s.serial == nil {
+		return
+	}
+
+	for _, b := range serialBytesForKeysym(keysym) {
+		s.serial <- b
+		if s.inject != nil {
+			_ = s.inject()
+		}
+	}
+}
+
+func (s *serialMirrorInput) PointerEvent(buttonMask uint8, x, y uint16) {
+	if s.primary != nil {
+		s.primary.PointerEvent(buttonMask, x, y)
+	}
+}
+
+func serialBytesForKeysym(keysym uint32) []byte {
+	if keysym >= 0x20 && keysym <= 0x7e {
+		return []byte{byte(keysym)}
+	}
+
+	switch keysym {
+	case 0xff08: // BackSpace
+		return []byte{0x7f}
+	case 0xff09: // Tab
+		return []byte{'\t'}
+	case 0xff0d: // Return
+		return []byte{'\r'}
+	case 0xff1b: // Escape
+		return []byte{0x1b}
+	case 0xff51: // Left
+		return []byte{0x1b, '[', 'D'}
+	case 0xff52: // Up
+		return []byte{0x1b, '[', 'A'}
+	case 0xff53: // Right
+		return []byte{0x1b, '[', 'C'}
+	case 0xff54: // Down
+		return []byte{0x1b, '[', 'B'}
+	default:
+		return nil
+	}
 }
 
 func (v *VMM) Boot() error {
