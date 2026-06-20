@@ -330,13 +330,17 @@ func TestVNCDisplayCursorPseudoEncoding(t *testing.T) {
 	if enc := binary.BigEndian.Uint32(cursorRect[8:12]); enc != 0xffffff11 {
 		t.Fatalf("cursor rect encoding: got 0x%x, want 0xffffff11", enc)
 	}
-	if w := binary.BigEndian.Uint16(cursorRect[4:6]); w != 16 {
-		t.Fatalf("cursor width: got %d, want 16", w)
+	if w := binary.BigEndian.Uint16(cursorRect[4:6]); w != 1 {
+		t.Fatalf("cursor width: got %d, want 1", w)
 	}
-	if h := binary.BigEndian.Uint16(cursorRect[6:8]); h != 16 {
-		t.Fatalf("cursor height: got %d, want 16", h)
+	if h := binary.BigEndian.Uint16(cursorRect[6:8]); h != 1 {
+		t.Fatalf("cursor height: got %d, want 1", h)
 	}
-	readN(t, conn, 16*16*4+16*2)
+
+	payload := readN(t, conn, 1*1*4+1)
+	if payload[4] != 0 {
+		t.Fatalf("cursor mask: got 0x%x, want transparent", payload[4])
+	}
 }
 
 func TestVNCDisplaySerialFallback(t *testing.T) {

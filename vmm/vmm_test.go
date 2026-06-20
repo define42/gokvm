@@ -104,6 +104,10 @@ func TestAddTinyCoreVNCAutostart(t *testing.T) {
 		t.Fatalf("patched initramfs does not use TinyCore's mouse input protocol")
 	}
 
+	if !bytes.Contains(data, []byte("-a 1 -t 0")) {
+		t.Fatalf("patched initramfs does not disable Xvesa mouse acceleration")
+	}
+
 	if !bytes.Contains(data, []byte("/tmp/gokvm-vnc-session")) {
 		t.Fatalf("patched initramfs does not create the VNC session script")
 	}

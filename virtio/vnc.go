@@ -794,57 +794,14 @@ func writeFramebufferUpdate(
 
 func encodeCursorPseudoRect(pf rfbPixelFormat) []byte {
 	const (
-		width  = 16
-		height = 16
+		width  = 1
+		height = 1
 	)
 
-	frame := vncFrame{
-		width:  width,
-		height: height,
-		pix:    make([]byte, width*height*4),
-	}
-	mask := make([]byte, height*((width+7)/8))
-	cursorShape := [16]string{
-		"W...............",
-		"WW..............",
-		"WBW.............",
-		"WBBW............",
-		"WBBBW...........",
-		"WBBBBW..........",
-		"WBBBBBW.........",
-		"WBBBBBBW........",
-		"WBBBBBBBBW......",
-		"WBBBBBW.........",
-		"WBBWBW..........",
-		"WBW.WBW.........",
-		"WW..WBW.........",
-		"W....WBW........",
-		".....WBW........",
-		"......W.........",
-	}
-
-	for y, row := range cursorShape {
-		for x, visible := range row {
-			if visible == '.' {
-				continue
-			}
-
-			off := (y*width + x) * 4
-			if visible == 'B' {
-				frame.pix[off] = 0x00
-				frame.pix[off+1] = 0x00
-				frame.pix[off+2] = 0x00
-			} else {
-				frame.pix[off] = 0xff
-				frame.pix[off+1] = 0xff
-				frame.pix[off+2] = 0xff
-			}
-			frame.pix[off+3] = 0xff
-			mask[y*((width+7)/8)+x/8] |= 1 << (7 - uint(x%8))
-		}
-	}
-
-	pixels := encodeRawPixels(frame, pf, 0, 0, width, height)
+	bytesPerPixel := int(pf.bitsPerPixel) / 8
+	maskStride := (width + 7) / 8
+	pixels := make([]byte, width*height*bytesPerPixel)
+	mask := make([]byte, height*maskStride)
 	b := make([]byte, 12+len(pixels)+len(mask))
 	binary.BigEndian.PutUint16(b[4:6], width)
 	binary.BigEndian.PutUint16(b[6:8], height)
