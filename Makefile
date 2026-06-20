@@ -104,3 +104,6 @@ clean:
 qemu: initrd bzImage
 	qemu-system-x86_64 -kernel ./bzImage -initrd ./initrd --nographic --enable-kvm \
 		--append "root=/dev/ram rw console=ttyS0 rdinit=/init" --enable-kvm
+.PHONY: tinycore
+tinycore: gokvm
+	./gokvm boot -iso TinyCore-current.iso -vnc 127.0.0.1:5900 -m 512M

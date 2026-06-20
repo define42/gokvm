@@ -16,7 +16,9 @@ The latest version supports the following features:
 - [x] virtio-net (virtio 1.0, modern PCI transport)
 - [x] virtio-blk (virtio 1.0, modern PCI transport)
 - [x] virtio-gpu (virtio 1.0, 2D; frames written to PNG via `-g`)
+- [x] VNC server for virtio-gpu with keyboard and mouse input (`-vnc`)
 - [x] PVH Boot Protocol
+- [x] ISO boot via the El Torito boot catalog (no SeaBIOS/UEFI firmware required)
 
 **This is an experimental project, so please do not use it in production.**
 
@@ -44,7 +46,15 @@ use a different kernel, make sure it has `CONFIG_DRM_VIRTIO_GPU`,
 ISO boot support reads the El Torito boot catalog when present, uses the boot
 image location to find common syslinux/isolinux or GRUB configs, then loads the
 Linux kernel/initrd through gokvm's direct Linux loader. It does not emulate the
-BIOS/UEFI bootloader code itself.
+BIOS/UEFI bootloader code, so no SeaBIOS firmware is required. The raw ISO is
+attached to the guest as a read-only virtio-blk device so the booted kernel can
+mount its live media.
+
+When booting a TinyCore ISO with `-vnc`, gokvm injects an autostart overlay into
+the initrd so the guest brings up the FLWM desktop (Xvesa) on the VNC display
+instead of a text login. The VNC server forwards keyboard and mouse input back
+to the guest. Try it with `make tinycore`, which builds gokvm and boots
+`TinyCore-current.iso` on `127.0.0.1:5900`.
 
 ## Go package
 

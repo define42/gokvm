@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/bobuhiro11/gokvm/iso9660"
 	"github.com/bobuhiro11/gokvm/machine"
 	"github.com/bobuhiro11/gokvm/pvh"
 	"github.com/bobuhiro11/gokvm/term"
@@ -199,20 +200,62 @@ func (v *VMM) setupISO() error {
 		}
 	}()
 
-	bios, biosPath, err := loadBIOSFirmware()
-	if err != nil {
-		return err
-	}
-
 	info, err := isoFile.Stat()
 	if err != nil {
 		return err
 	}
-	v.AddReadOnlyCDROM(isoFile, info.Size())
-	log.Printf("ISO media attached as read-only ATAPI CD-ROM: %s", isoFile.Name())
-	log.Printf("ISO firmware boot: BIOS=%s", biosPath)
 
-	if err := v.LoadBIOS(bios); err != nil {
+	isoReader, err := iso9660.NewReader(isoFile, info.Size())
+	if err != nil {
+		return err
+	}
+
+	// Use the El Torito boot catalog (plus the syslinux/grub config it points
+	// at) to identify the kernel, initrd, and command line, then boot them
+	// directly. No BIOS firmware is involved.
+	files, err := iso9660.LoadBootFiles(isoReader)
+	if err != nil {
+		return err
+	}
+
+	params := v.Params
+	if !v.ParamsSet {
+		params = isoBootParams(files.Cmdline)
+	}
+
+	log.Printf("ISO El Torito boot: kernel=%s initrd=%s", files.KernelPath, files.InitrdPath)
+
+	// Attach the raw ISO so the booted kernel can mount its live media and load
+	// its extensions (e.g. TinyCore's .tcz set). virtio-blk is the proven path
+	// for TinyCore's boot-time device scan to find /cde.
+	if err := v.AddReadOnlyDisk(isoFile.Name()); err != nil {
+		return fmt.Errorf("attach ISO media: %w", err)
+	}
+
+	log.Printf("ISO media attached as read-only virtio-blk: %s", isoFile.Name())
+
+	if v.VNC != "" && hasTinyCoreGUI(isoReader) {
+		files.Initrd, err = addTinyCoreVNCAutostart(files.Initrd)
+		if err != nil {
+			return err
+		}
+
+		log.Printf("ISO boot: added TinyCore VNC desktop autostart overlay")
+	}
+
+	kern := bytes.NewReader(files.Kernel)
+	initrd := readerAtOrNil(files.Initrd)
+
+	isPVH, err := pvh.CheckPVH(kern)
+	if err != nil {
+		return err
+	}
+
+	if isPVH {
+		if err := v.LoadPVH(kern, initrd, params); err != nil {
+			return err
+		}
+	} else if err := v.LoadLinux(kern, initrd, params); err != nil {
 		return err
 	}
 
@@ -224,31 +267,24 @@ func (v *VMM) setupISO() error {
 	return nil
 }
 
-func loadBIOSFirmware() ([]byte, string, error) {
-	if name := os.Getenv("GOKVM_BIOS"); name != "" {
-		bios, err := os.ReadFile(name) //nolint:gosec // User-selected local firmware path.
-		if err != nil {
-			return nil, "", err
-		}
-
-		return bios, name, nil
+func readerAtOrNil(data []byte) io.ReaderAt {
+	if len(data) == 0 {
+		return nil
 	}
 
-	var errs []error
-	for _, name := range []string{
-		"./bios.bin",
-		"/usr/share/seabios/bios.bin",
-		"/usr/share/seabios/bios-256k.bin",
-	} {
-		bios, err := os.ReadFile(name) //nolint:gosec // Fixed firmware search path.
-		if err == nil {
-			return bios, name, nil
-		}
+	return bytes.NewReader(data)
+}
 
-		errs = append(errs, fmt.Errorf("%s: %w", name, err))
+func hasTinyCoreGUI(r *iso9660.Reader) bool {
+	if _, err := r.ReadFile("/cde/onboot.lst"); err != nil {
+		return false
 	}
 
-	return nil, "", fmt.Errorf("BIOS firmware not found; set GOKVM_BIOS or install seabios: %w", errors.Join(errs...))
+	if _, err := r.ReadFile("/cde/optional/Xvesa.tcz"); err != nil {
+		return false
+	}
+
+	return true
 }
 
 func openISOSource(source string) (*os.File, func(), error) {
