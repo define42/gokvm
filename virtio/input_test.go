@@ -19,6 +19,10 @@ func TestInputGetDeviceHeader(t *testing.T) {
 		t.Fatalf("SubsystemID: got %d, want %d", hdr.SubsystemID, virtioInputDeviceID)
 	}
 
+	if hdr.ClassCode != 0x09 || hdr.Subclass != 0x80 {
+		t.Fatalf("class: got %#x/%#x, want 0x09/0x80", hdr.ClassCode, hdr.Subclass)
+	}
+
 	if hdr.Status&0x10 == 0 {
 		t.Fatal("capabilities-list status bit not set")
 	}

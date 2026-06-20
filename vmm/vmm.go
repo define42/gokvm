@@ -14,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/bobuhiro11/gokvm/iso9660"
 	"github.com/bobuhiro11/gokvm/machine"
 	"github.com/bobuhiro11/gokvm/pvh"
 	"github.com/bobuhiro11/gokvm/term"
@@ -29,8 +28,8 @@ var errDownloadISO = errors.New("download ISO failed")
 // command line; this list only adds the host/VMM plumbing that a real firmware
 // boot path would normally provide or hide from the guest.
 const gokvmDirectLinuxBootParams = "console=tty0 console=ttyS0 earlyprintk=serial " +
-	"noapic noacpi nortc notsc nowatchdog nmi_watchdog=0 mitigations=off " +
-	"lapic tsc_early_khz=2000 pci=realloc=off virtio_pci.force_legacy=1"
+	"noapic noacpi nosmp nortc nowatchdog nmi_watchdog=0 mitigations=off " +
+	"lapic pci=realloc=off virtio_pci.force_legacy=1"
 
 // Config defines the configuration of the
 // virtual machine, as determined by flags.
@@ -150,7 +149,7 @@ func (v *VMM) Setup() error {
 		return v.setupISO()
 	}
 
-	var initrd *os.File
+	var initrd io.ReaderAt
 	// Kernel arg required to load kernel or firmware image
 	kern, err := os.Open(v.Kernel)
 	if err != nil {
@@ -163,10 +162,12 @@ func (v *VMM) Setup() error {
 	}
 
 	if v.Initrd != "" {
-		initrd, err = os.Open(v.Initrd)
+		initrdFile, err := os.Open(v.Initrd)
 		if err != nil {
 			return err
 		}
+
+		initrd = initrdFile
 	}
 
 	if isPVH {
@@ -198,54 +199,20 @@ func (v *VMM) setupISO() error {
 		}
 	}()
 
+	bios, biosPath, err := loadBIOSFirmware()
+	if err != nil {
+		return err
+	}
+
 	info, err := isoFile.Stat()
 	if err != nil {
 		return err
 	}
+	v.AddReadOnlyCDROM(isoFile, info.Size())
+	log.Printf("ISO media attached as read-only ATAPI CD-ROM: %s", isoFile.Name())
+	log.Printf("ISO firmware boot: BIOS=%s", biosPath)
 
-	isoReader, err := iso9660.NewReader(isoFile, info.Size())
-	if err != nil {
-		return err
-	}
-
-	files, err := iso9660.LoadBootFiles(isoReader)
-	if err != nil {
-		return err
-	}
-
-	params := v.Params
-	if !v.ParamsSet {
-		params = isoBootParams(files.Cmdline)
-	}
-
-	log.Printf("ISO boot: kernel=%s initrd=%s", files.KernelPath, files.InitrdPath)
-
-	if err := v.AddReadOnlyDisk(isoFile.Name()); err != nil {
-		return fmt.Errorf("attach ISO media: %w", err)
-	}
-	log.Printf("ISO media attached as read-only virtio-blk: %s", isoFile.Name())
-
-	if v.VNC != "" && hasTinyCoreGUI(isoReader) {
-		files.Initrd, err = addTinyCoreVNCAutostart(files.Initrd)
-		if err != nil {
-			return err
-		}
-		log.Printf("ISO boot: added TinyCore VNC desktop autostart overlay")
-	}
-
-	kern := bytes.NewReader(files.Kernel)
-	initrd := readerAtOrNil(files.Initrd)
-
-	isPVH, err := pvh.CheckPVH(kern)
-	if err != nil {
-		return err
-	}
-
-	if isPVH {
-		if err := v.LoadPVH(kern, initrd, params); err != nil {
-			return err
-		}
-	} else if err := v.LoadLinux(kern, initrd, params); err != nil {
+	if err := v.LoadBIOS(bios); err != nil {
 		return err
 	}
 
@@ -255,6 +222,33 @@ func (v *VMM) setupISO() error {
 	cleanupOnError = false
 
 	return nil
+}
+
+func loadBIOSFirmware() ([]byte, string, error) {
+	if name := os.Getenv("GOKVM_BIOS"); name != "" {
+		bios, err := os.ReadFile(name) //nolint:gosec // User-selected local firmware path.
+		if err != nil {
+			return nil, "", err
+		}
+
+		return bios, name, nil
+	}
+
+	var errs []error
+	for _, name := range []string{
+		"./bios.bin",
+		"/usr/share/seabios/bios.bin",
+		"/usr/share/seabios/bios-256k.bin",
+	} {
+		bios, err := os.ReadFile(name) //nolint:gosec // Fixed firmware search path.
+		if err == nil {
+			return bios, name, nil
+		}
+
+		errs = append(errs, fmt.Errorf("%s: %w", name, err))
+	}
+
+	return nil, "", fmt.Errorf("BIOS firmware not found; set GOKVM_BIOS or install seabios: %w", errors.Join(errs...))
 }
 
 func openISOSource(source string) (*os.File, func(), error) {
@@ -308,14 +302,6 @@ func downloadISO(source string) (*os.File, func(), error) {
 	log.Printf("downloaded ISO %s to %s", source, file.Name())
 
 	return file, cleanup, nil
-}
-
-func readerAtOrNil(data []byte) io.ReaderAt {
-	if len(data) == 0 {
-		return nil
-	}
-
-	return bytes.NewReader(data)
 }
 
 func isoBootParams(cmdline string) string {
@@ -436,18 +422,6 @@ func serialBytesForKeysym(keysym uint32) []byte {
 	default:
 		return nil
 	}
-}
-
-func hasTinyCoreGUI(r *iso9660.Reader) bool {
-	if _, err := r.ReadFile("/cde/onboot.lst"); err != nil {
-		return false
-	}
-
-	if _, err := r.ReadFile("/cde/optional/Xvesa.tcz"); err != nil {
-		return false
-	}
-
-	return true
 }
 
 func addTinyCoreVNCAutostart(initrd []byte) ([]byte, error) {

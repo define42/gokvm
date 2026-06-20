@@ -63,6 +63,10 @@ func LoadBootFiles(r *Reader) (*BootFiles, error) {
 }
 
 func (r *Reader) findBootSpec() bootSpec {
+	if spec := r.findBootSpecByElTorito(); spec.kernelPath != "" {
+		return spec
+	}
+
 	for _, name := range []string{
 		"/boot/isolinux/isolinux.cfg",
 		"/isolinux/isolinux.cfg",
@@ -95,6 +99,73 @@ func (r *Reader) findBootSpec() bootSpec {
 	}
 
 	return bootSpec{}
+}
+
+func (r *Reader) findBootSpecByElTorito() bootSpec {
+	bootImagePath, err := r.elToritoBootImagePath()
+	if err != nil {
+		return bootSpec{}
+	}
+
+	for _, name := range elToritoSyslinuxConfigCandidates(bootImagePath) {
+		data, err := r.ReadFile(name)
+		if err != nil {
+			continue
+		}
+
+		if spec := parseSyslinuxConfig(name, string(data)); spec.kernelPath != "" {
+			return spec
+		}
+	}
+
+	for _, name := range elToritoGRUBConfigCandidates(bootImagePath) {
+		data, err := r.ReadFile(name)
+		if err != nil {
+			continue
+		}
+
+		if spec := parseGRUBConfig(name, string(data)); spec.kernelPath != "" {
+			return spec
+		}
+	}
+
+	return bootSpec{}
+}
+
+func elToritoSyslinuxConfigCandidates(bootImagePath string) []string {
+	dir := path.Dir(bootImagePath)
+
+	return uniquePaths(
+		path.Join(dir, "isolinux.cfg"),
+		path.Join(dir, "syslinux.cfg"),
+	)
+}
+
+func elToritoGRUBConfigCandidates(bootImagePath string) []string {
+	dir := path.Dir(bootImagePath)
+	parent := path.Dir(dir)
+
+	return uniquePaths(
+		path.Join(dir, "grub.cfg"),
+		path.Join(parent, "grub.cfg"),
+	)
+}
+
+func uniquePaths(names ...string) []string {
+	seen := map[string]bool{}
+	unique := make([]string, 0, len(names))
+
+	for _, name := range names {
+		name = path.Clean(name)
+		if seen[name] {
+			continue
+		}
+
+		seen[name] = true
+		unique = append(unique, name)
+	}
+
+	return unique
 }
 
 func (r *Reader) findBootSpecByPath() bootSpec {

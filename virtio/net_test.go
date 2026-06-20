@@ -53,6 +53,10 @@ func TestNetGetDeviceHeader(t *testing.T) {
 	}
 
 	hdr := v.GetDeviceHeader()
+	if hdr.ClassCode != 0x02 || hdr.Subclass != 0x00 {
+		t.Fatalf("class: got %#x/%#x, want 0x02/0x00", hdr.ClassCode, hdr.Subclass)
+	}
+
 	if hdr.Status&0x10 == 0 {
 		t.Fatal("capabilities-list status bit not set")
 	}

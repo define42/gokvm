@@ -122,6 +122,24 @@ func TestProbingBAR0(t *testing.T) {
 	}
 }
 
+func TestPciConfDataOutNonBARWriteReadsBack(t *testing.T) {
+	t.Parallel()
+
+	p := pci.New(pci.NewBridge())
+
+	_ = p.PciConfAddrOut(0x0, pci.NumToBytes(uint32(0x80000058)))
+	_ = p.PciConfDataOut(0xcfd, []byte{0x30, 0x33, 0x33})
+
+	data := make([]byte, 4)
+	if err := p.PciConfDataIn(0xcfc, data); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, want := data, []byte{0x00, 0x30, 0x33, 0x33}; !bytes.Equal(got, want) {
+		t.Fatalf("config readback: got %#v, want %#v", got, want)
+	}
+}
+
 func TestBytes(t *testing.T) {
 	t.Parallel()
 
@@ -220,3 +238,71 @@ func TestPciConfDataInOut(t *testing.T) {
 		})
 	}
 }
+
+func TestPciConfDataInAbsentDeviceReturnsAllOnes(t *testing.T) {
+	t.Parallel()
+
+	p := pci.New(pci.NewBridge())
+	_ = p.PciConfAddrOut(0x0, pci.NumToBytes(uint32(0x80000800))) // bus 0, slot 1, function 0
+
+	data := make([]byte, 4)
+	if err := p.PciConfDataIn(0xCFC, data); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, want := pci.BytesToNum(data), uint64(0xffffffff); got != want {
+		t.Fatalf("absent config read: got %#x, want %#x", got, want)
+	}
+}
+
+func TestPciConfDataOutPartialBARWriteUpdatesMMIODecode(t *testing.T) {
+	t.Parallel()
+
+	dev := &testMMIODevice{}
+	p := pci.New(dev)
+
+	_ = p.PciConfAddrOut(0x0, pci.NumToBytes(uint32(0x80000010)))
+	_ = p.PciConfDataOut(0xcfc, []byte{0x00, 0x00})
+	_ = p.PciConfDataOut(0xcfe, []byte{0x34, 0x12})
+
+	data := make([]byte, 4)
+	if err := p.PciConfDataIn(0xcfc, data); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, want := pci.BytesToNum(data), uint64(0x12340000); got != want {
+		t.Fatalf("BAR readback: got %#x, want %#x", got, want)
+	}
+
+	if _, off, ok := p.LookupMMIO(0x12340020); !ok || off != 0x20 {
+		t.Fatalf("LookupMMIO: ok=%v off=%#x, want true/0x20", ok, off)
+	}
+}
+
+type testMMIODevice struct{}
+
+func (d *testMMIODevice) GetDeviceHeader() pci.DeviceHeader {
+	return pci.DeviceHeader{
+		VendorID:            0x1af4,
+		DeviceID:            0x1042,
+		Status:              0x10,
+		CapabilitiesPointer: 0x40,
+		BAR:                 [6]uint32{0xd0000000},
+	}
+}
+
+func (d *testMMIODevice) Read(uint64, []byte) error { return nil }
+
+func (d *testMMIODevice) Write(uint64, []byte) error { return nil }
+
+func (d *testMMIODevice) IOPort() uint64 { return 0 }
+
+func (d *testMMIODevice) Size() uint64 { return 0 }
+
+func (d *testMMIODevice) Capabilities() []byte { return nil }
+
+func (d *testMMIODevice) MMIOBARIndex() int { return 0 }
+
+func (d *testMMIODevice) MMIOSize() uint64 { return 0x1000 }
+
+func (d *testMMIODevice) MMIO(uint64, []byte, bool) {}

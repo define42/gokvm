@@ -75,15 +75,17 @@ type DeviceHeader struct {
 	// Status bit 4 (0x10) advertises a PCI capabilities list; modern
 	// virtio devices set it together with CapabilitiesPointer.
 	Status              uint16
-	_                   uint8    // revisonID
-	_                   [3]uint8 // classCode
-	_                   uint8    // cacheLineSize
-	_                   uint8    // latencyTimer
+	RevisionID          uint8
+	ProgIF              uint8
+	Subclass            uint8
+	ClassCode           uint8
+	_                   uint8 // cacheLineSize
+	_                   uint8 // latencyTimer
 	HeaderType          uint8
 	_                   uint8 // bist
 	BAR                 [6]uint32
 	_                   uint32 // cardbusCISPointer
-	_                   uint16 // subsystemVendorID
+	SubsystemVendorID   uint16
 	SubsystemID         uint16
 	_                   uint32 // expansionROMBaseAddress
 	CapabilitiesPointer uint8  // offset of the first PCI capability
@@ -117,13 +119,19 @@ type PCI struct {
 	// barOverride records guest-assigned base addresses for the memory
 	// BARs of modern (CapsAndMMIO) devices, keyed by slot then BAR index.
 	barOverride map[int]map[int]uint32
+
+	// configOverride records writable configuration-space bytes outside BARs.
+	// Firmware uses this for chipset registers such as i440FX PAM shadow RAM
+	// controls, and later reads expect to see the values it wrote.
+	configOverride map[int]map[int]byte
 }
 
 func New(devices ...Device) *PCI {
 	return &PCI{
-		Devices:     devices,
-		probeSlot:   -1,
-		barOverride: map[int]map[int]uint32{},
+		Devices:        devices,
+		probeSlot:      -1,
+		barOverride:    map[int]map[int]uint32{},
+		configOverride: map[int]map[int]byte{},
 	}
 }
 
@@ -187,6 +195,12 @@ func (p *PCI) configSpace(slot int) ([]byte, error) {
 		copy(cfg[0x10+bar*4:], NumToBytes(v))
 	}
 
+	for off, v := range p.configOverride[slot] {
+		if off >= 0 && off < len(cfg) {
+			cfg[off] = v
+		}
+	}
+
 	return cfg, nil
 }
 
@@ -211,6 +225,12 @@ func (p *PCI) LookupMMIO(addr uint64) (CapsAndMMIO, uint64, bool) {
 }
 
 func (p *PCI) PciConfDataIn(port uint64, values []byte) error {
+	fillAbsent := func() {
+		for i := range values {
+			values[i] = 0xff
+		}
+	}
+
 	// offset can be obtained from many source as below:
 	//        (address from IO port 0xcf8) & 0xfc + (IO port address for Data) - 0xCFC
 	// see pci_conf1_read in linux/arch/x86/pci/direct.c for more detail.
@@ -221,24 +241,34 @@ func (p *PCI) PciConfDataIn(port uint64, values []byte) error {
 	}
 
 	if p.addr.getBusNumber() != 0 {
+		fillAbsent()
+
 		return nil
 	}
 
 	if p.addr.getFunctionNumber() != 0 {
+		fillAbsent()
+
 		return nil
 	}
 
 	slot := int(p.addr.getDeviceNumber())
 
 	if slot >= len(p.Devices) {
+		fillAbsent()
+
 		return nil
 	}
 
 	// Reply to a pending BAR size probe with the size mask.
 	if bar := barAtOffset(offset); bar >= 0 && p.probeSlot == slot && p.probeBar == bar {
-		copy(values[:4], NumToBytes(SizeToBits(p.barSize(slot, bar))))
+		barOffset := 0x10 + bar*4
+		mask := NumToBytes(SizeToBits(p.barSize(slot, bar)))
+		copy(values, mask[offset-barOffset:])
 
-		p.probeSlot, p.probeBar = -1, 0
+		if offset+len(values) >= barOffset+4 {
+			p.probeSlot, p.probeBar = -1, 0
+		}
 
 		return nil
 	}
@@ -248,8 +278,21 @@ func (p *PCI) PciConfDataIn(port uint64, values []byte) error {
 		return err
 	}
 
-	l := len(values)
-	copy(values[:l], b[offset:offset+l])
+	if offset >= len(b) {
+		fillAbsent()
+
+		return nil
+	}
+
+	end := offset + len(values)
+	if end > len(b) {
+		end = len(b)
+	}
+
+	copy(values, b[offset:end])
+	for i := end - offset; i < len(values); i++ {
+		values[i] = 0xff
+	}
 
 	return nil
 }
@@ -276,13 +319,23 @@ func (p *PCI) PciConfDataOut(port uint64, values []byte) error {
 	}
 
 	bar := barAtOffset(offset)
-	if bar < 0 || len(values) != 4 {
+	if bar < 0 {
+		if p.configOverride[slot] == nil {
+			p.configOverride[slot] = map[int]byte{}
+		}
+		for i, v := range values {
+			if off := offset + i; off >= 0 && off < 256 {
+				p.configOverride[slot][off] = v
+			}
+		}
+
 		return nil
 	}
+	barOffset := 0x10 + bar*4
 
 	// 0xffffffff arms a size probe; the next read of this BAR returns the
 	// size mask instead of the address.
-	if BytesToNum(values) == 0xffffffff {
+	if offset == barOffset && len(values) == 4 && BytesToNum(values) == 0xffffffff {
 		p.probeSlot, p.probeBar = slot, bar
 
 		return nil
@@ -296,7 +349,14 @@ func (p *PCI) PciConfDataOut(port uint64, values []byte) error {
 			p.barOverride[slot] = map[int]uint32{}
 		}
 
-		p.barOverride[slot][bar] = uint32(BytesToNum(values))
+		cur := p.Devices[slot].GetDeviceHeader().BAR[bar]
+		if v, ok := p.barOverride[slot][bar]; ok {
+			cur = v
+		}
+
+		raw := NumToBytes(cur)
+		copy(raw[offset-barOffset:], values)
+		p.barOverride[slot][bar] = uint32(BytesToNum(raw))
 	}
 
 	return nil

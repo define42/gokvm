@@ -49,6 +49,10 @@ func TestBlkGetDeviceHeader(t *testing.T) {
 		t.Fatalf("DeviceID: expected 0x1042, actual 0x%x", hdr.DeviceID)
 	}
 
+	if hdr.ClassCode != 0x01 || hdr.Subclass != 0x00 {
+		t.Fatalf("class: got %#x/%#x, want 0x01/0x00", hdr.ClassCode, hdr.Subclass)
+	}
+
 	if hdr.Status&0x10 == 0 {
 		t.Fatal("capabilities-list status bit not set")
 	}

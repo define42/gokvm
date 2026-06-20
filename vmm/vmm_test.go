@@ -19,8 +19,8 @@ func TestISOBootParamsAddsOnlyDirectLinuxDefaults(t *testing.T) {
 		"earlyprintk=serial",
 		"noapic",
 		"noacpi",
+		"nosmp",
 		"nortc",
-		"notsc",
 		"pci=realloc=off",
 		"virtio_pci.force_legacy=1",
 		"loglevel=3",
@@ -34,6 +34,8 @@ func TestISOBootParamsAddsOnlyDirectLinuxDefaults(t *testing.T) {
 	for _, unwanted := range []string{
 		"desktop=flwm",
 		"icons=wbar",
+		"notsc",
+		"tsc_early_khz=2000",
 		"xvesa=1024x768x32",
 	} {
 		if hasField(cmdline, unwanted) {

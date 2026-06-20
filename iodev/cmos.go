@@ -9,6 +9,9 @@ const (
 	indexOffset = uint64(0x70)
 	dataOffset  = uint64(0x71)
 	dataLen     = uint64(128)
+
+	kib = 1024
+	mib = 1024 * kib
 )
 
 type CMOS struct {
@@ -22,18 +25,43 @@ func NewCMOS(memBelow4G, memAbove4G uint64) *CMOS {
 		Data:  make([]uint8, dataLen),
 	}
 
-	// We assume 3G RAM at all times for now.....
-	extMem := uint16(0xBC00)
+	cmos.setUint16(0x15, 640) // Conventional memory in KiB.
+	extendedKiB := saturatingSub(memBelow4G, 1*mib) / kib
+	cmos.setUint16(0x17, uint16(clampMax(extendedKiB, 0xffff)))
+	cmos.setUint16(0x30, uint16(clampMax(extendedKiB, 0xffff)))
 
-	cmos.Data[0x34] = uint8(extMem)
-	cmos.Data[0x35] = uint8(extMem >> 8)
+	// Extended memory above 16MiB in 64KiB chunks. SeaBIOS uses this to
+	// decide where top-of-RAM scratch space lives.
+	extMem64K := uint16(clampMax(saturatingSub(memBelow4G, 16*mib)/(64*kib), 0xffff))
+	cmos.setUint16(0x34, extMem64K)
 
-	// Only valid for PVH boot of firmware with 3G RAM fixed.....
-	cmos.Data[0x5b] = 0
-	cmos.Data[0x5c] = 0
-	cmos.Data[0x5d] = 0
+	above4G64K := clampMax(memAbove4G/(64*kib), 0xffffff)
+	cmos.Data[0x5b] = uint8(above4G64K)
+	cmos.Data[0x5c] = uint8(above4G64K >> 8)
+	cmos.Data[0x5d] = uint8(above4G64K >> 16)
 
 	return cmos
+}
+
+func (c *CMOS) setUint16(index uint8, v uint16) {
+	c.Data[index] = uint8(v)
+	c.Data[index+1] = uint8(v >> 8)
+}
+
+func clampMax(v, max uint64) uint64 {
+	if v > max {
+		return max
+	}
+
+	return v
+}
+
+func saturatingSub(v, sub uint64) uint64 {
+	if v < sub {
+		return 0
+	}
+
+	return v - sub
 }
 
 func (c *CMOS) Read(base uint64, data []byte) error {
@@ -115,7 +143,7 @@ func (c *CMOS) Write(base uint64, data []byte) error {
 }
 
 func toBCD(v uint8) uint8 {
-	return ((v / 100) << 4) | (v % 10)
+	return ((v / 10) << 4) | (v % 10)
 }
 
 func (c *CMOS) IOPort() uint64 {

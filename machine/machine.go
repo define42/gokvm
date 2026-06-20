@@ -35,10 +35,13 @@ const (
 	initrdAddr  = 0xf000000
 	highMemBase = 0x100000
 	bootStack   = 0x80000
+	biosTop     = 0x100000
+	firmwareMax = 16 << 20
 
 	serialIRQ              = 4
 	ps2KeyboardIRQ         = 1
 	ps2MouseIRQ            = 12
+	idePrimaryIRQ          = 14
 	virtioNetIRQ           = 9
 	virtioBlkIRQ           = 10
 	virtioGPUIRQ           = 11
@@ -154,6 +157,7 @@ type Machine struct {
 	ioportHandlers [0x10000][2]func(port uint64, bytes []byte) error
 	stopped        uint32
 	vesaEnabled    bool
+	biosROM        []byte
 }
 
 // Close stops vCPU goroutines and releases PCI device
@@ -174,6 +178,11 @@ func (m *Machine) Close() error {
 	if m.kvmFile != nil {
 		_ = m.kvmFile.Close()
 		m.kvmFile = nil
+	}
+
+	if m.biosROM != nil {
+		_ = syscall.Munmap(m.biosROM)
+		m.biosROM = nil
 	}
 
 	return nil
@@ -270,6 +279,14 @@ func (m *Machine) AddReadOnlyDisk(diskPath string) error {
 	m.pci.Devices = append(m.pci.Devices, v)
 
 	return nil
+}
+
+func (m *Machine) AddReadOnlyCDROM(r io.ReaderAt, size int64) {
+	m.pci.Devices = append(m.pci.Devices, pci.NewIDEController())
+
+	for _, dev := range iodev.NewATAPICDROM(r, size, m.InjectIDEPrimaryIRQ) {
+		m.AddDevice(dev)
+	}
 }
 
 func (m *Machine) AddGPU(outputPath string) error {
@@ -498,9 +515,66 @@ func (m *Machine) LoadPVH(kern, initrd io.ReaderAt, cmdline string) error {
 	}
 
 	m.AddDevice(&iodev.FWDebug{}) // Port 0x402
-	m.AddDevice(iodev.NewCMOS(0xC000000, 0x0))
+	m.AddDevice(iodev.NewCMOS(uint64(len(m.mem)), 0x0))
 	m.AddDevice(iodev.NewACPIPMTimer())
 	m.initIOPortHandlers()
+
+	return nil
+}
+
+func (m *Machine) LoadBIOS(bios []byte) error {
+	if len(bios) == 0 {
+		return ErrZeroSizeKernel
+	}
+	if len(bios) > firmwareMax {
+		return fmt.Errorf("firmware image size %d:%w", len(bios), ErrUnsupported)
+	}
+
+	if len(bios) <= biosTop {
+		biosBase := biosTop - len(bios)
+		copy(m.mem[biosBase:biosTop], bios)
+	}
+
+	var err error
+	m.biosROM, err = syscall.Mmap(-1, 0, len(bios),
+		syscall.PROT_READ|syscall.PROT_WRITE,
+		syscall.MAP_SHARED|syscall.MAP_ANONYMOUS)
+	if err != nil {
+		return err
+	}
+	copy(m.biosROM, bios)
+
+	if err := kvm.SetUserMemoryRegion(m.vmFd, &kvm.UserspaceMemoryRegion{
+		Slot:          1,
+		Flags:         0,
+		GuestPhysAddr: uint64(0x1_0000_0000 - len(bios)),
+		MemorySize:    uint64(len(bios)),
+		UserspaceAddr: uint64(uintptr(unsafe.Pointer(&m.biosROM[0]))),
+	}); err != nil {
+		_ = syscall.Munmap(m.biosROM)
+		m.biosROM = nil
+
+		return err
+	}
+
+	for cpuID, cpu := range m.vcpuFds {
+		if err := m.initBIOSRegs(cpu, cpuID == 0); err != nil {
+			return err
+		}
+	}
+
+	if m.serial, err = serial.New(m); err != nil {
+		return err
+	}
+
+	m.AddDevice(&iodev.FWDebug{}) // Port 0x402
+	m.AddDevice(iodev.NewCMOS(uint64(len(m.mem)), 0x0))
+	m.AddDevice(iodev.NewFWCfg(uint64(len(m.mem)), uint16(len(m.vcpuFds)), "d"))
+	m.AddDevice(&iodev.Noop{Port: 0x80, Psize: 0xA0})
+	m.initIOPortHandlers()
+	if m.vesaEnabled {
+		m.installVESABIOS()
+	}
 
 	return nil
 }
@@ -672,7 +746,7 @@ func (m *Machine) LoadLinux(kernel, initrd io.ReaderAt, params string) error {
 		return err
 	}
 
-	m.AddDevice(iodev.NewCMOS(0xC000_0000, 0x0))
+	m.AddDevice(iodev.NewCMOS(uint64(len(m.mem)), 0x0))
 	m.AddDevice(&iodev.Noop{Port: 0x80, Psize: 0xA0})
 	m.initIOPortHandlers()
 	if m.vesaEnabled {
@@ -879,6 +953,60 @@ func (m *Machine) initSregs(vcpufd uintptr, amd64 bool) error {
 	return nil
 }
 
+func (m *Machine) initBIOSRegs(vcpufd uintptr, bootstrap bool) error {
+	sregs, err := kvm.GetSregs(vcpufd)
+	if err != nil {
+		return err
+	}
+
+	sregs.CS = realModeSegment(0xf000, 0xffff0000, true)
+	sregs.DS = realModeSegment(0, 0, false)
+	sregs.ES = realModeSegment(0, 0, false)
+	sregs.FS = realModeSegment(0, 0, false)
+	sregs.GS = realModeSegment(0, 0, false)
+	sregs.SS = realModeSegment(0, 0, false)
+	sregs.IDT = kvm.Descriptor{Base: 0, Limit: 0x3ff}
+	sregs.GDT = kvm.Descriptor{Base: 0, Limit: 0}
+	sregs.CR0 = CR0xET
+	sregs.CR2 = 0
+	sregs.CR3 = 0
+	sregs.CR4 = 0
+	sregs.CR8 = 0
+	sregs.EFER = 0
+
+	if err := kvm.SetSregs(vcpufd, sregs); err != nil {
+		return err
+	}
+
+	regs, err := kvm.GetRegs(vcpufd)
+	if err != nil {
+		return err
+	}
+
+	*regs = kvm.Regs{RFLAGS: 2, RIP: 0xfff0}
+	if !bootstrap {
+		_ = kvm.SetMPState(vcpufd, &kvm.MPState{State: kvm.MPStateHalted})
+	}
+
+	return kvm.SetRegs(vcpufd, regs)
+}
+
+func realModeSegment(selector uint16, base uint64, code bool) kvm.Segment {
+	typ := uint8(3) // Data: read/write, accessed.
+	if code {
+		typ = 11 // Code: execute/read, accessed.
+	}
+
+	return kvm.Segment{
+		Base:     base,
+		Limit:    0xffff,
+		Selector: selector,
+		Typ:      typ,
+		Present:  1,
+		S:        1,
+	}
+}
+
 func (m *Machine) initCPUID(cpu int) error {
 	cpuid := kvm.CPUID{
 		Nent:    100,
@@ -987,9 +1115,20 @@ func (m *Machine) RunOnce(cpu int) (bool, error) {
 	case kvm.EXITIO:
 		direction, size, port, count, offset := m.runs[cpu].IO()
 		f := m.ioportHandlers[port][direction]
+		if os.Getenv("GOKVM_TRACE_IO") != "" {
+			dir := "out"
+			if direction == kvm.EXITIOIN {
+				dir = "in"
+			}
+			log.Printf("io %s port=%#x size=%d count=%d", dir, port, size, count)
+		}
 
-		bytes := (*(*[100]byte)(unsafe.Pointer(uintptr(unsafe.Pointer(m.runs[cpu])) + uintptr(offset))))[0:size]
+		ioBytes := unsafe.Slice(
+			(*byte)(unsafe.Pointer(uintptr(unsafe.Pointer(m.runs[cpu]))+uintptr(offset))),
+			int(size)*int(count),
+		)
 		for i := 0; i < int(count); i++ {
+			bytes := ioBytes[i*int(size) : (i+1)*int(size)]
 			if err := f(port, bytes); err != nil {
 				return false, err
 			}
@@ -1001,7 +1140,7 @@ func (m *Machine) RunOnce(cpu int) (bool, error) {
 
 		if dev, offset, ok := m.pci.LookupMMIO(physAddr); ok {
 			dev.MMIO(offset, data, isWrite)
-		} else {
+		} else if os.Getenv("GOKVM_TRACE_MMIO") != "" {
 			log.Printf("unhandled MMIO @%#x len=%d write=%v",
 				physAddr, len(data), isWrite)
 		}
@@ -1112,6 +1251,8 @@ func (m *Machine) initIOPortHandlers() {
 	}
 
 	m.registerIOPortHandler(0, 0x10000, funcError, funcError)     // default handler
+	m.registerIOPortHandler(0x00, 0x10, funcNone, funcNone)       // 8237 DMA controller 1
+	m.registerIOPortHandler(0xc0, 0xe0, funcNone, funcNone)       // 8237 DMA controller 2
 	m.registerIOPortHandler(0xcf9, 0xcfa, funcNone, funcOutbCF9)  // CF9
 	m.registerIOPortHandler(0x170, 0x3f8, funcInAbsent, funcNone) // Absent legacy ISA/gameport/PNP/ATA ports
 	m.registerIOPortHandler(0x3c0, 0x3db, funcNone, funcNone)     // VGA
@@ -1179,6 +1320,19 @@ func (m *Machine) InjectPS2MouseIRQ() error {
 	}
 
 	if err := kvm.IRQLineStatus(m.vmFd, ps2MouseIRQ, 1); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// InjectIDEPrimaryIRQ injects a primary IDE channel interrupt.
+func (m *Machine) InjectIDEPrimaryIRQ() error {
+	if err := kvm.IRQLineStatus(m.vmFd, idePrimaryIRQ, 0); err != nil {
+		return err
+	}
+
+	if err := kvm.IRQLineStatus(m.vmFd, idePrimaryIRQ, 1); err != nil {
 		return err
 	}
 

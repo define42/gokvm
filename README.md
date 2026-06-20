@@ -41,9 +41,10 @@ VNC shows the Linux framebuffer console once the guest probes the GPU. If you
 use a different kernel, make sure it has `CONFIG_DRM_VIRTIO_GPU`,
 `CONFIG_DRM_FBDEV_EMULATION`, and `CONFIG_FRAMEBUFFER_CONSOLE` built in.
 
-ISO boot support extracts Linux boot files from ISO9660 media and uses gokvm's
-direct Linux loader. It supports common syslinux/isolinux and GRUB configs, but
-does not emulate BIOS/UEFI El Torito boot.
+ISO boot support reads the El Torito boot catalog when present, uses the boot
+image location to find common syslinux/isolinux or GRUB configs, then loads the
+Linux kernel/initrd through gokvm's direct Linux loader. It does not emulate the
+BIOS/UEFI bootloader code itself.
 
 ## Go package
 

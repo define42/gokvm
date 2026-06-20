@@ -138,6 +138,8 @@ func (g *GPU) GetDeviceHeader() pci.DeviceHeader {
 		// interface and requires VIRTIO_F_VERSION_1.
 		DeviceID:    0x1050,
 		VendorID:    0x1AF4,
+		ClassCode:   0x03, // Display controller
+		Subclass:    0x00, // VGA-compatible controller
 		HeaderType:  0,
 		SubsystemID: 16, // GPU
 		// Memory space enable | bus master.
