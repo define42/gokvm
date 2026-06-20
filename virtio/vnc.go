@@ -29,7 +29,8 @@ const (
 	rfbMsgPointerEvent             = 5
 	rfbMsgClientCutText            = 6
 
-	rfbEncodingRaw = 0
+	rfbEncodingRaw    = 0
+	rfbEncodingCursor = 0xffffff11 // int32(-239) on the wire.
 
 	vncDefaultWidth  = 1024
 	vncDefaultHeight = 768
@@ -357,15 +358,30 @@ func (d *VNCDisplay) serveConn(conn net.Conn) error {
 	}
 
 	pf := defaultRFBPixelFormat()
+	cursorEnabled := false
 	frame := d.snapshot()
 
 	if err := writeServerInit(conn, frame.width, frame.height, pf); err != nil {
 		return err
 	}
 
-	lastSeq := uint64(0)
+	updateReqs := make(chan vncUpdateRequest, 1)
+	updateErrs := make(chan error, 1)
+	done := make(chan struct{})
+	defer func() {
+		close(done)
+		d.wakeFrameWaiters()
+	}()
+
+	go d.writeFramebufferUpdates(conn, updateReqs, updateErrs, done)
 
 	for {
+		select {
+		case err := <-updateErrs:
+			return err
+		default:
+		}
+
 		var typ [1]byte
 		if _, err := io.ReadFull(conn, typ[:]); err != nil {
 			return err
@@ -380,21 +396,22 @@ func (d *VNCDisplay) serveConn(conn net.Conn) error {
 
 			pf = next
 		case rfbMsgSetEncodings:
-			if err := readSetEncodings(conn); err != nil {
+			encodings, err := readSetEncodings(conn)
+			if err != nil {
 				return err
 			}
+
+			cursorEnabled = encodings.cursor
 		case rfbMsgFramebufferUpdateRequest:
 			req, err := readFramebufferUpdateRequest(conn)
 			if err != nil {
 				return err
 			}
 
-			frame = d.frameForRequest(req.incremental, lastSeq)
-			if err := writeFramebufferUpdate(conn, frame, pf, req.x, req.y, req.width, req.height); err != nil {
-				return err
+			select {
+			case updateReqs <- vncUpdateRequest{req: req, pf: pf, cursor: cursorEnabled}:
+			default:
 			}
-
-			lastSeq = frame.seq
 		case rfbMsgKeyEvent:
 			event, err := readKeyEvent(conn)
 			if err != nil {
@@ -415,6 +432,54 @@ func (d *VNCDisplay) serveConn(conn net.Conn) error {
 			}
 		default:
 			return fmt.Errorf("unknown client message %d", typ[0])
+		}
+	}
+}
+
+type vncUpdateRequest struct {
+	req    framebufferUpdateRequest
+	pf     rfbPixelFormat
+	cursor bool
+}
+
+func (d *VNCDisplay) writeFramebufferUpdates(
+	conn net.Conn,
+	reqs <-chan vncUpdateRequest,
+	errs chan<- error,
+	done <-chan struct{},
+) {
+	lastSeq := uint64(0)
+
+	for {
+		select {
+		case <-done:
+			return
+		case req := <-reqs:
+			frame, ok := d.frameForRequestUntil(req.req.incremental, lastSeq, done)
+			if !ok {
+				return
+			}
+
+			if err := writeFramebufferUpdate(
+				conn,
+				frame,
+				req.pf,
+				req.cursor,
+				req.req.x,
+				req.req.y,
+				req.req.width,
+				req.req.height,
+			); err != nil {
+				select {
+				case errs <- err:
+				default:
+				}
+				_ = conn.Close()
+
+				return
+			}
+
+			lastSeq = frame.seq
 		}
 	}
 }
@@ -480,23 +545,45 @@ func (d *VNCDisplay) snapshot() vncFrame {
 	return d.snapshotLocked()
 }
 
-func (d *VNCDisplay) frameForRequest(incremental bool, lastSeq uint64) vncFrame {
+func (d *VNCDisplay) frameForRequestUntil(incremental bool, lastSeq uint64, done <-chan struct{}) (vncFrame, bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	if incremental {
 		for d.seq == lastSeq {
-			select {
-			case <-d.done:
-				return d.snapshotLocked()
-			default:
+			if d.frameWaitCanceled(done) {
+				return d.snapshotLocked(), false
 			}
 
 			d.cond.Wait()
 		}
 	}
 
-	return d.snapshotLocked()
+	return d.snapshotLocked(), true
+}
+
+func (d *VNCDisplay) frameWaitCanceled(done <-chan struct{}) bool {
+	select {
+	case <-d.done:
+		return true
+	default:
+	}
+
+	if done != nil {
+		select {
+		case <-done:
+			return true
+		default:
+		}
+	}
+
+	return false
+}
+
+func (d *VNCDisplay) wakeFrameWaiters() {
+	d.mu.Lock()
+	d.cond.Broadcast()
+	d.mu.Unlock()
 }
 
 func (d *VNCDisplay) snapshotLocked() vncFrame {
@@ -528,6 +615,10 @@ type pointerEvent struct {
 	buttonMask uint8
 	x          uint16
 	y          uint16
+}
+
+type clientEncodings struct {
+	cursor bool
 }
 
 func readFramebufferUpdateRequest(r io.Reader) (framebufferUpdateRequest, error) {
@@ -584,15 +675,27 @@ func readSetPixelFormat(r io.Reader) (rfbPixelFormat, error) {
 	return pf, nil
 }
 
-func readSetEncodings(r io.Reader) error {
+func readSetEncodings(r io.Reader) (clientEncodings, error) {
 	var hdr [3]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return err
+		return clientEncodings{}, err
 	}
 
 	n := binary.BigEndian.Uint16(hdr[1:3])
+	var enc clientEncodings
+	var raw [4]byte
 
-	return discardFull(r, int(n)*4)
+	for range n {
+		if _, err := io.ReadFull(r, raw[:]); err != nil {
+			return clientEncodings{}, err
+		}
+
+		if binary.BigEndian.Uint32(raw[:]) == rfbEncodingCursor {
+			enc.cursor = true
+		}
+	}
+
+	return enc, nil
 }
 
 func readClientCutText(r io.Reader) error {
@@ -635,6 +738,7 @@ func writeFramebufferUpdate(
 	w io.Writer,
 	frame vncFrame,
 	pf rfbPixelFormat,
+	cursor bool,
 	xReq, yReq, wReq, hReq uint16,
 ) error {
 	x := int(xReq)
@@ -643,7 +747,14 @@ func writeFramebufferUpdate(
 	height := int(hReq)
 
 	if x >= frame.width || y >= frame.height || width == 0 || height == 0 {
-		_, err := w.Write([]byte{0, 0, 0, 0})
+		if !cursor {
+			_, err := w.Write([]byte{0, 0, 0, 0})
+
+			return err
+		}
+
+		b := append([]byte{0, 0, 0, 1}, encodeCursorPseudoRect(pf)...)
+		_, err := w.Write(b)
 
 		return err
 	}
@@ -657,20 +768,91 @@ func writeFramebufferUpdate(
 	}
 
 	pixels := encodeRawPixels(frame, pf, x, y, width, height)
-	b := make([]byte, 16+len(pixels))
+	cursorRect := []byte(nil)
+	rects := uint16(1)
+	if cursor {
+		cursorRect = encodeCursorPseudoRect(pf)
+		rects++
+	}
+
+	b := make([]byte, 16+len(pixels)+len(cursorRect))
 
 	b[0] = 0 // FramebufferUpdate
-	binary.BigEndian.PutUint16(b[2:4], 1)
+	binary.BigEndian.PutUint16(b[2:4], rects)
 	binary.BigEndian.PutUint16(b[4:6], uint16(x))
 	binary.BigEndian.PutUint16(b[6:8], uint16(y))
 	binary.BigEndian.PutUint16(b[8:10], uint16(width))
 	binary.BigEndian.PutUint16(b[10:12], uint16(height))
 	binary.BigEndian.PutUint32(b[12:16], rfbEncodingRaw)
 	copy(b[16:], pixels)
+	copy(b[16+len(pixels):], cursorRect)
 
 	_, err := w.Write(b)
 
 	return err
+}
+
+func encodeCursorPseudoRect(pf rfbPixelFormat) []byte {
+	const (
+		width  = 16
+		height = 16
+	)
+
+	frame := vncFrame{
+		width:  width,
+		height: height,
+		pix:    make([]byte, width*height*4),
+	}
+	mask := make([]byte, height*((width+7)/8))
+	cursorShape := [16]string{
+		"W...............",
+		"WW..............",
+		"WBW.............",
+		"WBBW............",
+		"WBBBW...........",
+		"WBBBBW..........",
+		"WBBBBBW.........",
+		"WBBBBBBW........",
+		"WBBBBBBBBW......",
+		"WBBBBBW.........",
+		"WBBWBW..........",
+		"WBW.WBW.........",
+		"WW..WBW.........",
+		"W....WBW........",
+		".....WBW........",
+		"......W.........",
+	}
+
+	for y, row := range cursorShape {
+		for x, visible := range row {
+			if visible == '.' {
+				continue
+			}
+
+			off := (y*width + x) * 4
+			if visible == 'B' {
+				frame.pix[off] = 0x00
+				frame.pix[off+1] = 0x00
+				frame.pix[off+2] = 0x00
+			} else {
+				frame.pix[off] = 0xff
+				frame.pix[off+1] = 0xff
+				frame.pix[off+2] = 0xff
+			}
+			frame.pix[off+3] = 0xff
+			mask[y*((width+7)/8)+x/8] |= 1 << (7 - uint(x%8))
+		}
+	}
+
+	pixels := encodeRawPixels(frame, pf, 0, 0, width, height)
+	b := make([]byte, 12+len(pixels)+len(mask))
+	binary.BigEndian.PutUint16(b[4:6], width)
+	binary.BigEndian.PutUint16(b[6:8], height)
+	binary.BigEndian.PutUint32(b[8:12], rfbEncodingCursor)
+	copy(b[12:], pixels)
+	copy(b[12+len(pixels):], mask)
+
+	return b
 }
 
 func encodeRawPixels(frame vncFrame, pf rfbPixelFormat, x, y, width, height int) []byte {

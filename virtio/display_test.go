@@ -195,6 +195,150 @@ func TestVNCDisplayHandshakeAndRawFramebuffer(t *testing.T) {
 	}
 }
 
+func TestVNCDisplayInputWhileIncrementalUpdatePending(t *testing.T) {
+	t.Parallel()
+
+	d, err := virtio.NewVNCDisplay("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	input := &mockVNCInput{events: make(chan vncInputEvent, 1)}
+	d.SetInput(input)
+
+	img := image.NewRGBA(image.Rect(0, 0, 2, 1))
+	if err := d.Flush(2, 1, img); err != nil {
+		t.Fatal(err)
+	}
+
+	conn, err := net.Dial("tcp", d.Addr())
+	if err != nil {
+		if errors.Is(err, syscall.ENETUNREACH) {
+			t.Skipf("loopback is unreachable in this network namespace: %v", err)
+		}
+
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	version := readN(t, conn, 12)
+	writeAll(t, conn, version)
+	readN(t, conn, 2)
+	writeAll(t, conn, []byte{1})
+	readN(t, conn, 4)
+	writeAll(t, conn, []byte{1})
+	serverInit := readN(t, conn, 24)
+	nameLen := binary.BigEndian.Uint32(serverInit[20:24])
+	readN(t, conn, int(nameLen))
+
+	writeAll(t, conn, []byte{
+		3,    // FramebufferUpdateRequest
+		0,    // incremental = false
+		0, 0, // x
+		0, 0, // y
+		0, 2, // width
+		0, 1, // height
+	})
+	readN(t, conn, 4)
+	readN(t, conn, 12)
+	readN(t, conn, 8)
+
+	writeAll(t, conn, []byte{
+		3,    // FramebufferUpdateRequest
+		1,    // incremental = true, no newer frame is available.
+		0, 0, // x
+		0, 0, // y
+		0, 2, // width
+		0, 1, // height
+	})
+	writeAll(t, conn, []byte{
+		5,     // PointerEvent
+		0x01,  // left button
+		0, 21, // x
+		0, 43, // y
+	})
+
+	event := readInputEvent(t, input.events)
+	if event.kind != "pointer" || event.buttonMask != 0x01 || event.x != 21 || event.y != 43 {
+		t.Fatalf("input event: got %+v", event)
+	}
+}
+
+func TestVNCDisplayCursorPseudoEncoding(t *testing.T) {
+	t.Parallel()
+
+	d, err := virtio.NewVNCDisplay("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	img := image.NewRGBA(image.Rect(0, 0, 1, 1))
+	if err := d.Flush(1, 1, img); err != nil {
+		t.Fatal(err)
+	}
+
+	conn, err := net.Dial("tcp", d.Addr())
+	if err != nil {
+		if errors.Is(err, syscall.ENETUNREACH) {
+			t.Skipf("loopback is unreachable in this network namespace: %v", err)
+		}
+
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	version := readN(t, conn, 12)
+	writeAll(t, conn, version)
+	readN(t, conn, 2)
+	writeAll(t, conn, []byte{1})
+	readN(t, conn, 4)
+	writeAll(t, conn, []byte{1})
+	serverInit := readN(t, conn, 24)
+	nameLen := binary.BigEndian.Uint32(serverInit[20:24])
+	readN(t, conn, int(nameLen))
+
+	writeAll(t, conn, []byte{
+		2,    // SetEncodings
+		0,    // padding
+		0, 1, // one encoding
+		0xff, 0xff, // Cursor pseudo-encoding (-239).
+		0xff, 0x11,
+	})
+	writeAll(t, conn, []byte{
+		3,    // FramebufferUpdateRequest
+		0,    // incremental = false
+		0, 0, // x
+		0, 0, // y
+		0, 1, // width
+		0, 1, // height
+	})
+
+	header := readN(t, conn, 4)
+	if rects := binary.BigEndian.Uint16(header[2:4]); rects != 2 {
+		t.Fatalf("rectangles: got %d, want 2", rects)
+	}
+
+	rawRect := readN(t, conn, 12)
+	if enc := binary.BigEndian.Uint32(rawRect[8:12]); enc != 0 {
+		t.Fatalf("raw rect encoding: got 0x%x, want 0", enc)
+	}
+	readN(t, conn, 4)
+
+	cursorRect := readN(t, conn, 12)
+	if enc := binary.BigEndian.Uint32(cursorRect[8:12]); enc != 0xffffff11 {
+		t.Fatalf("cursor rect encoding: got 0x%x, want 0xffffff11", enc)
+	}
+	if w := binary.BigEndian.Uint16(cursorRect[4:6]); w != 16 {
+		t.Fatalf("cursor width: got %d, want 16", w)
+	}
+	if h := binary.BigEndian.Uint16(cursorRect[6:8]); h != 16 {
+		t.Fatalf("cursor height: got %d, want 16", h)
+	}
+	readN(t, conn, 16*16*4+16*2)
+}
+
 func TestVNCDisplaySerialFallback(t *testing.T) {
 	t.Parallel()
 
