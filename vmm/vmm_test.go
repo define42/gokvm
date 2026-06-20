@@ -8,18 +8,15 @@ import (
 	"testing"
 )
 
-func TestISOCmdlineAddsCompatibilityParams(t *testing.T) {
+func TestISOBootParamsAddsOnlyDirectLinuxDefaults(t *testing.T) {
 	t.Parallel()
 
-	cmdline := isoCmdline("loglevel=3 cde")
+	cmdline := isoBootParams("loglevel=3 cde")
 
 	for _, want := range []string{
 		"console=tty0",
 		"console=ttyS0",
 		"earlyprintk=serial",
-		"desktop=flwm",
-		"icons=wbar",
-		"xvesa=1024x768x32",
 		"noapic",
 		"noacpi",
 		"nortc",
@@ -33,12 +30,22 @@ func TestISOCmdlineAddsCompatibilityParams(t *testing.T) {
 			t.Fatalf("cmdline %q is missing %q", cmdline, want)
 		}
 	}
+
+	for _, unwanted := range []string{
+		"desktop=flwm",
+		"icons=wbar",
+		"xvesa=1024x768x32",
+	} {
+		if hasField(cmdline, unwanted) {
+			t.Fatalf("cmdline %q should not add ISO-specific %q", cmdline, unwanted)
+		}
+	}
 }
 
-func TestISOCmdlineDoesNotDuplicateExistingParams(t *testing.T) {
+func TestISOBootParamsDoesNotDuplicateExistingParams(t *testing.T) {
 	t.Parallel()
 
-	cmdline := isoCmdline("console=ttyS0 pci=nomsi custom=1")
+	cmdline := isoBootParams("console=ttyS0 pci=nomsi custom=1")
 
 	if got := countField(cmdline, "console=ttyS0"); got != 1 {
 		t.Fatalf("console=ttyS0 count: got %d, want 1 in %q", got, cmdline)
@@ -94,6 +101,10 @@ func TestAddTinyCoreVNCAutostart(t *testing.T) {
 
 	if !bytes.Contains(data, []byte("echo wbar > /etc/sysconfig/icons")) {
 		t.Fatalf("patched initramfs does not seed TinyCore icons")
+	}
+
+	if !bytes.Contains(data, []byte("echo Xvesa > /etc/sysconfig/Xserver")) {
+		t.Fatalf("patched initramfs does not seed TinyCore X server")
 	}
 
 	if bytes.Contains(data, []byte("Xvesa -listmodes")) {

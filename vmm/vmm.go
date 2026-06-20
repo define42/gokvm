@@ -24,8 +24,11 @@ import (
 
 var errDownloadISO = errors.New("download ISO failed")
 
-const isoCompatibilityParams = "console=tty0 console=ttyS0 earlyprintk=serial " +
-	"desktop=flwm icons=wbar xvesa=1024x768x32 " +
+// These parameters describe gaps in gokvm's direct Linux boot environment, not
+// ISO-specific policy. The ISO's own boot config still supplies the distro
+// command line; this list only adds the host/VMM plumbing that a real firmware
+// boot path would normally provide or hide from the guest.
+const gokvmDirectLinuxBootParams = "console=tty0 console=ttyS0 earlyprintk=serial " +
 	"noapic noacpi nortc notsc nowatchdog nmi_watchdog=0 mitigations=off " +
 	"lapic tsc_early_khz=2000 pci=realloc=off virtio_pci.force_legacy=1"
 
@@ -212,7 +215,7 @@ func (v *VMM) setupISO() error {
 
 	params := v.Params
 	if !v.ParamsSet {
-		params = isoCmdline(files.Cmdline)
+		params = isoBootParams(files.Cmdline)
 	}
 
 	log.Printf("ISO boot: kernel=%s initrd=%s", files.KernelPath, files.InitrdPath)
@@ -315,12 +318,15 @@ func readerAtOrNil(data []byte) io.ReaderAt {
 	return bytes.NewReader(data)
 }
 
-func isoCmdline(cmdline string) string {
-	fields := strings.Fields(cmdline)
+func isoBootParams(cmdline string) string {
+	return mergeKernelParams(cmdline, strings.Fields(gokvmDirectLinuxBootParams))
+}
 
-	compatFields := strings.Fields(isoCompatibilityParams)
-	merged := make([]string, 0, len(compatFields)+len(fields))
-	for _, param := range compatFields {
+func mergeKernelParams(cmdline string, defaults []string) string {
+	fields := strings.Fields(cmdline)
+	merged := make([]string, 0, len(defaults)+len(fields))
+
+	for _, param := range defaults {
 		if !hasKernelParam(fields, param) {
 			merged = append(merged, param)
 		}
@@ -453,8 +459,8 @@ touch /var/log/autologin
 TCUSER="$(cat /etc/sysconfig/tcuser 2>/dev/null || echo tc)"
 if command -v Xvesa >/dev/null 2>&1 && \
 	command -v flwm >/dev/null 2>&1 && \
-	[ -f /etc/sysconfig/Xserver ] && \
 	[ ! -f /etc/sysconfig/text ]; then
+	[ -s /etc/sysconfig/Xserver ] || echo Xvesa > /etc/sysconfig/Xserver
 	[ -s /etc/sysconfig/desktop ] || echo flwm > /etc/sysconfig/desktop
 	[ -s /etc/sysconfig/icons ] || echo wbar > /etc/sysconfig/icons
 	for file in .xsession .setbackground .Xdefaults; do
