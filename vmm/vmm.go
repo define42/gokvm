@@ -87,7 +87,7 @@ func (v *VMM) Init() error {
 	if len(v.GPU) > 0 || len(v.VNC) > 0 {
 		var input virtio.VNCInput
 		if len(v.VNC) > 0 {
-			input = m.AddPS2Input()
+			input = m.AddVirtioInput()
 			v.vncInput = input
 		}
 

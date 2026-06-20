@@ -36,12 +36,14 @@ const (
 	highMemBase = 0x100000
 	bootStack   = 0x80000
 
-	serialIRQ      = 4
-	ps2KeyboardIRQ = 1
-	ps2MouseIRQ    = 12
-	virtioNetIRQ   = 9
-	virtioBlkIRQ   = 10
-	virtioGPUIRQ   = 11
+	serialIRQ              = 4
+	ps2KeyboardIRQ         = 1
+	ps2MouseIRQ            = 12
+	virtioNetIRQ           = 9
+	virtioBlkIRQ           = 10
+	virtioGPUIRQ           = 11
+	virtioInputKeyboardIRQ = 5
+	virtioInputPointerIRQ  = 6
 
 	pageTableBase = 0x30_000
 
@@ -289,6 +291,18 @@ func (m *Machine) AddPS2Input() virtio.VNCInput {
 	m.AddDevice(dev)
 
 	return dev
+}
+
+func (m *Machine) AddVirtioInput() virtio.VNCInput {
+	keyboard := virtio.NewInputKeyboard(virtioInputKeyboardIRQ, m.InjectVirtioInputKeyboardIRQ, m.mem)
+	pointer := virtio.NewInputPointer(virtioInputPointerIRQ, m.InjectVirtioInputPointerIRQ, m.mem)
+
+	go keyboard.IOThreadEntry()
+	go pointer.IOThreadEntry()
+
+	m.pci.Devices = append(m.pci.Devices, keyboard, pointer)
+
+	return virtio.NewInputPair(keyboard, pointer)
 }
 
 func (m *Machine) StartVGATextFallback(display *virtio.VNCDisplay) {
@@ -1204,6 +1218,32 @@ func (m *Machine) InjectVirtioGPUIRQ() error {
 	}
 
 	if err := kvm.IRQLineStatus(m.vmFd, virtioGPUIRQ, 1); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// InjectVirtioInputKeyboardIRQ injects a virtio-input keyboard interrupt.
+func (m *Machine) InjectVirtioInputKeyboardIRQ() error {
+	if err := kvm.IRQLineStatus(m.vmFd, virtioInputKeyboardIRQ, 0); err != nil {
+		return err
+	}
+
+	if err := kvm.IRQLineStatus(m.vmFd, virtioInputKeyboardIRQ, 1); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// InjectVirtioInputPointerIRQ injects a virtio-input pointer interrupt.
+func (m *Machine) InjectVirtioInputPointerIRQ() error {
+	if err := kvm.IRQLineStatus(m.vmFd, virtioInputPointerIRQ, 0); err != nil {
+		return err
+	}
+
+	if err := kvm.IRQLineStatus(m.vmFd, virtioInputPointerIRQ, 1); err != nil {
 		return err
 	}
 
