@@ -194,6 +194,10 @@ func testNewAndLoadLinux(t *testing.T, kernel, tap, guestIPv4, hostIPv4, prefixL
 		t.Fatal(err)
 	}
 
+	if isPVH {
+		param += " tsc=reliable"
+	}
+
 	initrd, err := os.Open("../initrd")
 	if err != nil {
 		t.Fatal(err)
