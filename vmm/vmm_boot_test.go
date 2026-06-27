@@ -38,6 +38,11 @@ func TestTinyCoreVNCDesktopBoot(t *testing.T) { //nolint:paralleltest
 		t.Skipf("skipping test since %s is missing: %v", isoPath, err)
 	}
 
+	// `make test` runs under `unshare --net`, where loopback starts down; VNC
+	// binds/listens in Init(), so bring loopback up before creating the display.
+	// On a real host it is already up and this is a harmless no-op.
+	_ = exec.Command("ip", "link", "set", "lo", "up").Run()
+
 	v := New(Config{
 		Dev:     "/dev/kvm",
 		ISO:     isoPath,
@@ -68,11 +73,6 @@ func TestTinyCoreVNCDesktopBoot(t *testing.T) { //nolint:paralleltest
 			}
 		}()
 	}
-
-	// `make test` runs under `unshare --net`, where loopback starts down; the
-	// VNC client connects over loopback, so bring it up. On a real host it is
-	// already up and this is a harmless no-op.
-	_ = exec.Command("ip", "link", "set", "lo", "up").Run()
 
 	addr := v.vncDisplay.Addr()
 	t.Logf("VNC listening on %s", addr)
