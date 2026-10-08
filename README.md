@@ -123,6 +123,11 @@ enable codec support in an already-built FreeRDP client. Use a client built
 with H.264 decoding, or omit `/gfx:AVC420` to connect using bitmap updates.
 The interoperability tests used a separate H.264-enabled FreeRDP build.
 
+For the X11 client, also check for `WITH_XCURSOR=ON`. The guest draws its
+cursor into the framebuffer, and gokvm asks the client to hide its local
+cursor. FreeRDP builds without Xcursor support ignore that request, leaving
+two cursors visible; during movement they can appear separated or offset.
+
 The server logs `using OpenH264 AVC420 graphics` after negotiation. Clients
 without AVC420 support receive bitmap updates automatically. The tagged binary
 links to the OpenH264 shared library, which must remain installed at runtime.
