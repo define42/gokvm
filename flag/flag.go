@@ -12,6 +12,8 @@ var ErrorInvalidSubcommands = errors.New("expected 'boot' or 'probe' subcommands
 
 var ErrRDPOptions = errors.New("RDP certificate and key must be provided together with -rdp")
 
+var ErrRDPH264 = errors.New("-rdp-h264 requires -rdp")
+
 type BootArgs struct {
 	Kernel     string
 	MemSize    int
@@ -28,6 +30,7 @@ type BootArgs struct {
 	RDP        string
 	RDPCert    string
 	RDPKey     string
+	RDPH264    bool
 	TraceCount int
 }
 
@@ -60,6 +63,8 @@ func parseBootArgs(args []string) (*BootArgs, error) {
 	bootCmd.StringVar(&c.RDPCert, "rdp-cert", "",
 		"RDP TLS certificate PEM file (default: temporary self-signed certificate)")
 	bootCmd.StringVar(&c.RDPKey, "rdp-key", "", "RDP TLS private key PEM file")
+	bootCmd.BoolVar(&c.RDPH264, "rdp-h264", false,
+		"enable OpenH264 AVC420 graphics for compatible RDP clients (requires an openh264 build)")
 
 	bootCmd.IntVar(&c.NCPUs, "c", 1, "number of cpus")
 
@@ -75,6 +80,9 @@ func parseBootArgs(args []string) (*BootArgs, error) {
 	}
 	if (c.RDPCert == "") != (c.RDPKey == "") || (c.RDPCert != "" && c.RDP == "") {
 		return nil, ErrRDPOptions
+	}
+	if c.RDPH264 && c.RDP == "" {
+		return nil, ErrRDPH264
 	}
 	bootCmd.Visit(func(f *flag.Flag) {
 		if f.Name == "p" {

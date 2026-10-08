@@ -34,6 +34,7 @@ type Session struct {
 	writeMu       sync.Mutex
 	pending       []queuedPacket
 	joined        map[uint16]bool
+	graphics      *graphicsState
 }
 
 type queuedPacket struct {
@@ -90,14 +91,15 @@ func Accept(conn net.Conn, config *tls.Config, width, height int) (*Session, err
 	if err != nil {
 		return nil, err
 	}
-	channels, err := parseConnectInitial(mcs)
+	client, err := parseConnectInitialDetails(mcs)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.writeMCS(connectResponse(requested, channels)); err != nil {
+	if err := s.writeMCS(connectResponse(requested, client.channels)); err != nil {
 		return nil, err
 	}
-	if err := s.activate(channels); err != nil {
+	s.graphics = &graphicsState{channel: client.dynamicChannel, supported: client.graphics}
+	if err := s.activate(client.channels); err != nil {
 		return nil, fmt.Errorf("rdp activation: %w", err)
 	}
 	if err := conn.SetDeadline(time.Time{}); err != nil {
@@ -288,7 +290,7 @@ func (s *Session) queueInput(data []byte, fast bool) error {
 
 // ReadPacket returns global-channel Share Control data, or fast-path input as
 // the original first header byte followed by the event payload (without the
-// transport length bytes). Static virtual channels are ignored.
+// transport length bytes). Negotiated graphics-channel traffic is handled internally.
 func (s *Session) ReadPacket() ([]byte, bool, error) {
 	if len(s.pending) > 0 {
 		p := s.pending[0]
@@ -315,6 +317,10 @@ func (s *Session) ReadPacket() ([]byte, bool, error) {
 		if channel != globalChannel {
 			if channel < 1004 || !s.joined[channel] {
 				return nil, false, errors.New("rdp: data on unknown static channel")
+			}
+
+			if err := s.readGraphicsChannel(channel, data); err != nil {
+				return nil, false, err
 			}
 
 			continue
@@ -353,10 +359,14 @@ func (s *Session) WriteDataPDU(pduType byte, payload []byte) error {
 func (s *Session) Close() error { return s.conn.Close() }
 
 func (s *Session) writeGlobal(data []byte) error {
+	return s.writeChannel(globalChannel, data)
+}
+
+func (s *Session) writeChannel(channel uint16, data []byte) error {
 	if len(data) > maxUserData {
 		return errors.New("rdp: MCS data exceeds PER limit")
 	}
-	packet := []byte{0x68, 0, 1, 3, 0xeb, 0x70}
+	packet := []byte{0x68, 0, 1, byte(channel >> 8), byte(channel), 0x70}
 	packet = appendPERLength(packet, len(data))
 
 	return s.writeMCS(append(packet, data...))
@@ -515,72 +525,99 @@ func takeBER(p []byte, tag byte) (value, rest []byte, err error) {
 	return p[off : off+n], p[off+n:], nil
 }
 
+type clientSettings struct {
+	channels       int
+	dynamicChannel uint16
+	graphics       bool
+}
+
 func parseConnectInitial(p []byte) (int, error) {
+	settings, err := parseConnectInitialDetails(p)
+
+	return settings.channels, err
+}
+
+func parseConnectInitialDetails(p []byte) (clientSettings, error) {
+	var settings clientSettings
 	if len(p) < 3 || p[0] != 0x7f {
-		return 0, errors.New("rdp: missing MCS Connect Initial")
+		return settings, errors.New("rdp: missing MCS Connect Initial")
 	}
 	body, rest, err := takeBER(p[1:], 0x65)
 	if err != nil || len(rest) != 0 {
-		return 0, errors.New("rdp: invalid MCS Connect Initial")
+		return settings, errors.New("rdp: invalid MCS Connect Initial")
 	}
 	for _, tag := range []byte{4, 4, 1, 0x30, 0x30, 0x30} {
 		_, body, err = takeBER(body, tag)
 		if err != nil {
-			return 0, err
+			return settings, err
 		}
 	}
 	gcc, rest, err := takeBER(body, 4)
 	if err != nil || len(rest) != 0 {
-		return 0, errors.New("rdp: invalid GCC envelope")
+		return settings, errors.New("rdp: invalid GCC envelope")
 	}
 	// ConferenceCreateRequest carries a non-standard H.221 key, "Duca".
 	// Require the key's PER choice/length prefix and validate every following
 	// user-data block; do not scan arbitrary data for individual block types.
 	key := bytes.Index(gcc, []byte{0xc0, 0, 'D', 'u', 'c', 'a'})
 	if key < 0 {
-		return 0, errors.New("rdp: missing GCC client key")
+		return settings, errors.New("rdp: missing GCC client key")
 	}
 	blocks, err := takePER(gcc[key+6:])
 	if err != nil {
-		return 0, err
+		return settings, err
 	}
 	core, channels, network := false, 0, false
 	for len(blocks) > 0 {
 		if len(blocks) < 4 {
-			return 0, errors.New("rdp: truncated GCC block")
+			return settings, errors.New("rdp: truncated GCC block")
 		}
 		typ, size := binary.LittleEndian.Uint16(blocks), int(binary.LittleEndian.Uint16(blocks[2:4]))
 		if size < 4 || size > len(blocks) {
-			return 0, errors.New("rdp: invalid GCC block size")
+			return settings, errors.New("rdp: invalid GCC block size")
 		}
 		payload := blocks[4:size]
 		switch typ {
 		case 0xc001:
 			if core || len(payload) < 128 {
-				return 0, errors.New("rdp: invalid GCC core data")
+				return settings, errors.New("rdp: invalid GCC core data")
 			}
 			if len(payload) >= 212 && binary.LittleEndian.Uint32(payload[208:212]) != 1 {
-				return 0, errors.New("rdp: client core TLS negotiation mismatch")
+				return settings, errors.New("rdp: client core TLS negotiation mismatch")
+			}
+			if len(payload) >= 142 {
+				settings.graphics = binary.LittleEndian.Uint16(payload[140:142])&0x100 != 0
 			}
 			core = true
 		case 0xc003:
 			if network || len(payload) < 4 {
-				return 0, errors.New("rdp: invalid GCC network data")
+				return settings, errors.New("rdp: invalid GCC network data")
 			}
 			network = true
 			count := binary.LittleEndian.Uint32(payload)
 			if count > 31 || len(payload) != 4+12*int(count) {
-				return 0, errors.New("rdp: invalid static channel count")
+				return settings, errors.New("rdp: invalid static channel count")
 			}
 			channels = int(count)
+			for index := 0; index < channels; index++ {
+				name := bytes.TrimRight(payload[4+12*index:12+12*index], "\x00")
+				if string(name) == "drdynvc" {
+					if settings.dynamicChannel != 0 {
+						return settings, errors.New("rdp: duplicate drdynvc channel")
+					}
+					settings.dynamicChannel = uint16(1004 + index)
+				}
+			}
 		}
 		blocks = blocks[size:]
 	}
 	if !core {
-		return 0, errors.New("rdp: missing client core data")
+		return settings, errors.New("rdp: missing client core data")
 	}
 
-	return channels, nil
+	settings.channels = channels
+
+	return settings, nil
 }
 
 func ber(tag byte, body []byte) []byte {
@@ -668,6 +705,7 @@ func (s *Session) demandActive() []byte {
 	put16(general, 0, 1)
 	put16(general, 2, 3)
 	put16(general, 4, 0x200)
+	general[18], general[19] = 1, 1
 	bitmap := make([]byte, 24)
 	put16(bitmap, 0, 24)
 	put16(bitmap, 2, 1)

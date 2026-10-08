@@ -18,9 +18,16 @@ import (
 	"time"
 
 	"github.com/bobuhiro11/gokvm/internal/rdp"
+	"github.com/bobuhiro11/gokvm/internal/rdp/avc"
 )
 
 const rdpMaxClients = 8
+
+// RDPConfig selects the server certificate and optional OpenH264 graphics.
+type RDPConfig struct {
+	TLS  *tls.Config
+	H264 bool
+}
 
 // RDPDisplay exports the guest console using TLS-secured RDP bitmap updates.
 // It is a console server, without account authentication or NLA. Use a trusted
@@ -29,6 +36,7 @@ type RDPDisplay struct {
 	*framebuffer
 	listener net.Listener
 	tls      *tls.Config
+	h264     bool
 	connMu   sync.Mutex
 	conns    map[net.Conn]struct{}
 	wg       sync.WaitGroup
@@ -43,6 +51,21 @@ func NewRDPDisplay(addr string) (*RDPDisplay, error) {
 // NewRDPDisplayWithTLS uses the supplied server certificate, or generates one
 // for this process when config is nil. TLS 1.2 or newer is always required.
 func NewRDPDisplayWithTLS(addr string, config *tls.Config) (*RDPDisplay, error) {
+	return NewRDPDisplayWithConfig(addr, RDPConfig{TLS: config})
+}
+
+// NewRDPDisplayWithConfig enables AVC420 for capable clients when H264 is set.
+// Other clients retain bitmap updates. H264 requires the openh264 build tag.
+func NewRDPDisplayWithConfig(addr string, options RDPConfig) (*RDPDisplay, error) {
+	if options.H264 {
+		// Fail before opening the listener if the native encoder is unavailable.
+		encoder, err := avc.NewEncoder(1024, 768)
+		if err != nil {
+			return nil, err
+		}
+		encoder.Close()
+	}
+	config := options.TLS
 	if config == nil {
 		certificate, err := rdpCertificate()
 		if err != nil {
@@ -62,7 +85,7 @@ func NewRDPDisplayWithTLS(addr string, config *tls.Config) (*RDPDisplay, error) 
 
 	display := &RDPDisplay{
 		framebuffer: newFramebuffer(), listener: listener, tls: config,
-		conns: make(map[net.Conn]struct{}),
+		conns: make(map[net.Conn]struct{}), h264: options.H264,
 	}
 	display.wg.Add(1)
 	go display.acceptLoop()
@@ -132,16 +155,17 @@ func (d *RDPDisplay) handleConn(conn net.Conn) {
 	}
 }
 
-func (d *RDPDisplay) serveConn(conn net.Conn) error {
+func (d *RDPDisplay) serveConn(conn net.Conn) (serveErr error) {
 	session, err := rdp.Accept(conn, d.tls, 1024, 768)
 	if err != nil {
 		return err
 	}
 	defer session.Close()
 
-	encoder, err := rdp.NewBitmapEncoder(session.Width, session.Height, session.BitsPerPixel)
-	if err != nil {
-		return err
+	if d.h264 {
+		if _, err := session.BeginGraphics(); err != nil {
+			return err
+		}
 	}
 
 	// The guest draws its own cursor, as it does on the VNC console.
@@ -153,17 +177,19 @@ func (d *RDPDisplay) serveConn(conn net.Conn) error {
 	defer func() { d.dispatchInput(session, decoder.ReleaseAll()) }()
 	refresh := make(chan struct{}, 1)
 	stop := make(chan struct{})
-	writerDone := make(chan struct{})
+	writerDone := make(chan error, 1)
 	var suppressed atomic.Bool
 	go func() {
-		defer close(writerDone)
-		defer session.Close()
-		_ = d.writeFrames(conn, session, encoder, stop, refresh, &suppressed)
+		writerDone <- d.writeFrames(conn, session, stop, refresh, &suppressed)
+		_ = session.Close()
 	}()
 	defer func() {
 		close(stop)
 		_ = session.Close()
-		<-writerDone
+		writerErr := <-writerDone
+		if writerErr != nil && (serveErr == nil || errors.Is(serveErr, io.EOF) || errors.Is(serveErr, net.ErrClosed)) {
+			serveErr = writerErr
+		}
 	}()
 
 	for {
@@ -204,23 +230,33 @@ func requestRDPRefresh(refresh chan<- struct{}) {
 }
 
 func (d *RDPDisplay) writeFrames(
-	conn net.Conn, session *rdp.Session, encoder *rdp.BitmapEncoder,
+	conn net.Conn, session *rdp.Session,
 	stop, refresh <-chan struct{}, suppressed *atomic.Bool,
 ) error {
+	bitmap, err := rdp.NewBitmapEncoder(session.Width, session.Height, session.BitsPerPixel)
+	if err != nil {
+		return err
+	}
+	writer := &rdpFrameWriter{session: session, bitmap: bitmap}
+	defer writer.close()
 	ticker := time.NewTicker(time.Second / 30)
 	defer ticker.Stop()
 
 	var sequence uint64
 	force := true
 	for {
-		if !suppressed.Load() {
-			frame, changed := d.changedFrame(sequence, force)
-			if changed {
-				if err := writeRDPFrame(conn, session, encoder, frame, force); err != nil {
-					return err
-				}
-				sequence = frame.seq
-				force = false
+		if ready := session.GraphicsReady(); ready != writer.graphics {
+			writer.graphics = ready
+			force = true
+			if ready {
+				log.Printf("rdp: client %s using OpenH264 AVC420 graphics", conn.RemoteAddr())
+			}
+		}
+		if !suppressed.Load() && (!writer.graphics || session.GraphicsCanSend()) {
+			var err error
+			sequence, force, err = d.writeChangedRDPFrame(conn, writer, sequence, force)
+			if err != nil {
+				return err
 			}
 		}
 
@@ -236,7 +272,35 @@ func (d *RDPDisplay) writeFrames(
 	}
 }
 
-func writeRDPFrame(conn net.Conn, session *rdp.Session, encoder *rdp.BitmapEncoder, frame vncFrame, force bool) error {
+func (d *RDPDisplay) writeChangedRDPFrame(
+	conn net.Conn, writer *rdpFrameWriter, sequence uint64, force bool,
+) (uint64, bool, error) {
+	frame, changed := d.changedFrame(sequence, force)
+	if !changed {
+		return sequence, force, nil
+	}
+	sent, err := writer.write(conn, frame, force)
+	if err != nil || !sent {
+		return sequence, true, err
+	}
+
+	return frame.seq, false, nil
+}
+
+type rdpFrameWriter struct {
+	session  *rdp.Session
+	bitmap   *rdp.BitmapEncoder
+	avc      *avc.Encoder
+	graphics bool
+}
+
+func (w *rdpFrameWriter) close() {
+	if w.avc != nil {
+		w.avc.Close()
+	}
+}
+
+func (w *rdpFrameWriter) write(conn net.Conn, frame vncFrame, force bool) (bool, error) {
 	img := &image.RGBA{Pix: frame.pix, Stride: frame.width * 4, Rect: image.Rect(0, 0, frame.width, frame.height)}
 	if len(frame.pix) == 0 {
 		img = image.NewRGBA(img.Rect)
@@ -244,9 +308,26 @@ func writeRDPFrame(conn net.Conn, session *rdp.Session, encoder *rdp.BitmapEncod
 	_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	defer func() { _ = conn.SetWriteDeadline(time.Time{}) }()
 
-	return encoder.WriteFrame(img, force, func(data []byte) error {
-		return session.WriteDataPDU(2, data)
-	})
+	if !w.graphics {
+		err := w.bitmap.WriteFrame(img, force, func(data []byte) error {
+			return w.session.WriteDataPDU(2, data)
+		})
+
+		return err == nil, err
+	}
+	if w.avc == nil {
+		encoder, err := avc.NewEncoder(w.session.Width, w.session.Height)
+		if err != nil {
+			return false, err
+		}
+		w.avc = encoder
+	}
+	data, err := w.avc.Encode(img, force)
+	if err != nil || len(data) == 0 {
+		return err == nil, err
+	}
+
+	return w.session.WriteAVC420(data)
 }
 
 func (d *RDPDisplay) dispatchInput(session *rdp.Session, events []rdp.InputEvent) {

@@ -11,9 +11,30 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/bobuhiro11/gokvm/internal/rdp/avc"
 )
 
 var _ ConsoleDisplay = (*RDPDisplay)(nil)
+
+func TestRDPDisplayH264Configuration(t *testing.T) {
+	t.Parallel()
+	d, err := NewRDPDisplayWithConfig("127.0.0.1:0", RDPConfig{H264: true})
+	if !avc.Available() {
+		if d != nil || !errors.Is(err, avc.ErrUnavailable) {
+			t.Fatalf("H.264 without codec build: display %v, error %v", d, err)
+		}
+
+		return
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+	if !d.h264 {
+		t.Fatal("H.264 option was not enabled")
+	}
+}
 
 func TestRDPDisplayRequiresTLSSecurity(t *testing.T) {
 	t.Parallel()

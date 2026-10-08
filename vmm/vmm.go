@@ -50,6 +50,7 @@ type Config struct {
 	RDP        string
 	RDPCert    string
 	RDPKey     string
+	RDPH264    bool
 	NCPUs      int
 	MemSize    int
 	TraceCount int
@@ -169,7 +170,7 @@ func (v *VMM) display(input virtio.VNCInput) (result virtio.Display, displayErr 
 			}
 			config = &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12}
 		}
-		display, err := virtio.NewRDPDisplayWithTLS(v.RDP, config)
+		display, err := virtio.NewRDPDisplayWithConfig(v.RDP, virtio.RDPConfig{TLS: config, H264: v.RDPH264})
 		if err != nil {
 			return nil, err
 		}

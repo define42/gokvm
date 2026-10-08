@@ -30,6 +30,7 @@ func main() {
 			RDP:        bootArgs.RDP,
 			RDPCert:    bootArgs.RDPCert,
 			RDPKey:     bootArgs.RDPKey,
+			RDPH264:    bootArgs.RDPH264,
 			NCPUs:      bootArgs.NCPUs,
 			MemSize:    bootArgs.MemSize,
 			TraceCount: bootArgs.TraceCount,

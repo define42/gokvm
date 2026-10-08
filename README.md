@@ -18,6 +18,7 @@ The latest version supports the following features:
 - [x] virtio-gpu (virtio 1.0, 2D; frames written to PNG via `-g`)
 - [x] VNC server for virtio-gpu with keyboard and mouse input (`-vnc`)
 - [x] Built-in TLS RDP console with keyboard and mouse input (`-rdp`)
+- [x] Optional OpenH264 AVC420 compression for RDP (`-rdp-h264`)
 - [x] PVH Boot Protocol
 - [x] ISO boot via the El Torito boot catalog (no SeaBIOS/UEFI firmware required)
 
@@ -85,7 +86,8 @@ can control the VM. Keep the listener on loopback and use an authenticated SSH
 tunnel for access from another machine.
 
 The RDP session uses a fixed 1024×768 desktop, scaling other guest framebuffer
-sizes to fit, with uncompressed bitmap updates and 16-, 24-, or 32-bit color.
+sizes to fit. By default it sends uncompressed bitmap updates with 16-, 24-, or
+32-bit color. The optional OpenH264 build adds compressed AVC420 graphics.
 It includes the same serial/VGA/VESA fallbacks as VNC. Both `-rdp` and `-vnc` can
 be supplied to view the same guest at once; connected viewers share its keyboard
 and mouse. Clipboard, audio, drive redirection, dynamic resolution changes, and
@@ -96,11 +98,46 @@ Microsoft Remote Desktop has not yet been validated.
 In TinyCore, right-click the desktop to open its menu. The application dock
 appears along the bottom of the screen.
 
+#### OpenH264 graphics
+
+Build with the `openh264` tag to enable H.264/AVC420 over the RDP graphics
+pipeline. This requires cgo, a C compiler, `pkg-config`, and the
+[OpenH264](https://github.com/cisco/openh264) development library. On Debian or
+Ubuntu, the build packages are `build-essential pkg-config libopenh264-dev`.
+
+```bash
+CGO_ENABLED=1 go build -tags openh264 -o gokvm .
+./gokvm boot -iso ./TinyCore-current.iso -rdp 127.0.0.1:3389 -rdp-h264 -m 512M
+```
+
+Use a FreeRDP build with H.264 decoding enabled:
+
+```bash
+xfreerdp /v:127.0.0.1:3389 /sec:tls /u:console /p:console /cert:ignore /gfx:AVC420
+```
+
+The server logs `using OpenH264 AVC420 graphics` after negotiation. Clients
+without AVC420 support receive bitmap updates automatically. The tagged binary
+links to the OpenH264 shared library, which must remain installed at runtime.
+Normal builds need no OpenH264 dependency and report a clear error if
+`-rdp-h264` is requested.
+
+AVC420 uses lossy YUV 4:2:0 compression and software encoding, so small colored
+text can be softer than bitmap output. AVC444 and hardware encoding are not
+implemented. TLS and authentication behavior are the same as for bitmap RDP.
+
 Run the protocol, input, framebuffer, and listener tests without booting a VM:
 
 ```bash
 go test ./internal/rdp ./virtio ./flag ./vmm -short
 go test -race ./internal/rdp ./virtio ./vmm -run 'Test(RDP|Framebuffer|SerialMirror)'
+```
+
+With the OpenH264 development library installed, also run the native encoder
+roundtrip and graphics pipeline tests:
+
+```bash
+go test -tags openh264 -short ./internal/rdp/... ./virtio ./vmm ./flag
 ```
 
 ## Go package

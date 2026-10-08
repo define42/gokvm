@@ -62,6 +62,7 @@ func TestParseBootArgs(t *testing.T) {
 		"-rdp", "127.0.0.1:3389",
 		"-rdp-cert", "console.crt",
 		"-rdp-key", "console.key",
+		"-rdp-h264",
 		"-m",
 		"1G",
 		"-T",
@@ -108,7 +109,7 @@ func TestParseBootArgs(t *testing.T) {
 	if c.VNC != "127.0.0.1:5900" {
 		t.Errorf("invalid VNC listen address: got %v, want %v", c.VNC, "127.0.0.1:5900")
 	}
-	if c.RDP != "127.0.0.1:3389" || c.RDPCert != "console.crt" || c.RDPKey != "console.key" {
+	if c.RDP != "127.0.0.1:3389" || c.RDPCert != "console.crt" || c.RDPKey != "console.key" || !c.RDPH264 {
 		t.Errorf("invalid RDP options: %+v", c)
 	}
 
@@ -180,7 +181,7 @@ func TestParseBootArgsWithDefaults(t *testing.T) {
 	if c.VNC != "" {
 		t.Errorf("invalid VNC listen address: got %v, want empty", c.VNC)
 	}
-	if c.RDP != "" || c.RDPCert != "" || c.RDPKey != "" {
+	if c.RDP != "" || c.RDPCert != "" || c.RDPKey != "" || c.RDPH264 {
 		t.Errorf("RDP must be disabled by default: %+v", c)
 	}
 
@@ -207,6 +208,13 @@ func TestRDPRequiresCertificatePair(t *testing.T) {
 		if _, _, err := flag.ParseArgs(append([]string{"gokvm", "boot"}, args...)); !errors.Is(err, flag.ErrRDPOptions) {
 			t.Errorf("args %v: got %v, want %v", args, err, flag.ErrRDPOptions)
 		}
+	}
+}
+
+func TestRDPH264RequiresListener(t *testing.T) {
+	t.Parallel()
+	if _, _, err := flag.ParseArgs([]string{"gokvm", "boot", "-rdp-h264"}); !errors.Is(err, flag.ErrRDPH264) {
+		t.Fatalf("H.264 without RDP listener: got %v, want %v", err, flag.ErrRDPH264)
 	}
 }
 
