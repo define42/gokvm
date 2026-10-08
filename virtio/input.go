@@ -48,6 +48,11 @@ const (
 	relX     = 0x00
 	relY     = 0x01
 
+	absX = 0x00
+	absY = 0x01
+
+	inputAbsMax = 32767
+
 	keyEsc        = 1
 	key1          = 2
 	key2          = 3
@@ -148,6 +153,7 @@ type inputKind int
 const (
 	inputKindKeyboard inputKind = iota
 	inputKindPointer
+	inputKindTablet
 )
 
 type inputEvent struct {
@@ -156,7 +162,7 @@ type inputEvent struct {
 	value int32
 }
 
-// InputDevice is a modern virtio-input keyboard or relative pointer.
+// InputDevice is a modern virtio-input keyboard, relative mouse, or absolute tablet.
 var _ pci.CapsAndMMIO = (*InputDevice)(nil)
 
 type InputDevice struct {
@@ -309,8 +315,14 @@ func (d *InputDevice) KeyEvent(down bool, keysym uint32) {
 	d.enqueue(inputEvent{typ: evKey, code: code, value: value}, synEvent())
 }
 
-// PointerEvent satisfies VNCInput for relative pointer devices.
+// PointerEvent satisfies VNCInput. Tablet callers should use PointerEventInBounds
+// to supply the display dimensions; this legacy entry point assumes 1024x768.
 func (d *InputDevice) PointerEvent(buttonMask uint8, x, y uint16) {
+	if d.kind == inputKindTablet {
+		d.PointerEventInBounds(buttonMask, x, y, 1024, 768)
+
+		return
+	}
 	if d.kind != inputKindPointer {
 		return
 	}
@@ -348,6 +360,45 @@ func (d *InputDevice) PointerEvent(buttonMask uint8, x, y uint16) {
 	d.enqueue(events...)
 }
 
+// PointerEventInBounds sends a pixel position in the current framebuffer to an
+// absolute tablet. Relative mice keep their existing delta-based behavior.
+func (d *InputDevice) PointerEventInBounds(buttonMask uint8, x, y uint16, width, height int) {
+	if d.kind != inputKindTablet {
+		d.PointerEvent(buttonMask, x, y)
+
+		return
+	}
+	if width <= 0 || height <= 0 {
+		return
+	}
+
+	// Complete movement before reporting button changes. Linux mousedev splits
+	// large moves into PS/2 packets; a button in the same report would be pressed
+	// on the first partial move, before the pointer reaches the intended target.
+	events := []inputEvent{
+		{typ: evAbs, code: absX, value: inputAbsolutePosition(x, width)},
+		{typ: evAbs, code: absY, value: inputAbsolutePosition(y, height)},
+		synEvent(),
+	}
+	d.mu.Lock()
+	events = append(events, buttonEvents(d.buttons, buttonMask)...)
+	events = append(events, wheelEvents(d.buttons, buttonMask)...)
+	d.buttons = buttonMask
+	if len(events) > 3 {
+		events = append(events, synEvent())
+	}
+	d.enqueueLocked(events...)
+	d.mu.Unlock()
+	d.Notify(inputEventQueue)
+}
+
+func inputAbsolutePosition(position uint16, size int) int32 {
+	// Map pixel centers rather than the outside edges. Linux mousedev scales an
+	// absolute maximum to width (one past the last pixel); avoiding that value
+	// prevents a one-pixel offset after reaching a screen edge in legacy Xvesa.
+	return int32((2*min(int(position), size-1) + 1) * inputAbsMax / (2 * size))
+}
+
 func (d *InputDevice) Read(port uint64, bytes []byte) error { return nil }
 
 func (d *InputDevice) Write(port uint64, bytes []byte) error { return nil }
@@ -364,6 +415,13 @@ func (d *InputDevice) Close() error {
 
 func (d *InputDevice) enqueue(events ...inputEvent) {
 	d.mu.Lock()
+	d.enqueueLocked(events...)
+	d.mu.Unlock()
+
+	d.Notify(inputEventQueue)
+}
+
+func (d *InputDevice) enqueueLocked(events ...inputEvent) {
 	if len(d.pending)+len(events) > inputMaxPendingEvents {
 		drop := len(d.pending) + len(events) - inputMaxPendingEvents
 		if drop > len(d.pending) {
@@ -372,9 +430,6 @@ func (d *InputDevice) enqueue(events ...inputEvent) {
 		d.pending = d.pending[drop:]
 	}
 	d.pending = append(d.pending, events...)
-	d.mu.Unlock()
-
-	d.Notify(inputEventQueue)
 }
 
 func (d *InputDevice) popPending() (inputEvent, bool) {
@@ -504,19 +559,26 @@ func (d *InputDevice) configImage() [inputConfigLen]byte {
 		cfg[2] = 8
 		binary.LittleEndian.PutUint16(cfg[inputUnionOff:], busVirtual)
 		binary.LittleEndian.PutUint16(cfg[inputUnionOff+2:], 0x1af4)
-		if d.kind == inputKindKeyboard {
+		switch d.kind {
+		case inputKindKeyboard:
 			binary.LittleEndian.PutUint16(cfg[inputUnionOff+4:], 0x0001)
-		} else {
+		case inputKindTablet:
+			binary.LittleEndian.PutUint16(cfg[inputUnionOff+4:], 0x0003)
+		default:
 			binary.LittleEndian.PutUint16(cfg[inputUnionOff+4:], 0x0002)
 		}
 		binary.LittleEndian.PutUint16(cfg[inputUnionOff+6:], 1)
 	case inputCfgPropBits:
-		// No pointer properties are needed for a relative mouse.
+		// These pointers do not require touchscreen or touchpad properties.
 	case inputCfgEvBits:
 		bitmap := d.evBitmap(d.configSubsel)
 		cfg[2] = inputBitmapSize(bitmap[:])
 		copy(cfg[inputUnionOff:], bitmap[:])
 	case inputCfgAbsInfo:
+		if d.kind == inputKindTablet && (d.configSubsel == absX || d.configSubsel == absY) {
+			cfg[2] = 20 // struct virtio_input_absinfo: min, max, fuzz, flat, resolution.
+			binary.LittleEndian.PutUint32(cfg[inputUnionOff+4:], inputAbsMax)
+		}
 	case inputCfgUnset:
 	default:
 	}
@@ -537,16 +599,23 @@ func (d *InputDevice) evBitmap(subsel uint8) [128]byte {
 		case evRep:
 			setInputBit(bitmap[:], 0)
 		}
-	case inputKindPointer:
+	case inputKindPointer, inputKindTablet:
 		switch subsel {
 		case evKey:
 			setInputBit(bitmap[:], btnLeft)
 			setInputBit(bitmap[:], btnRight)
 			setInputBit(bitmap[:], btnMiddle)
 		case evRel:
-			setInputBit(bitmap[:], relX)
-			setInputBit(bitmap[:], relY)
+			if d.kind == inputKindPointer {
+				setInputBit(bitmap[:], relX)
+				setInputBit(bitmap[:], relY)
+			}
 			setInputBit(bitmap[:], relWheel)
+		case evAbs:
+			if d.kind == inputKindTablet {
+				setInputBit(bitmap[:], absX)
+				setInputBit(bitmap[:], absY)
+			}
 		}
 	}
 
@@ -559,6 +628,11 @@ func NewInputKeyboard(irq uint8, inject func() error, mem []byte) *InputDevice {
 
 func NewInputPointer(irq uint8, inject func() error, mem []byte) *InputDevice {
 	return newInputDevice("gokvm mouse", inputKindPointer, irq, InputPointerMMIOBase, inject, mem)
+}
+
+// NewInputTablet creates an absolute pointer suitable for VNC and RDP input.
+func NewInputTablet(irq uint8, inject func() error, mem []byte) *InputDevice {
+	return newInputDevice("gokvm tablet", inputKindTablet, irq, InputPointerMMIOBase, inject, mem)
 }
 
 func newInputDevice(
@@ -583,7 +657,7 @@ func newInputDevice(
 	return d
 }
 
-// InputPair sends VNC keyboard events to one virtio-input device and pointer
+// InputPair sends remote keyboard events to one virtio-input device and pointer
 // events to another.
 type InputPair struct {
 	keyboard *InputDevice
@@ -603,6 +677,13 @@ func (p *InputPair) KeyEvent(down bool, keysym uint32) {
 func (p *InputPair) PointerEvent(buttonMask uint8, x, y uint16) {
 	if p != nil && p.pointer != nil {
 		p.pointer.PointerEvent(buttonMask, x, y)
+	}
+}
+
+// PointerEventInBounds preserves the framebuffer dimensions for absolute input.
+func (p *InputPair) PointerEventInBounds(buttonMask uint8, x, y uint16, width, height int) {
+	if p != nil && p.pointer != nil {
+		p.pointer.PointerEventInBounds(buttonMask, x, y, width, height)
 	}
 }
 

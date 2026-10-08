@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -46,6 +47,9 @@ type Config struct {
 	Disk       string
 	GPU        string
 	VNC        string
+	RDP        string
+	RDPCert    string
+	RDPKey     string
 	NCPUs      int
 	MemSize    int
 	TraceCount int
@@ -57,7 +61,9 @@ type VMM struct {
 
 	serialOutput io.Writer
 	vncDisplay   *virtio.VNCDisplay
-	vncInput     virtio.VNCInput
+	rdpDisplay   *virtio.RDPDisplay
+	consoleInput virtio.VNCInput
+	consoles     []virtio.ConsoleDisplay
 	isoCleanup   func()
 }
 
@@ -69,11 +75,16 @@ func New(c Config) *VMM {
 }
 
 // Init instantiates a machine.
-func (v *VMM) Init() error {
+func (v *VMM) Init() (initErr error) {
 	m, err := machine.New(v.Dev, v.NCPUs, v.MemSize)
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if initErr != nil {
+			_ = m.Close()
+		}
+	}()
 
 	if len(v.TapIfName) > 0 {
 		if err := m.AddTapIf(v.TapIfName); err != nil {
@@ -87,11 +98,11 @@ func (v *VMM) Init() error {
 		}
 	}
 
-	if len(v.GPU) > 0 || len(v.VNC) > 0 {
+	if len(v.GPU) > 0 || v.hasRemoteDisplay() {
 		var input virtio.VNCInput
-		if len(v.VNC) > 0 {
+		if v.hasRemoteDisplay() {
 			input = m.AddVirtioInput()
-			v.vncInput = input
+			v.consoleInput = input
 		}
 
 		display, err := v.display(input)
@@ -100,12 +111,16 @@ func (v *VMM) Init() error {
 		}
 
 		if err := m.AddGPUDisplay(display); err != nil {
+			_ = display.Close()
+
 			return err
 		}
 
-		if len(v.ISO) > 0 && v.vncDisplay != nil {
-			m.EnableVESA(v.vncDisplay)
-			m.StartVGATextFallback(v.vncDisplay)
+		if len(v.ISO) > 0 {
+			for _, console := range v.consoles {
+				m.EnableVESA(console)
+				m.StartVGATextFallback(console)
+			}
 		}
 	}
 
@@ -114,8 +129,20 @@ func (v *VMM) Init() error {
 	return nil
 }
 
-func (v *VMM) display(input virtio.VNCInput) (virtio.Display, error) {
+func (v *VMM) hasRemoteDisplay() bool { return v.VNC != "" || v.RDP != "" }
+
+func (v *VMM) display(input virtio.VNCInput) (result virtio.Display, displayErr error) {
 	var displays []virtio.Display
+	defer func() {
+		if displayErr != nil {
+			for _, display := range displays {
+				_ = display.Close()
+			}
+			v.vncDisplay = nil
+			v.rdpDisplay = nil
+			v.consoles = nil
+		}
+	}()
 
 	if len(v.GPU) > 0 {
 		displays = append(displays, virtio.NewPNGDisplay(v.GPU))
@@ -124,18 +151,40 @@ func (v *VMM) display(input virtio.VNCInput) (virtio.Display, error) {
 	if len(v.VNC) > 0 {
 		display, err := virtio.NewVNCDisplay(v.VNC)
 		if err != nil {
-			for _, d := range displays {
-				_ = d.Close()
-			}
-
 			return nil, err
 		}
 
 		display.SetInput(input)
-		v.serialOutput = display
 		v.vncDisplay = display
+		v.consoles = append(v.consoles, display)
 		log.Printf("VNC listening on %s", display.Addr())
 		displays = append(displays, display)
+	}
+	if v.RDP != "" {
+		var config *tls.Config
+		if v.RDPCert != "" || v.RDPKey != "" {
+			certificate, err := tls.LoadX509KeyPair(v.RDPCert, v.RDPKey)
+			if err != nil {
+				return nil, fmt.Errorf("RDP certificate: %w", err)
+			}
+			config = &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12}
+		}
+		display, err := virtio.NewRDPDisplayWithTLS(v.RDP, config)
+		if err != nil {
+			return nil, err
+		}
+		display.SetInput(input)
+		v.rdpDisplay = display
+		v.consoles = append(v.consoles, display)
+		displays = append(displays, display)
+		log.Printf("RDP console listening on %s (TLS, no account authentication)", display.Addr())
+	}
+	if len(v.consoles) > 0 {
+		writers := make([]io.Writer, 0, len(v.consoles))
+		for _, console := range v.consoles {
+			writers = append(writers, console)
+		}
+		v.serialOutput = io.MultiWriter(writers...)
 	}
 
 	if len(displays) == 1 {
@@ -234,13 +283,13 @@ func (v *VMM) setupISO() error {
 
 	log.Printf("ISO media attached as read-only virtio-blk: %s", isoFile.Name())
 
-	if v.VNC != "" && hasTinyCoreGUI(isoReader) {
+	if v.hasRemoteDisplay() && hasTinyCoreGUI(isoReader) {
 		files.Initrd, err = addTinyCoreVNCAutostart(files.Initrd)
 		if err != nil {
 			return err
 		}
 
-		log.Printf("ISO boot: added TinyCore VNC desktop autostart overlay")
+		log.Printf("ISO boot: added TinyCore remote desktop autostart overlay")
 	}
 
 	kern := bytes.NewReader(files.Kernel)
@@ -393,15 +442,18 @@ func (v *VMM) attachSerialOutput() {
 }
 
 func (v *VMM) attachSerialInput() {
-	if v.ISO == "" || v.vncDisplay == nil || v.GetSerial() == nil {
+	if v.ISO == "" || len(v.consoles) == 0 || v.GetSerial() == nil {
 		return
 	}
 
-	v.vncDisplay.SetInput(&serialMirrorInput{
-		primary: v.vncInput,
+	input := &serialMirrorInput{
+		primary: v.consoleInput,
 		serial:  v.GetSerial().GetInputChan(),
 		inject:  v.InjectSerialIRQ,
-	})
+	}
+	for _, console := range v.consoles {
+		console.SetInput(input)
+	}
 }
 
 type serialMirrorInput struct {
@@ -420,9 +472,14 @@ func (s *serialMirrorInput) KeyEvent(down bool, keysym uint32) {
 	}
 
 	for _, b := range serialBytesForKeysym(keysym) {
-		s.serial <- b
-		if s.inject != nil {
-			_ = s.inject()
+		// A graphical guest may never read its serial console. Keep that
+		// best-effort mirror from blocking remote input or display shutdown.
+		select {
+		case s.serial <- b:
+			if s.inject != nil {
+				_ = s.inject()
+			}
+		default:
 		}
 	}
 }
@@ -431,6 +488,17 @@ func (s *serialMirrorInput) PointerEvent(buttonMask uint8, x, y uint16) {
 	if s.primary != nil {
 		s.primary.PointerEvent(buttonMask, x, y)
 	}
+}
+
+func (s *serialMirrorInput) PointerEventInBounds(buttonMask uint8, x, y uint16, width, height int) {
+	if bounded, ok := s.primary.(interface {
+		PointerEventInBounds(uint8, uint16, uint16, int, int)
+	}); ok {
+		bounded.PointerEventInBounds(buttonMask, x, y, width, height)
+
+		return
+	}
+	s.PointerEvent(buttonMask, x, y)
 }
 
 func serialBytesForKeysym(keysym uint32) []byte {
@@ -484,11 +552,30 @@ if command -v Xvesa >/dev/null 2>&1 && \
 export DISPLAY=:0.0
 export DESKTOP=flwm
 export ICONS=wbar
+# TinyCore's startx normally builds the FLWM menu and the icon configuration.
+# This session starts Xvesa directly, so perform that setup before the desktop.
+setupdesktop >/tmp/setupdesktop.log 2>&1
 Xvesa -br -screen 1024x768x32 -mouse /dev/input/mice,5 -a 1 -t 0 -nolisten tcp -I >/tmp/Xvesa.log 2>&1 &
 XPID=$!
 for _ in 1 2 3 4 5 6 7 8 9 10; do
 	waitforX >/dev/null 2>&1 && break
 	sleep 0.2
+done
+# Xvesa discards five small mouse packets while identifying the PS/2 protocol.
+# Prime it through the tablet's evdev node before showing the desktop. These
+# five balanced steps return to the initial center, so the discarded motion
+# leaves Xvesa and the kernel's absolute pointer at the same position.
+for event in /sys/class/input/event*; do
+	[ "$(cat "$event/device/name")" = "gokvm tablet" ] || continue
+	(
+		# TinyCore x86 uses 16-byte input_event records: timeval, type, code, value.
+		for x in '\000\100' '\040\100' '\100\100' '\040\100' '\340\077' '\000\100'; do
+			printf '\000\000\000\000\000\000\000\000\003\000\000\000%b\000\000' "$x"
+			printf '\000\000\000\000\000\000\000\000\003\000\001\000\000\100\000\000'
+			printf '\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000'
+			sleep 0.05
+		done
+	) > "/dev/input/${event##*/}"
 done
 flwm >/tmp/flwm.log 2>&1 &
 [ -x "$HOME/.setbackground" ] && "$HOME/.setbackground" >/tmp/background.log 2>&1

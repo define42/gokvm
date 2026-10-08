@@ -304,7 +304,7 @@ func (m *Machine) AddPS2Input() virtio.VNCInput {
 
 func (m *Machine) AddVirtioInput() virtio.VNCInput {
 	keyboard := virtio.NewInputKeyboard(virtioInputKeyboardIRQ, m.InjectVirtioInputKeyboardIRQ, m.mem)
-	pointer := virtio.NewInputPointer(virtioInputPointerIRQ, m.InjectVirtioInputPointerIRQ, m.mem)
+	pointer := virtio.NewInputTablet(virtioInputPointerIRQ, m.InjectVirtioInputPointerIRQ, m.mem)
 
 	go keyboard.IOThreadEntry()
 	go pointer.IOThreadEntry()
@@ -314,7 +314,7 @@ func (m *Machine) AddVirtioInput() virtio.VNCInput {
 	return virtio.NewInputPair(keyboard, pointer)
 }
 
-func (m *Machine) StartVGATextFallback(display *virtio.VNCDisplay) {
+func (m *Machine) StartVGATextFallback(display virtio.ConsoleDisplay) {
 	display.StartVGATextFallback(m.mem)
 }
 

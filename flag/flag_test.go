@@ -59,6 +59,9 @@ func TestParseBootArgs(t *testing.T) {
 		"disk_path",
 		"-vnc",
 		"127.0.0.1:5900",
+		"-rdp", "127.0.0.1:3389",
+		"-rdp-cert", "console.crt",
+		"-rdp-key", "console.key",
 		"-m",
 		"1G",
 		"-T",
@@ -104,6 +107,9 @@ func TestParseBootArgs(t *testing.T) {
 
 	if c.VNC != "127.0.0.1:5900" {
 		t.Errorf("invalid VNC listen address: got %v, want %v", c.VNC, "127.0.0.1:5900")
+	}
+	if c.RDP != "127.0.0.1:3389" || c.RDPCert != "console.crt" || c.RDPKey != "console.key" {
+		t.Errorf("invalid RDP options: %+v", c)
 	}
 
 	if c.NCPUs != 2 {
@@ -174,6 +180,9 @@ func TestParseBootArgsWithDefaults(t *testing.T) {
 	if c.VNC != "" {
 		t.Errorf("invalid VNC listen address: got %v, want empty", c.VNC)
 	}
+	if c.RDP != "" || c.RDPCert != "" || c.RDPKey != "" {
+		t.Errorf("RDP must be disabled by default: %+v", c)
+	}
 
 	if c.NCPUs != 1 {
 		t.Error("invalid number of vcpus")
@@ -185,6 +194,19 @@ func TestParseBootArgsWithDefaults(t *testing.T) {
 
 	if c.TraceCount != 0 {
 		t.Errorf("trace: got %#x, want %#x", c.TraceCount, 1<<20)
+	}
+}
+
+func TestRDPRequiresCertificatePair(t *testing.T) {
+	t.Parallel()
+	for _, args := range [][]string{
+		{"-rdp", "127.0.0.1:3389", "-rdp-cert", "console.crt"},
+		{"-rdp", "127.0.0.1:3389", "-rdp-key", "console.key"},
+		{"-rdp-cert", "console.crt", "-rdp-key", "console.key"},
+	} {
+		if _, _, err := flag.ParseArgs(append([]string{"gokvm", "boot"}, args...)); !errors.Is(err, flag.ErrRDPOptions) {
+			t.Errorf("args %v: got %v, want %v", args, err, flag.ErrRDPOptions)
+		}
 	}
 }
 

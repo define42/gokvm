@@ -2,6 +2,7 @@ package virtio
 
 import (
 	"encoding/binary"
+	"slices"
 	"testing"
 )
 
@@ -212,5 +213,118 @@ func assertInputEvent(t *testing.T, raw []byte, typ, code uint16, value int32) {
 
 	if got := int32(binary.LittleEndian.Uint32(raw[4:])); got != value {
 		t.Fatalf("event value: got %d, want %d", got, value)
+	}
+}
+
+func TestInputTabletConfig(t *testing.T) {
+	t.Parallel()
+
+	v := NewInputTablet(6, func() error { return nil }, nil)
+	cfg := readInputConfig(v, inputCfgEvBits, evAbs)
+	if !inputBitSet(cfg[inputUnionOff:], absX) || !inputBitSet(cfg[inputUnionOff:], absY) {
+		t.Fatal("tablet must advertise both absolute axes")
+	}
+	cfg = readInputConfig(v, inputCfgEvBits, evRel)
+	if inputBitSet(cfg[inputUnionOff:], relX) || inputBitSet(cfg[inputUnionOff:], relY) ||
+		!inputBitSet(cfg[inputUnionOff:], relWheel) {
+		t.Fatal("tablet must advertise only a relative scroll wheel")
+	}
+	cfg = readInputConfig(v, inputCfgEvBits, evKey)
+	for _, button := range []int{btnLeft, btnMiddle, btnRight} {
+		if !inputBitSet(cfg[inputUnionOff:], button) {
+			t.Fatalf("tablet button %d not advertised", button)
+		}
+	}
+	for _, axis := range []uint8{absX, absY} {
+		cfg = readInputConfig(v, inputCfgAbsInfo, axis)
+		if cfg[2] != 20 || binary.LittleEndian.Uint32(cfg[inputUnionOff:]) != 0 ||
+			binary.LittleEndian.Uint32(cfg[inputUnionOff+4:]) != inputAbsMax {
+			t.Fatalf("invalid tablet axis %d limits: %v", axis, cfg)
+		}
+	}
+	cfg = readInputConfig(v, inputCfgAbsInfo, 2)
+	if cfg[2] != 0 {
+		t.Fatal("tablet must not advertise unsupported absolute axes")
+	}
+}
+
+func TestInputTabletFirstClickDeliversPosition(t *testing.T) {
+	t.Parallel()
+
+	mem := make([]byte, 0x1000)
+	v := NewInputTablet(6, func() error { return nil }, mem)
+	q := newInputSplitQueue()
+	// Movement must be a complete report before the first button press.
+	for i := 0; i < 5; i++ {
+		queueInputBuffer(q, uint16(i), uint64(0x100+i*inputEventLen))
+	}
+	v.QueueReady(inputEventQueue, q)
+	pair := NewInputPair(nil, v)
+	pair.PointerEventInBounds(1, 400, 100, 800, 600)
+	for v.LastAvailIdx[inputEventQueue] < 5 {
+		if err := v.flushEvents(); err != nil {
+			t.Fatalf("flush tablet event: %v", err)
+		}
+	}
+	assertInputEvent(t, mem[0x100:0x108], evAbs, absX, 16403)
+	assertInputEvent(t, mem[0x108:0x110], evAbs, absY, 5488)
+	assertInputEvent(t, mem[0x110:0x118], evSyn, synReport, 0)
+	assertInputEvent(t, mem[0x118:0x120], evKey, btnLeft, 1)
+	assertInputEvent(t, mem[0x120:0x128], evSyn, synReport, 0)
+}
+
+func TestInputTabletPositionsMatchFramebuffer(t *testing.T) {
+	t.Parallel()
+
+	// Exercise every pixel, including both edges and reconnect-like jumps. The
+	// legacy Linux mousedev path must reconstruct exactly the original pixel.
+	for _, size := range []int{1, 600, 768, 800, 1024, 1920, 2560} {
+		for position := range size {
+			absolute := inputAbsolutePosition(uint16(position), size)
+			// A nonzero top-left value also avoids the input core filtering a
+			// first position as unchanged from its initial zero ABS state.
+			if absolute == 0 {
+				t.Fatalf("size %d position %d encoded as an unchanged initial axis", size, position)
+			}
+			pixel := int(absolute) * size / inputAbsMax
+			if pixel != position {
+				t.Fatalf("size %d position %d reconstructed as %d", size, position, pixel)
+			}
+		}
+		if got := inputAbsolutePosition(65535, size); got != inputAbsolutePosition(uint16(size-1), size) {
+			t.Fatalf("size %d out-of-range position was not clamped: %d", size, got)
+		}
+	}
+}
+
+func TestInputTabletButtonsWheelAndBounds(t *testing.T) {
+	t.Parallel()
+
+	v := NewInputTablet(6, func() error { return nil }, nil)
+	v.PointerEventInBounds(0x0d, 200, 120, 800, 600)
+	v.PointerEventInBounds(0, 200, 120, 800, 600)
+	want := []inputEvent{
+		{typ: evAbs, code: absX, value: 8212},
+		{typ: evAbs, code: absY, value: 6580},
+		synEvent(),
+		{typ: evKey, code: btnLeft, value: 1},
+		{typ: evKey, code: btnRight, value: 1},
+		{typ: evRel, code: relWheel, value: 1},
+		synEvent(),
+		{typ: evAbs, code: absX, value: 8212},
+		{typ: evAbs, code: absY, value: 6580},
+		synEvent(),
+		{typ: evKey, code: btnLeft},
+		{typ: evKey, code: btnRight},
+		synEvent(),
+	}
+	if !slices.Equal(v.pending, want) {
+		t.Fatalf("tablet reports %v, want %v", v.pending, want)
+	}
+	before := len(v.pending)
+	v.PointerEventInBounds(1, 0, 0, 0, 600)
+	v.PointerEventInBounds(1, 0, 0, 800, -1)
+	if len(v.pending) != before {
+		t.Fatal("invalid framebuffer bounds generated input")
 	}
 }

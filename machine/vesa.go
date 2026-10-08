@@ -25,7 +25,7 @@ const (
 	vesaMode = 0x118
 )
 
-func (m *Machine) EnableVESA(display *virtio.VNCDisplay) {
+func (m *Machine) EnableVESA(display virtio.ConsoleDisplay) {
 	if display == nil {
 		return
 	}
@@ -37,8 +37,10 @@ func (m *Machine) EnableVESA(display *virtio.VNCDisplay) {
 	}
 
 	framebuffer := m.mem[vesaFramebufferBase : vesaFramebufferBase+uint64(vesaFramebufferSize)]
-	for i := range framebuffer {
-		framebuffer[i] = 0
+	if !m.vesaEnabled {
+		for i := range framebuffer {
+			framebuffer[i] = 0
+		}
 	}
 
 	m.vesaEnabled = true

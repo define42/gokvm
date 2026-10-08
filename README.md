@@ -17,6 +17,7 @@ The latest version supports the following features:
 - [x] virtio-blk (virtio 1.0, modern PCI transport)
 - [x] virtio-gpu (virtio 1.0, 2D; frames written to PNG via `-g`)
 - [x] VNC server for virtio-gpu with keyboard and mouse input (`-vnc`)
+- [x] Built-in TLS RDP console with keyboard and mouse input (`-rdp`)
 - [x] PVH Boot Protocol
 - [x] ISO boot via the El Torito boot catalog (no SeaBIOS/UEFI firmware required)
 
@@ -35,6 +36,7 @@ tar zxvf gokvm*.tar.gz
 ./gokvm boot -k ./bzImage -i ./initrd  # To exit, press Ctrl-a x.
 ./gokvm boot -k ./bzImage -i ./initrd -vnc :5900  # Enable virtio-gpu over VNC.
 ./gokvm boot -iso ./TinyCore-current.iso -vnc :5900  # Boot kernel/initrd from an ISO.
+./gokvm boot -iso ./TinyCore-current.iso -rdp 127.0.0.1:3389 -m 512M  # RDP desktop.
 ./gokvm boot -iso http://www.tinycorelinux.net/17.x/x86/release/TinyCore-current.iso -vnc :5900
 ```
 
@@ -50,11 +52,56 @@ BIOS/UEFI bootloader code, so no SeaBIOS firmware is required. The raw ISO is
 attached to the guest as a read-only virtio-blk device so the booted kernel can
 mount its live media.
 
-When booting a TinyCore ISO with `-vnc`, gokvm injects an autostart overlay into
-the initrd so the guest brings up the FLWM desktop (Xvesa) on the VNC display
-instead of a text login. The VNC server forwards keyboard and mouse input back
+When booting a TinyCore ISO with `-vnc` or `-rdp`, gokvm injects an autostart overlay into
+the initrd so the guest brings up the FLWM desktop (Xvesa) on the remote display
+instead of a text login. Both servers forward keyboard and mouse input back
 to the guest. Try it with `make tinycore`, which builds gokvm and boots
 `TinyCore-current.iso` on `127.0.0.1:5900`.
+
+### RDP console
+
+RDP is implemented in Go inside gokvm; no xrdp daemon or guest RDP server is
+needed. Build and start the bundled TinyCore desktop:
+
+```bash
+go build -o gokvm .
+./gokvm boot -iso ./TinyCore-current.iso -rdp 127.0.0.1:3389 -m 512M
+```
+
+Connect using FreeRDP (the executable may be named `xfreerdp3` on your system):
+
+```bash
+xfreerdp /v:127.0.0.1:3389 /sec:tls /u:console /p:console /cert:ignore
+```
+
+The example accepts the temporary self-signed certificate for local testing.
+To supply a persistent certificate, add `-rdp-cert console.crt -rdp-key console.key`
+to the gokvm command; both files must be PEM encoded. In clients with a security
+selector, choose TLS. NLA/CredSSP is not supported in this initial implementation.
+
+**The console has no user authentication.** The example credentials are dummy
+values and are not checked. TLS encrypts the connection; it does not restrict who
+can control the VM. Keep the listener on loopback and use an authenticated SSH
+tunnel for access from another machine.
+
+The RDP session uses a fixed 1024×768 desktop, scaling other guest framebuffer
+sizes to fit, with uncompressed bitmap updates and 16-, 24-, or 32-bit color.
+It includes the same serial/VGA/VESA fallbacks as VNC. Both `-rdp` and `-vnc` can
+be supplied to view the same guest at once; connected viewers share its keyboard
+and mouse. Clipboard, audio, drive redirection, dynamic resolution changes, and
+multiple monitors are not implemented. FreeRDP 3.32.1 has been tested with TinyCore
+desktop rendering, pointer positioning, menu interaction, and application launch;
+Microsoft Remote Desktop has not yet been validated.
+
+In TinyCore, right-click the desktop to open its menu. The application dock
+appears along the bottom of the screen.
+
+Run the protocol, input, framebuffer, and listener tests without booting a VM:
+
+```bash
+go test ./internal/rdp ./virtio ./flag ./vmm -short
+go test -race ./internal/rdp ./virtio ./vmm -run 'Test(RDP|Framebuffer|SerialMirror)'
+```
 
 ## Go package
 

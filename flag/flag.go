@@ -10,6 +10,8 @@ import (
 
 var ErrorInvalidSubcommands = errors.New("expected 'boot' or 'probe' subcommands")
 
+var ErrRDPOptions = errors.New("RDP certificate and key must be provided together with -rdp")
+
 type BootArgs struct {
 	Kernel     string
 	MemSize    int
@@ -23,6 +25,9 @@ type BootArgs struct {
 	Disk       string
 	GPU        string
 	VNC        string
+	RDP        string
+	RDPCert    string
+	RDPKey     string
 	TraceCount int
 }
 
@@ -51,6 +56,10 @@ func parseBootArgs(args []string) (*BootArgs, error) {
 		`If empty, no virtio-gpu device is created. (default "")`)
 	bootCmd.StringVar(&c.VNC, "vnc", "", `VNC listen address for virtio-gpu, for example ":5900". `+
 		`If empty, no VNC server is created. (default "")`)
+	bootCmd.StringVar(&c.RDP, "rdp", "", "RDP console listen address, for example 127.0.0.1:3389 (TLS, no authentication)")
+	bootCmd.StringVar(&c.RDPCert, "rdp-cert", "",
+		"RDP TLS certificate PEM file (default: temporary self-signed certificate)")
+	bootCmd.StringVar(&c.RDPKey, "rdp-key", "", "RDP TLS private key PEM file")
 
 	bootCmd.IntVar(&c.NCPUs, "c", 1, "number of cpus")
 
@@ -63,6 +72,9 @@ func parseBootArgs(args []string) (*BootArgs, error) {
 
 	if err = bootCmd.Parse(args); err != nil {
 		return nil, err
+	}
+	if (c.RDPCert == "") != (c.RDPKey == "") || (c.RDPCert != "" && c.RDP == "") {
+		return nil, ErrRDPOptions
 	}
 	bootCmd.Visit(func(f *flag.Flag) {
 		if f.Name == "p" {
