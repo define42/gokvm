@@ -54,7 +54,7 @@ int gokvm_avc_create(int width, int height, gokvm_avc_encoder **out) {
     params.iUsageType = SCREEN_CONTENT_REAL_TIME;
     params.iPicWidth = width;
     params.iPicHeight = height;
-    params.fMaxFrameRate = 30;
+    params.fMaxFrameRate = 60;
     params.iRCMode = RC_OFF_MODE;
     params.iSpatialLayerNum = 1;
     params.iTemporalLayerNum = 1;
@@ -72,7 +72,7 @@ int gokvm_avc_create(int width, int height, gokvm_avc_encoder **out) {
     SSpatialLayerConfig *layer = &params.sSpatialLayers[0];
     layer->iVideoWidth = width;
     layer->iVideoHeight = height;
-    layer->fFrameRate = 30;
+    layer->fFrameRate = 60;
     layer->uiProfileIdc = PRO_BASELINE;
     layer->iDLayerQp = 20;
     layer->sSliceArgument.uiSliceMode = SM_SINGLE_SLICE;

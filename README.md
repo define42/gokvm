@@ -116,6 +116,13 @@ Use a FreeRDP build with H.264 decoding enabled:
 xfreerdp /v:127.0.0.1:3389 /sec:tls /u:console /p:console /cert:ignore /gfx:AVC420
 ```
 
+Check `xfreerdp /buildconfig` for `WITH_GFX_H264=ON`. A build with
+`WITH_GFX_H264=OFF` rejects `/gfx:AVC420` during command-line parsing, even if
+its help lists that option. Installing the OpenH264 library alone does not
+enable codec support in an already-built FreeRDP client. Use a client built
+with H.264 decoding, or omit `/gfx:AVC420` to connect using bitmap updates.
+The interoperability tests used a separate H.264-enabled FreeRDP build.
+
 The server logs `using OpenH264 AVC420 graphics` after negotiation. Clients
 without AVC420 support receive bitmap updates automatically. The tagged binary
 links to the OpenH264 shared library, which must remain installed at runtime.
@@ -125,6 +132,12 @@ Normal builds need no OpenH264 dependency and report a clear error if
 AVC420 uses lossy YUV 4:2:0 compression and software encoding, so small colored
 text can be softer than bitmap output. AVC444 and hardware encoding are not
 implemented. TLS and authentication behavior are the same as for bitmap RDP.
+
+The H.264 path captures the linear framebuffer and sends changed frames at up
+to 60 fps. Frame notifications avoid waiting for a separate polling cycle,
+and slow clients receive the latest available frame when they are ready.
+Actual frame rate depends on guest rendering, host CPU, and client decoding.
+Bitmap RDP remains capped at 30 fps.
 
 Run the protocol, input, framebuffer, and listener tests without booting a VM:
 

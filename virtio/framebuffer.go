@@ -30,14 +30,16 @@ type ConsoleDisplay interface {
 // The text lock serializes fallback publication with the first GPU frame and
 // coordinates worker creation with shutdown. The frame lock never acquires it.
 type framebuffer struct {
-	mu     sync.Mutex
-	cond   *sync.Cond
-	width  int
-	height int
-	frame  []byte
-	seq    uint64
-	input  VNCInput
-	done   chan struct{}
+	mu             sync.Mutex
+	cond           *sync.Cond
+	width          int
+	height         int
+	frame          []byte
+	seq            uint64
+	input          VNCInput
+	done           chan struct{}
+	changed        chan struct{}
+	linearInterval time.Duration
 
 	textMu       sync.Mutex
 	textConsole  *vncTextConsole
@@ -50,9 +52,11 @@ type framebuffer struct {
 
 func newFramebuffer() *framebuffer {
 	d := &framebuffer{
-		width:  vncDefaultWidth,
-		height: vncDefaultHeight,
-		done:   make(chan struct{}),
+		width:          vncDefaultWidth,
+		height:         vncDefaultHeight,
+		done:           make(chan struct{}),
+		changed:        make(chan struct{}),
+		linearInterval: 33 * time.Millisecond,
 	}
 	d.cond = sync.NewCond(&d.mu)
 
@@ -114,6 +118,8 @@ func (d *framebuffer) flush(width, height int, img *image.RGBA) error {
 	d.height = height
 	d.frame = frame
 	d.seq++
+	close(d.changed)
+	d.changed = make(chan struct{})
 	d.cond.Broadcast()
 	d.mu.Unlock()
 
@@ -161,7 +167,7 @@ func (d *framebuffer) StartLinearFramebufferFallback(mem []byte, base, width, he
 		return
 	}
 
-	d.startFallback(mem[base:base+stride*height], 33*time.Millisecond, framebufferBlank,
+	d.startFallback(mem[base:base+stride*height], d.linearInterval, framebufferBlank,
 		func(frame []byte) *image.RGBA {
 			return renderLinearFramebuffer(frame, width, height, stride)
 		})
@@ -218,11 +224,11 @@ func (d *framebuffer) refreshFallback(
 		return false
 	}
 
-	snap := bytes.Clone(mem)
-	if bytes.Equal(snap, *last) {
+	if bytes.Equal(mem, *last) {
 		return true
 	}
 
+	snap := bytes.Clone(mem)
 	*last = snap
 	if !*rendered && isBlank(snap) {
 		return true
@@ -311,16 +317,18 @@ func (d *framebuffer) snapshot() vncFrame {
 	return d.snapshotLocked()
 }
 
-// changedFrame avoids copying the framebuffer while a remote viewer is idle.
-func (d *framebuffer) changedFrame(sequence uint64, force bool) (vncFrame, bool) {
+// changedFrame returns an immutable frame and the next publication notification
+// atomically, so a writer cannot lose a wakeup between reading and waiting.
+// Unlike snapshot, the returned pixels must never be modified by the caller.
+func (d *framebuffer) changedFrame(sequence uint64, force bool) (vncFrame, bool, <-chan struct{}) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	if !force && d.seq == sequence {
-		return vncFrame{}, false
+		return vncFrame{}, false, d.changed
 	}
 
-	return d.snapshotLocked(), true
+	return vncFrame{width: d.width, height: d.height, pix: d.frame, seq: d.seq}, true, d.changed
 }
 
 func (d *framebuffer) frameForRequestUntil(incremental bool, lastSeq uint64, done <-chan struct{}) (vncFrame, bool) {

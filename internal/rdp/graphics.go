@@ -29,6 +29,7 @@ type graphicsState struct {
 	ackOff      bool
 	frameID     uint32
 	inFlight    []uint32
+	changed     chan struct{}
 	staticData  fragmentBuffer
 	dynamicData fragmentBuffer
 }
@@ -77,6 +78,31 @@ func (s *Session) GraphicsCanSend() bool {
 	defer s.graphics.mu.Unlock()
 
 	return s.graphics.canSend()
+}
+
+// GraphicsChanged wakes the single video writer when negotiation or frame
+// acknowledgments change graphics readiness. Notifications are coalesced; the
+// writer must check the current state after subscribing and after each wake.
+func (s *Session) GraphicsChanged() <-chan struct{} {
+	if s.graphics == nil {
+		return nil
+	}
+	g := s.graphics
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.changed == nil {
+		g.changed = make(chan struct{}, 1)
+	}
+
+	return g.changed
+}
+
+// notifyChanged is called with mu held and never blocks the protocol reader.
+func (g *graphicsState) notifyChanged() {
+	select {
+	case g.changed <- struct{}{}:
+	default:
+	}
 }
 
 func (g *graphicsState) canSend() bool {
@@ -199,6 +225,7 @@ func (s *Session) readDynamic(data []byte) error {
 		g.ready = false
 		g.phase = 4
 		g.inFlight = nil
+		g.notifyChanged()
 
 		return s.writeStatic(g.channel, []byte{0x40, graphicsChannelID})
 	default:
@@ -246,6 +273,7 @@ func (s *Session) readGraphicsPDU(command uint16, data []byte) error {
 			return err
 		}
 		g.ready = true
+		g.notifyChanged()
 	case 0x0d: // RDPGFX_FRAME_ACKNOWLEDGE
 		if !g.ready || len(data) != 12 {
 			return errors.New("rdp: invalid graphics frame acknowledgment")
@@ -253,6 +281,7 @@ func (s *Session) readGraphicsPDU(command uint16, data []byte) error {
 		if binary.LittleEndian.Uint32(data) == ^uint32(0) {
 			g.ackOff = true
 			g.inFlight = nil
+			g.notifyChanged()
 
 			return nil
 		}
@@ -261,6 +290,7 @@ func (s *Session) readGraphicsPDU(command uint16, data []byte) error {
 		for i, id := range g.inFlight {
 			if id == frameID {
 				g.inFlight = g.inFlight[i+1:]
+				g.notifyChanged()
 
 				return nil
 			}

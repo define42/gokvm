@@ -8,6 +8,11 @@ import (
 	"image"
 )
 
+// FrameRate is the maximum frame rate of the RDP AVC420 encoder.
+const FrameRate = 60
+
+const maxDimension = 4096
+
 var (
 	ErrUnavailable = errors.New("OpenH264 support requires rebuilding with CGO_ENABLED=1 and -tags openh264")
 	ErrGeometry    = errors.New("invalid OpenH264 frame geometry")
@@ -33,7 +38,7 @@ type Encoder struct {
 // NewEncoder fixes the output size for the lifetime of the encoder. Dimensions
 // must be even and between 16 and 4096 pixels, inclusive.
 func NewEncoder(width, height int) (*Encoder, error) {
-	if width < 16 || height < 16 || width > 4096 || height > 4096 || width%2 != 0 || height%2 != 0 {
+	if width < 16 || height < 16 || width > maxDimension || height > maxDimension || width%2 != 0 || height%2 != 0 {
 		return nil, ErrGeometry
 	}
 
@@ -64,7 +69,7 @@ func (e *Encoder) Encode(img *image.RGBA, force bool) ([]byte, error) {
 	if !force && bytes.Equal(e.i420, e.previous) {
 		return nil, nil
 	}
-	data, err := e.codec.encode(e.i420, force, e.frame*1000/30)
+	data, err := e.codec.encode(e.i420, force, e.frame*1000/FrameRate)
 	e.frame++
 	if err == nil {
 		e.previous, e.i420 = e.i420, e.previous
@@ -107,23 +112,38 @@ func validRGBA(img *image.RGBA) bool {
 func scaleI420(dst []byte, width, height int, img *image.RGBA) {
 	luma := width * height
 	chroma := luma / 4
+	// Mapping columns once avoids repeated integer divisions for every pixel.
+	// NewEncoder bounds width, so this fixed-size scratch array stays on the
+	// stack without allocating a lookup table for every frame.
+	var columns [maxDimension]int
+	for x := range width {
+		columns[x] = x * img.Rect.Dx() / width * 4
+	}
+	var pos int
 	for y := 0; y < height; y += 2 {
-		for x := 0; x < width; x += 2 {
-			var red, green, blue int
-			for dy := range 2 {
-				sy := (y + dy) * img.Rect.Dy() / height
-				for dx := range 2 {
-					sx := (x + dx) * img.Rect.Dx() / width
-					offset := sy*img.Stride + sx*4
-					r, g, b := int(img.Pix[offset]), int(img.Pix[offset+1]), int(img.Pix[offset+2])
-					dst[(y+dy)*width+x+dx] = byte((54*r + 183*g + 18*b) >> 8)
-					red, green, blue = red+r, green+g, blue+b
-				}
-			}
-			red, green, blue = red/4, green/4, blue/4
-			pos := (y/2)*(width/2) + x/2
+		row0 := img.Pix[(y*img.Rect.Dy()/height)*img.Stride:]
+		row1 := img.Pix[((y+1)*img.Rect.Dy()/height)*img.Stride:]
+		luma0 := dst[y*width : (y+1)*width]
+		luma1 := dst[(y+1)*width : (y+2)*width]
+		for x := 0; x+1 < width; x += 2 {
+			p00 := row0[columns[x]:][:3]
+			p01 := row0[columns[x+1]:][:3]
+			p10 := row1[columns[x]:][:3]
+			p11 := row1[columns[x+1]:][:3]
+			r00, g00, b00 := int(p00[0]), int(p00[1]), int(p00[2])
+			r01, g01, b01 := int(p01[0]), int(p01[1]), int(p01[2])
+			r10, g10, b10 := int(p10[0]), int(p10[1]), int(p10[2])
+			r11, g11, b11 := int(p11[0]), int(p11[1]), int(p11[2])
+			luma0[x] = byte((54*r00 + 183*g00 + 18*b00) >> 8)
+			luma0[x+1] = byte((54*r01 + 183*g01 + 18*b01) >> 8)
+			luma1[x] = byte((54*r10 + 183*g10 + 18*b10) >> 8)
+			luma1[x+1] = byte((54*r11 + 183*g11 + 18*b11) >> 8)
+			red := (r00 + r01 + r10 + r11) / 4
+			green := (g00 + g01 + g10 + g11) / 4
+			blue := (b00 + b01 + b10 + b11) / 4
 			dst[luma+pos] = byte(((-29*red - 99*green + 128*blue) >> 8) + 128)
 			dst[luma+chroma+pos] = byte(((128*red - 116*green - 12*blue) >> 8) + 128)
+			pos++
 		}
 	}
 }

@@ -84,6 +84,74 @@ func TestGraphicsChannelNegotiationAndAcknowledgments(t *testing.T) {
 	}
 }
 
+func TestGraphicsChangesWakeWriter(t *testing.T) {
+	t.Parallel()
+	if new(Session).GraphicsChanged() != nil {
+		t.Fatal("client without graphics has a notification channel")
+	}
+	s := &Session{
+		Width: 1024, Height: 768, conn: &graphicsTestConn{},
+		graphics: &graphicsState{channel: 1004, phase: 3},
+	}
+	changed := s.GraphicsChanged()
+	if changed != s.GraphicsChanged() {
+		t.Fatal("graphics notification channel changed between calls")
+	}
+	wantWake := func(want bool) {
+		t.Helper()
+		select {
+		case <-changed:
+			if !want {
+				t.Fatal("unexpected graphics wake")
+			}
+		default:
+			if want {
+				t.Fatal("graphics writer was not notified")
+			}
+		}
+	}
+	wantWake(false)
+	if err := s.readGraphics(graphicsCapsFixture(graphicsVersion81, 0x10)); err != nil {
+		t.Fatal(err)
+	}
+	wantWake(true)
+	for range graphicsMaxFrames {
+		if sent, err := s.WriteAVC420([]byte{0, 0, 1, 0x65}); err != nil || !sent {
+			t.Fatalf("send frame = %v, %v", sent, err)
+		}
+	}
+	wantWake(false)
+	ack := make([]byte, 12)
+	binary.LittleEndian.PutUint32(ack[4:], 99)
+	if err := s.readGraphicsPDU(0x0d, ack); err != nil {
+		t.Fatal(err)
+	}
+	wantWake(false)
+	for _, id := range []uint32{1, 2} {
+		binary.LittleEndian.PutUint32(ack[4:], id)
+		if err := s.readGraphicsPDU(0x0d, ack); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wantWake(true)
+	wantWake(false) // Multiple acknowledgments coalesce without blocking the reader.
+	if !s.GraphicsCanSend() {
+		t.Fatal("acknowledgments did not reopen the send window")
+	}
+	binary.LittleEndian.PutUint32(ack, ^uint32(0))
+	if err := s.readGraphicsPDU(0x0d, ack); err != nil {
+		t.Fatal(err)
+	}
+	wantWake(true)
+	if err := s.readDynamic([]byte{0x40, graphicsChannelID}); err != nil {
+		t.Fatal(err)
+	}
+	wantWake(true)
+	if s.GraphicsReady() {
+		t.Fatal("closed graphics channel still ready")
+	}
+}
+
 func TestGraphicsGCCSettings(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {

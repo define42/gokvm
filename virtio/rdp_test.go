@@ -34,6 +34,9 @@ func TestRDPDisplayH264Configuration(t *testing.T) {
 	if !d.h264 {
 		t.Fatal("H.264 option was not enabled")
 	}
+	if d.linearInterval != time.Second/avc.FrameRate {
+		t.Fatalf("H.264 capture interval %v does not match encoder frame rate", d.linearInterval)
+	}
 }
 
 func TestRDPDisplayRequiresTLSSecurity(t *testing.T) {

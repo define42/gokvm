@@ -5,6 +5,7 @@ import (
 	"errors"
 	"image"
 	"image/color"
+	"math/rand/v2"
 	"testing"
 )
 
@@ -75,6 +76,71 @@ func TestI420SubimageAndScaling(t *testing.T) {
 	}
 }
 
+func TestI420MatchesReference(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name                      string
+		sourceWidth, sourceHeight int
+		width, height             int
+	}{
+		{"native", 1024, 768, 1024, 768},
+		{"upscale", 800, 600, 1024, 768},
+		{"downscale", 1920, 1080, 1024, 768},
+		{"odd-source", 17, 21, 32, 16},
+		{"single-pixel", 1, 1, 16, 16},
+		{"maximum-width", 31, 17, maxDimension, 16},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			// A subimage exercises nonzero origins, padding between rows, and
+			// unused bytes before and after the source rectangle.
+			parent := image.NewRGBA(image.Rect(-7, -9, test.sourceWidth+3, test.sourceHeight+5))
+			random := rand.New(rand.NewPCG(17, 31)) //nolint:gosec // Deterministic test pixels, not security-sensitive.
+			for index := range parent.Pix {
+				parent.Pix[index] = byte(random.Uint32())
+			}
+			img := parent.SubImage(image.Rect(-3, -5, test.sourceWidth-3, test.sourceHeight-5)).(*image.RGBA)
+			want := referenceI420(test.width, test.height, img)
+			got := make([]byte, len(want))
+			scaleI420(got, test.width, test.height, img)
+			if !bytes.Equal(got, want) {
+				for index, value := range want {
+					if got[index] != value {
+						t.Fatalf("I420 byte %d = %d, want %d", index, got[index], value)
+					}
+				}
+			}
+		})
+	}
+}
+
+// referenceI420 deliberately samples each output pixel independently; it is
+// the scalar definition of nearest-neighbor scaling and 2x2 chroma averaging.
+func referenceI420(width, height int, img *image.RGBA) []byte {
+	luma := width * height
+	dst := make([]byte, luma*3/2)
+	for y := 0; y < height; y += 2 {
+		for x := 0; x < width; x += 2 {
+			var red, green, blue int
+			for dy := range 2 {
+				for dx := range 2 {
+					pixel := img.RGBAAt(img.Rect.Min.X+(x+dx)*img.Rect.Dx()/width,
+						img.Rect.Min.Y+(y+dy)*img.Rect.Dy()/height)
+					r, g, b := int(pixel.R), int(pixel.G), int(pixel.B)
+					dst[(y+dy)*width+x+dx] = byte((54*r + 183*g + 18*b) >> 8)
+					red, green, blue = red+r, green+g, blue+b
+				}
+			}
+			red, green, blue = red/4, green/4, blue/4
+			pos := (y/2)*(width/2) + x/2
+			dst[luma+pos] = byte(((-29*red - 99*green + 128*blue) >> 8) + 128)
+			dst[luma+luma/4+pos] = byte(((128*red - 116*green - 12*blue) >> 8) + 128)
+		}
+	}
+
+	return dst
+}
+
 type recordingCodec struct {
 	forces     []bool
 	timestamps []int64
@@ -100,7 +166,7 @@ func TestEncoderRefreshAndClose(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if len(codec.forces) != 2 || codec.forces[0] || !codec.forces[1] || codec.timestamps[1] != 33 {
+	if len(codec.forces) != 2 || codec.forces[0] || !codec.forces[1] || codec.timestamps[1] != 1000/FrameRate {
 		t.Fatalf("encode calls: force=%v timestamp=%v", codec.forces, codec.timestamps)
 	}
 

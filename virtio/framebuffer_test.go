@@ -201,3 +201,133 @@ func TestFramebufferConcurrentFallbackStartAndShutdown(t *testing.T) {
 		}
 	}
 }
+
+func TestFramebufferPublicationNotificationAndOwnership(t *testing.T) {
+	t.Parallel()
+	d := newFramebuffer()
+	t.Cleanup(d.shutdown)
+	_, changed, first := d.changedFrame(0, false)
+	if changed {
+		t.Fatal("empty framebuffer reported a change")
+	}
+	_, _, second := d.changedFrame(0, false)
+	img := image.NewRGBA(image.Rect(0, 0, 1, 1))
+	img.Pix[0] = 42
+	if err := d.Flush(1, 1, img); err != nil {
+		t.Fatal(err)
+	}
+	for _, notification := range []<-chan struct{}{first, second} {
+		select {
+		case <-notification:
+		default:
+			t.Fatal("publication did not notify every frame reader")
+		}
+	}
+	frame, changed, next := d.changedFrame(0, false)
+	if !changed || frame.seq != 1 || frame.pix[0] != 42 {
+		t.Fatalf("published frame: %+v, changed %v", frame, changed)
+	}
+	select {
+	case <-next:
+		t.Fatal("next frame notification was already signaled")
+	default:
+	}
+	img.Pix[0] = 73
+	if err := d.Flush(1, 1, img); err != nil {
+		t.Fatal(err)
+	}
+	if frame.pix[0] != 42 {
+		t.Fatal("subsequent publication changed an in-flight frame")
+	}
+	select {
+	case <-next:
+	default:
+		t.Fatal("next publication did not wake the frame reader")
+	}
+	latest, changed, _ := d.changedFrame(frame.seq, false)
+	if !changed || latest.seq != 2 || latest.pix[0] != 73 {
+		t.Fatalf("latest frame: %+v, changed %v", latest, changed)
+	}
+}
+
+func TestFramebufferConcurrentPublicationNotifications(t *testing.T) {
+	t.Parallel()
+	d := newFramebuffer()
+	t.Cleanup(d.shutdown)
+	const frames = 1000
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		img := image.NewRGBA(image.Rect(0, 0, 1, 1))
+		for sequence := range frames {
+			img.Pix[0] = byte(sequence + 1)
+			if err := d.Flush(1, 1, img); err != nil {
+				t.Error(err)
+
+				return
+			}
+		}
+	}()
+	t.Cleanup(func() { <-finished })
+	timeout := time.NewTimer(2 * time.Second)
+	defer timeout.Stop()
+	var sequence uint64
+	for sequence < frames {
+		frame, changed, published := d.changedFrame(sequence, false)
+		if changed {
+			if frame.seq <= sequence || frame.pix[0] != byte(frame.seq) {
+				t.Fatalf("torn frame: %+v after sequence %d", frame, sequence)
+			}
+			sequence = frame.seq
+
+			continue
+		}
+		select {
+		case <-published:
+		case <-timeout.C:
+			t.Fatalf("missed publication after sequence %d", sequence)
+		}
+	}
+}
+
+//nolint:paralleltest // AllocsPerRun forbids running inside a parallel test.
+func TestFramebufferIdleFallbackDoesNotAllocate(t *testing.T) {
+	d := newFramebuffer()
+	t.Cleanup(d.shutdown)
+	mem := []byte{1, 2, 3, 0}
+	var last []byte
+	rendered := false
+	render := func(data []byte) *image.RGBA {
+		return renderLinearFramebuffer(data, 1, 1, 4)
+	}
+	d.refreshFallback(mem, &last, &rendered, framebufferBlank, render)
+	allocations := testing.AllocsPerRun(100, func() {
+		d.refreshFallback(mem, &last, &rendered, framebufferBlank, render)
+	})
+	if allocations != 0 {
+		t.Fatalf("unchanged fallback allocates %.0f times per capture", allocations)
+	}
+	if frame := d.snapshot(); frame.seq != 1 {
+		t.Fatalf("unchanged fallback was republished %d times", frame.seq)
+	}
+}
+
+func BenchmarkFramebufferRead(b *testing.B) {
+	d := newFramebuffer()
+	b.Cleanup(d.shutdown)
+	if err := d.Flush(1024, 768, image.NewRGBA(image.Rect(0, 0, 1024, 768))); err != nil {
+		b.Fatal(err)
+	}
+	b.Run("copy", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			d.snapshot()
+		}
+	})
+	b.Run("immutable", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			d.changedFrame(0, false)
+		}
+	})
+}

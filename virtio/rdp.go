@@ -87,6 +87,9 @@ func NewRDPDisplayWithConfig(addr string, options RDPConfig) (*RDPDisplay, error
 		framebuffer: newFramebuffer(), listener: listener, tls: config,
 		conns: make(map[net.Conn]struct{}), h264: options.H264,
 	}
+	if options.H264 {
+		display.linearInterval = time.Second / avc.FrameRate
+	}
 	display.wg.Add(1)
 	go display.acceptLoop()
 
@@ -237,24 +240,23 @@ func (d *RDPDisplay) writeFrames(
 	if err != nil {
 		return err
 	}
-	writer := &rdpFrameWriter{session: session, bitmap: bitmap}
+	writer := &rdpFrameWriter{session: session, bitmap: bitmap, force: true}
 	defer writer.close()
-	ticker := time.NewTicker(time.Second / 30)
-	defer ticker.Stop()
+	timer := time.NewTimer(time.Hour)
+	timer.Stop()
+	defer timer.Stop()
+	graphicsChanged := session.GraphicsChanged()
 
-	var sequence uint64
-	force := true
+	// Coalesce publications while pacing or awaiting acknowledgments. Only arm
+	// the timer for a pending frame; idle clients need no periodic polling.
 	for {
-		if ready := session.GraphicsReady(); ready != writer.graphics {
-			writer.graphics = ready
-			force = true
-			if ready {
-				log.Printf("rdp: client %s using OpenH264 AVC420 graphics", conn.RemoteAddr())
-			}
+		if writer.updateGraphics(conn) {
+			writer.force = true
 		}
-		if !suppressed.Load() && (!writer.graphics || session.GraphicsCanSend()) {
-			var err error
-			sequence, force, err = d.writeChangedRDPFrame(conn, writer, sequence, force)
+		frame, changed, published := d.changedFrame(writer.sequence, writer.force)
+		var paced <-chan time.Time
+		if changed && !suppressed.Load() && (!writer.graphics || session.GraphicsCanSend()) {
+			paced, err = writer.writeWhenReady(conn, frame, timer)
 			if err != nil {
 				return err
 			}
@@ -266,32 +268,63 @@ func (d *RDPDisplay) writeFrames(
 		case <-d.done:
 			return nil
 		case <-refresh:
-			force = true
-		case <-ticker.C:
+			writer.force = true
+		case <-published:
+		case <-graphicsChanged:
+		case <-paced:
 		}
+		timer.Stop()
 	}
-}
-
-func (d *RDPDisplay) writeChangedRDPFrame(
-	conn net.Conn, writer *rdpFrameWriter, sequence uint64, force bool,
-) (uint64, bool, error) {
-	frame, changed := d.changedFrame(sequence, force)
-	if !changed {
-		return sequence, force, nil
-	}
-	sent, err := writer.write(conn, frame, force)
-	if err != nil || !sent {
-		return sequence, true, err
-	}
-
-	return frame.seq, false, nil
 }
 
 type rdpFrameWriter struct {
-	session  *rdp.Session
-	bitmap   *rdp.BitmapEncoder
-	avc      *avc.Encoder
-	graphics bool
+	session   *rdp.Session
+	bitmap    *rdp.BitmapEncoder
+	avc       *avc.Encoder
+	graphics  bool
+	sequence  uint64
+	force     bool
+	nextFrame time.Time
+}
+
+func (w *rdpFrameWriter) writeWhenReady(conn net.Conn, frame vncFrame, timer *time.Timer) (<-chan time.Time, error) {
+	if delay := time.Until(w.nextFrame); delay > 0 {
+		timer.Reset(delay)
+
+		return timer.C, nil
+	}
+	w.nextFrame = time.Now().Add(w.frameInterval())
+	sent, err := w.write(conn, frame, w.force)
+	if err != nil {
+		return nil, err
+	}
+	w.force = !sent
+	if sent {
+		w.sequence = frame.seq
+	}
+
+	return nil, nil //nolint:nilnil // A nil timer channel keeps an idle writer asleep until an event.
+}
+
+func (w *rdpFrameWriter) updateGraphics(conn net.Conn) bool {
+	ready := w.session.GraphicsReady()
+	if ready == w.graphics {
+		return false
+	}
+	w.graphics = ready
+	if ready {
+		log.Printf("rdp: client %s using OpenH264 AVC420 graphics", conn.RemoteAddr())
+	}
+
+	return true
+}
+
+func (w *rdpFrameWriter) frameInterval() time.Duration {
+	if w.graphics {
+		return time.Second / avc.FrameRate
+	}
+
+	return time.Second / 30
 }
 
 func (w *rdpFrameWriter) close() {
