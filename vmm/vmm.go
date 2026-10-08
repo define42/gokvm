@@ -721,7 +721,14 @@ func (v *VMM) Boot() error {
 		i := cpu
 
 		f := func() error {
-			return v.VCPU(os.Stderr, i, v.TraceCount)
+			err := v.VCPU(os.Stderr, i, v.TraceCount)
+			if err != nil {
+				// Serial input may still be waiting on stdin. Report the CPU
+				// failure now so it does not look like a guest boot hang.
+				log.Printf("CPU %d stopped: %v", i, err)
+			}
+
+			return err
 		}
 
 		g.Go(f)

@@ -12,6 +12,102 @@ import (
 
 var _ ConsoleDisplay = (*VNCDisplay)(nil)
 
+func TestFramebufferSerialWritesAreBatched(t *testing.T) {
+	t.Parallel()
+
+	d := newFramebuffer()
+	d.serialInterval = time.Hour
+	t.Cleanup(d.shutdown)
+	payload := []byte("Starting...\rReady\x1b[K\nroot@slax:~# ")
+	for i := range payload {
+		if n, err := d.Write(payload[i : i+1]); n != 1 || err != nil {
+			t.Fatalf("write byte %d: got %d, %v", i, n, err)
+		}
+	}
+	if frame := d.snapshot(); frame.seq != 1 {
+		t.Fatalf("serial burst published %d frames before refresh, want 1", frame.seq)
+	}
+	if !d.refreshSerial() {
+		t.Fatal("serial renderer stopped before graphics took over")
+	}
+
+	expected := newVNCTextConsole(vncTextCols, vncTextRows)
+	expected.write([]byte("Ready\nroot@slax:~# "))
+	frame := d.snapshot()
+	if frame.seq != 2 || !bytes.Equal(frame.pix, expected.render().Pix) {
+		t.Fatal("batched serial frame lost characters, ordering, or terminal escapes")
+	}
+	d.refreshSerial()
+	if got := d.snapshot().seq; got != frame.seq {
+		t.Fatal("idle serial console published another frame")
+	}
+}
+
+func TestFramebufferSerialPromptIsEventuallyPublished(t *testing.T) {
+	t.Parallel()
+
+	d := newFramebuffer()
+	t.Cleanup(d.shutdown)
+	if _, err := d.Write([]byte("boot\n")); err != nil {
+		t.Fatal(err)
+	}
+	_, _, published := d.changedFrame(1, false)
+	if _, err := d.Write([]byte("login: ")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-published:
+	case <-time.After(time.Second):
+		t.Fatal("serial prompt without a newline was never rendered")
+	}
+	expected := newVNCTextConsole(vncTextCols, vncTextRows)
+	expected.write([]byte("boot\nlogin: "))
+	if !bytes.Equal(d.snapshot().pix, expected.render().Pix) {
+		t.Fatal("published serial frame does not contain the complete prompt")
+	}
+}
+
+func TestFramebufferPendingSerialCannotOverwriteTakeover(t *testing.T) {
+	t.Parallel()
+
+	for _, takeover := range []string{"gpu", "vga", "shutdown"} {
+		t.Run(takeover, func(t *testing.T) {
+			t.Parallel()
+			d := newFramebuffer()
+			d.serialInterval = time.Hour
+			t.Cleanup(d.shutdown)
+			for _, text := range []string{"initial", "pending"} {
+				if _, err := d.Write([]byte(text)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			img := image.NewRGBA(image.Rect(0, 0, 1, 1))
+			img.SetRGBA(0, 0, color.RGBA{R: 0xff, A: 0xff})
+			switch takeover {
+			case "gpu":
+				if err := d.Flush(1, 1, img); err != nil {
+					t.Fatal(err)
+				}
+			case "vga":
+				var last []byte
+				rendered := false
+				d.refreshFallback([]byte{1}, &last, &rendered, framebufferBlank,
+					func([]byte) *image.RGBA { return img })
+			case "shutdown":
+				d.shutdown()
+			}
+			before := d.snapshot()
+			if d.refreshSerial() {
+				t.Fatal("serial renderer continued after takeover")
+			}
+			after := d.snapshot()
+			if before.seq != after.seq || !bytes.Equal(before.pix, after.pix) {
+				t.Fatal("pending serial output replaced the final framebuffer")
+			}
+		})
+	}
+}
+
 func TestFramebufferTabletUsesCurrentDimensions(t *testing.T) {
 	t.Parallel()
 	d := newFramebuffer()
@@ -330,4 +426,17 @@ func BenchmarkFramebufferRead(b *testing.B) {
 			d.changedFrame(0, false)
 		}
 	})
+}
+
+func BenchmarkFramebufferSerialByte(b *testing.B) {
+	d := newFramebuffer()
+	b.Cleanup(d.shutdown)
+	p := []byte{'x'}
+	b.ReportAllocs()
+	b.SetBytes(1)
+	for b.Loop() {
+		if _, err := d.Write(p); err != nil {
+			b.Fatal(err)
+		}
+	}
 }

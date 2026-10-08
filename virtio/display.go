@@ -10,7 +10,7 @@ import (
 // Display is the sink virtio-gpu presents flushed frames to. Implementations
 // must be safe for the single GPU IO goroutine to call.
 type Display interface {
-	// Flush is called on RESOURCE_FLUSH with the scanout's current frame.
+	// Flush publishes the scanout image, including any hardware cursor.
 	// The image is owned by the caller only for the duration of the call.
 	Flush(width, height int, img *image.RGBA) error
 

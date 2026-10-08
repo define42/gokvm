@@ -40,9 +40,11 @@ type framebuffer struct {
 	done           chan struct{}
 	changed        chan struct{}
 	linearInterval time.Duration
+	serialInterval time.Duration
 
 	textMu       sync.Mutex
 	textConsole  *vncTextConsole
+	textDirty    bool
 	textDisabled bool
 	serialMuted  bool
 	stopped      bool
@@ -57,6 +59,7 @@ func newFramebuffer() *framebuffer {
 		done:           make(chan struct{}),
 		changed:        make(chan struct{}),
 		linearInterval: 33 * time.Millisecond,
+		serialInterval: 33 * time.Millisecond,
 	}
 	d.cond = sync.NewCond(&d.mu)
 
@@ -127,25 +130,70 @@ func (d *framebuffer) flush(width, height int, img *image.RGBA) error {
 }
 
 // Write mirrors serial bytes until a graphical or VGA console takes over.
+// After the first frame, rendering is batched so byte-at-a-time UART writes do
+// not stall the guest copying a complete framebuffer for every character.
 func (d *framebuffer) Write(p []byte) (int, error) {
 	d.textMu.Lock()
 	defer d.textMu.Unlock()
 
-	if d.stopped || d.textDisabled || d.serialMuted {
+	if len(p) == 0 || d.stopped || d.textDisabled || d.serialMuted {
 		return len(p), nil
 	}
 
-	if d.textConsole == nil {
+	first := d.textConsole == nil
+	if first {
 		d.textConsole = newVNCTextConsole(vncTextCols, vncTextRows)
 	}
 
 	d.textConsole.write(p)
+	if !first {
+		d.textDirty = true
+
+		return len(p), nil
+	}
+
 	img := d.textConsole.render()
 	if err := d.flush(img.Bounds().Dx(), img.Bounds().Dy(), img); err != nil {
 		return 0, err
 	}
 
+	d.fallbackWG.Add(1)
+	go d.renderSerialFrames()
+
 	return len(p), nil
+}
+
+func (d *framebuffer) renderSerialFrames() {
+	defer d.fallbackWG.Done()
+	ticker := time.NewTicker(d.serialInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-d.done:
+			return
+		case <-ticker.C:
+			if !d.refreshSerial() {
+				return
+			}
+		}
+	}
+}
+
+func (d *framebuffer) refreshSerial() bool {
+	d.textMu.Lock()
+	defer d.textMu.Unlock()
+
+	if d.stopped || d.textDisabled || d.serialMuted {
+		return false
+	}
+	if d.textDirty {
+		img := d.textConsole.render()
+		_ = d.flush(img.Bounds().Dx(), img.Bounds().Dy(), img)
+		d.textDirty = false
+	}
+
+	return true
 }
 
 // StartVGATextFallback presents legacy VGA text until the GPU supplies a frame.

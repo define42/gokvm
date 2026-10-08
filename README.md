@@ -59,6 +59,17 @@ instead of a text login. Both servers forward keyboard and mouse input back
 to the guest. Try it with `make tinycore`, which builds gokvm and boots
 `TinyCore-current.iso` on `127.0.0.1:5900`.
 
+Slax can boot directly from its ISO with its normal graphical startup:
+
+```bash
+./gokvm boot -iso ./slax.iso -m 1G -rdp 127.0.0.1:3390
+```
+
+The Slackware-based Slax image with Linux 6.1.38 has been tested through to the
+desktop. Keep the ISO's default boot parameters; no extracted kernel, custom
+initrd, or driver blacklist is needed. For AVC420, build with the `openh264` tag
+and add `-rdp-h264` as described below.
+
 ### RDP console
 
 RDP is implemented in Go inside gokvm; no xrdp daemon or guest RDP server is
@@ -92,7 +103,7 @@ It includes the same serial/VGA/VESA fallbacks as VNC. Both `-rdp` and `-vnc` ca
 be supplied to view the same guest at once; connected viewers share its keyboard
 and mouse. Clipboard, audio, drive redirection, dynamic resolution changes, and
 multiple monitors are not implemented. FreeRDP 3.32.1 has been tested with TinyCore
-desktop rendering, pointer positioning, menu interaction, and application launch;
+and Slax desktop rendering, pointer positioning, menu interaction, and application launch;
 Microsoft Remote Desktop has not yet been validated.
 
 In TinyCore, right-click the desktop to open its menu. The application dock
@@ -123,9 +134,10 @@ enable codec support in an already-built FreeRDP client. Use a client built
 with H.264 decoding, or omit `/gfx:AVC420` to connect using bitmap updates.
 The interoperability tests used a separate H.264-enabled FreeRDP build.
 
-For the X11 client, also check for `WITH_XCURSOR=ON`. The guest draws its
-cursor into the framebuffer, and gokvm asks the client to hide its local
-cursor. FreeRDP builds without Xcursor support ignore that request, leaving
+For the X11 client, also check for `WITH_XCURSOR=ON`. The framebuffer includes
+the guest's software cursor or the virtio-gpu hardware cursor composed by gokvm,
+and gokvm asks the client to hide its local cursor. FreeRDP builds without
+Xcursor support ignore that request, leaving
 two cursors visible; during movement they can appear separated or offset.
 
 The server logs `using OpenH264 AVC420 graphics` after negotiation. Clients

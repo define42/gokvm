@@ -1131,11 +1131,14 @@ func (m *Machine) initIOPortHandlers() {
 		return nil
 	}
 
-	m.registerIOPortHandler(0, 0x10000, funcError, funcError)     // default handler
-	m.registerIOPortHandler(0x00, 0x10, funcNone, funcNone)       // 8237 DMA controller 1
-	m.registerIOPortHandler(0xc0, 0xe0, funcNone, funcNone)       // 8237 DMA controller 2
-	m.registerIOPortHandler(0xcf9, 0xcfa, funcNone, funcOutbCF9)  // CF9
-	m.registerIOPortHandler(0x170, 0x3f8, funcInAbsent, funcNone) // Absent legacy ISA/gameport/PNP/ATA ports
+	m.registerIOPortHandler(0, 0x10000, funcError, funcError)    // default handler
+	m.registerIOPortHandler(0x00, 0x10, funcNone, funcNone)      // 8237 DMA controller 1
+	m.registerIOPortHandler(0xc0, 0xe0, funcNone, funcNone)      // 8237 DMA controller 2
+	m.registerIOPortHandler(0xcf9, 0xcfa, funcNone, funcOutbCF9) // CF9
+	// Built-in ISA drivers also probe below the ATA range (for example,
+	// advansys reads its signature at 0x121). An absent device must return
+	// all ones so probing can continue without terminating the vCPU.
+	m.registerIOPortHandler(0x120, 0x3f8, funcInAbsent, funcNone) // Absent legacy ISA/gameport/PNP/ATA ports
 	m.registerIOPortHandler(0x3c0, 0x3db, funcNone, funcNone)     // VGA
 	m.registerIOPortHandler(0x3b4, 0x3b6, funcNone, funcNone)     // VGA
 	m.registerIOPortHandler(0xcfe, 0xcff, funcNone, funcNone)     // unknown

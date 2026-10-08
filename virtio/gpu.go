@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"image"
+	"image/draw"
 	"log"
 	"sync"
 	"time"
@@ -16,7 +17,7 @@ import (
 // The driver drives two virtqueues:
 //
 //	controlq (0) : resource lifecycle and 2D blits (the commands below)
-//	cursorq  (1) : hardware cursor updates (accepted, not rendered)
+//	cursorq  (1) : hardware cursor shape and position updates
 //
 // A typical frame goes: RESOURCE_CREATE_2D to allocate a host resource,
 // RESOURCE_ATTACH_BACKING to point it at guest framebuffer pages, SET_SCANOUT
@@ -47,6 +48,7 @@ const (
 	gpuBytesPerPixel = 4
 	gpuDefaultWidth  = 1024
 	gpuDefaultHeight = 768
+	gpuCursorSize    = 64
 
 	// Wire-format struct sizes.
 	gpuCtrlHdrLen    = 24 // struct virtio_gpu_ctrl_hdr
@@ -66,6 +68,8 @@ const (
 	gpuCmdTransferToHost2D      = 0x0105
 	gpuCmdResourceAttachBacking = 0x0106
 	gpuCmdResourceDetachBacking = 0x0107
+	gpuCmdUpdateCursor          = 0x0300
+	gpuCmdMoveCursor            = 0x0301
 
 	// Responses.
 	gpuRespOKNoData             = 0x1100
@@ -109,6 +113,11 @@ type gpuResource struct {
 	backing []gpuMemEntry
 }
 
+type gpuCursor struct {
+	image *image.RGBA
+	x, y  int
+}
+
 // GPU is a modern (virtio 1.0) 2D display device.
 type GPU struct {
 	*ModernTransport
@@ -119,6 +128,8 @@ type GPU struct {
 
 	resources map[uint32]*gpuResource
 	scanout   [gpuNumScanouts]uint32
+	frame     *image.RGBA // Last presented scanout, without the hardware cursor.
+	cursor    gpuCursor
 
 	VirtQueue    [gpuNumQueues]*SplitQueue
 	LastAvailIdx [gpuNumQueues]uint16
@@ -242,8 +253,8 @@ func (g *GPU) drain() {
 // or ErrNoGPUReq / ErrVQNotInit otherwise.
 func (g *GPU) ProcessControlQueue() error { return g.process(gpuControlQueue, true) }
 
-// ProcessCursorQueue drains the cursorq. Cursor commands are accepted but not
-// rendered, and (per spec) are completed with a zero-length used entry.
+// ProcessCursorQueue drains the cursorq and composites the final cursor state
+// over the scanout. Cursor commands complete with a zero-length used entry.
 func (g *GPU) ProcessCursorQueue() error { return g.process(gpuCursorQueue, false) }
 
 func (g *GPU) process(sel int, control bool) error {
@@ -256,6 +267,7 @@ func (g *GPU) process(sel int, control bool) error {
 		return ErrNoGPUReq
 	}
 
+	cursorChanged := false
 	for g.LastAvailIdx[sel] != LoadU16(&q.Avail.Idx) {
 		head := q.Avail.Ring[g.LastAvailIdx[sel]%QueueSize]
 
@@ -265,6 +277,9 @@ func (g *GPU) process(sel int, control bool) error {
 			req, wr := g.collectChain(q, head)
 			resp := g.handleControl(req)
 			used = g.writeResponse(wr, resp)
+		} else {
+			req, _ := g.collectChain(q, head)
+			cursorChanged = g.handleCursor(req) || cursorChanged
 		}
 
 		uidx := LoadU16(&q.Used.Idx)
@@ -274,8 +289,53 @@ func (g *GPU) process(sel int, control bool) error {
 		StoreAddU16(&q.Used.Idx, 1)
 		g.LastAvailIdx[sel]++
 	}
+	if cursorChanged {
+		g.present()
+	}
 
 	return g.Interrupt()
+}
+
+// handleCursor applies struct virtio_gpu_update_cursor. MOVE ignores the
+// resource and hotspot fields; UPDATE with resource zero hides the cursor.
+func (g *GPU) handleCursor(req []byte) bool {
+	if len(req) < gpuCtrlHdrLen+32 {
+		return false
+	}
+
+	le := binary.LittleEndian
+	if le.Uint32(req[gpuCtrlHdrLen:]) >= gpuNumScanouts {
+		return false
+	}
+
+	switch le.Uint32(req) {
+	case gpuCmdUpdateCursor:
+		resourceID := le.Uint32(req[gpuCtrlHdrLen+16:])
+		if resourceID == 0 {
+			g.cursor.image = nil
+		} else {
+			res := g.resources[resourceID]
+			hotX := le.Uint32(req[gpuCtrlHdrLen+20:])
+			hotY := le.Uint32(req[gpuCtrlHdrLen+24:])
+			if res == nil || res.width != gpuCursorSize || res.height != gpuCursorSize ||
+				hotX >= gpuCursorSize || hotY >= gpuCursorSize {
+				return false
+			}
+
+			// Snapshot the transferred resource: later transfers or unrefs do
+			// not alter the cursor until another UPDATE command arrives.
+			g.cursor.image = resourceImage(res, true)
+		}
+	case gpuCmdMoveCursor:
+	default:
+		return false
+	}
+
+	// Linux sends signed CRTC coordinates in these little-endian fields.
+	g.cursor.x = int(int32(le.Uint32(req[gpuCtrlHdrLen+4:])))
+	g.cursor.y = int(int32(le.Uint32(req[gpuCtrlHdrLen+8:])))
+
+	return true
 }
 
 // writableSeg is a device-writable descriptor segment (response buffer).
@@ -494,7 +554,9 @@ func (g *GPU) cmdResourceFlush(req []byte) []byte {
 		return g.respNoData(gpuRespErrInvalidResourceID)
 	}
 
-	g.flush(res)
+	if g.scanout[0] == resourceID {
+		g.flush(res)
+	}
 
 	return g.respNoData(gpuRespOKNoData)
 }
@@ -652,7 +714,45 @@ func (g *GPU) flush(res *gpuResource) {
 		return
 	}
 
+	g.frame = resourceImage(res, false)
+	g.present()
+}
+
+// present uses the last flushed scanout, so cursor movement never publishes
+// unflushed transfers or leaves pixels behind at the cursor's old position.
+func (g *GPU) present() {
+	if g.display == nil || g.frame == nil || g.scanout[0] == 0 {
+		return
+	}
+
+	img := g.frame
+	if cursor := g.cursor.image; cursor != nil {
+		// The guest supplies the cursor image's top-left CRTC position;
+		// Xorg has already subtracted the hotspot from the pointer position.
+		position := image.Pt(g.cursor.x, g.cursor.y)
+		rect := cursor.Bounds().Add(position)
+		if rect.Overlaps(img.Bounds()) {
+			img = image.NewRGBA(g.frame.Bounds())
+			copy(img.Pix, g.frame.Pix)
+			// DRM cursor pixels use premultiplied alpha, matching image.RGBA.
+			draw.Draw(img, rect, cursor, image.Point{}, draw.Over)
+		}
+	}
+
+	if err := g.display.Flush(img.Bounds().Dx(), img.Bounds().Dy(), img); err != nil {
+		log.Printf("virtio-gpu: display flush: %v", err)
+	}
+}
+
+func resourceImage(res *gpuResource, cursor bool) *image.RGBA {
 	rOff, gOff, bOff, aOff, hasAlpha := formatOffsets(res.format)
+	if cursor && !hasAlpha {
+		// Linux creates dumb buffers as XRGB even when they hold an ARGB
+		// cursor. Preserve the unused channel as alpha for cursor images,
+		// matching QEMU's raw cursor-resource copy.
+		aOff = 6 - rOff - gOff - bOff
+		hasAlpha = true
+	}
 	img := image.NewRGBA(image.Rect(0, 0, int(res.width), int(res.height)))
 
 	pixels := int(res.width) * int(res.height)
@@ -674,9 +774,7 @@ func (g *GPU) flush(res *gpuResource) {
 		}
 	}
 
-	if err := g.display.Flush(int(res.width), int(res.height), img); err != nil {
-		log.Printf("virtio-gpu: display flush: %v", err)
-	}
+	return img
 }
 
 // formatOffsets returns the byte position of each channel within a 4-byte
