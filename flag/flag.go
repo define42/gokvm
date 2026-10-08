@@ -14,6 +14,8 @@ var ErrRDPOptions = errors.New("RDP certificate and key must be provided togethe
 
 var ErrRDPH264 = errors.New("-rdp-h264 requires -rdp")
 
+var ErrNetwork = errors.New("-net must be 'user' or 'none' and cannot be combined with -t")
+
 type BootArgs struct {
 	Kernel     string
 	MemSize    int
@@ -24,6 +26,7 @@ type BootArgs struct {
 	Params     string
 	ParamsSet  bool
 	TapIfName  string
+	Network    string
 	Disk       string
 	GPU        string
 	VNC        string
@@ -54,6 +57,8 @@ func parseBootArgs(args []string) (*BootArgs, error) {
 		"kernel command-line parameters")
 	bootCmd.StringVar(&c.TapIfName, "t", "", `name of tap interface. `+
 		`If the string is an empty, no tap intarface is created. (default"")`)
+	bootCmd.StringVar(&c.Network, "net", "", "network backend: user (built-in DHCP/DNS and outbound access) "+
+		"or none (default); mutually exclusive with -t")
 	bootCmd.StringVar(&c.Disk, "d", "", "path of disk file (for /dev/vda)")
 	bootCmd.StringVar(&c.GPU, "g", "", `path to write the virtio-gpu framebuffer as PNG. `+
 		`If empty, no virtio-gpu device is created. (default "")`)
@@ -83,6 +88,10 @@ func parseBootArgs(args []string) (*BootArgs, error) {
 	}
 	if c.RDPH264 && c.RDP == "" {
 		return nil, ErrRDPH264
+	}
+	if (c.Network != "" && c.Network != "none" && c.Network != "user") ||
+		(c.Network != "" && c.TapIfName != "") {
+		return nil, ErrNetwork
 	}
 	bootCmd.Visit(func(f *flag.Flag) {
 		if f.Name == "p" {

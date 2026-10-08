@@ -18,6 +18,7 @@ import (
 
 	"github.com/bobuhiro11/gokvm/bootparam"
 	"github.com/bobuhiro11/gokvm/ebda"
+	"github.com/bobuhiro11/gokvm/internal/usernet"
 	"github.com/bobuhiro11/gokvm/iodev"
 	"github.com/bobuhiro11/gokvm/kvm"
 	"github.com/bobuhiro11/gokvm/pci"
@@ -239,13 +240,29 @@ func (m *Machine) AddTapIf(tapIfName string) error {
 		return err
 	}
 
-	v := virtio.NewNet(virtioNetIRQ, m, t, m.mem)
+	m.addNetwork(t)
+
+	return nil
+}
+
+// AddUserNet attaches an unprivileged Ethernet backend with DHCP, DNS, and
+// outbound connections through the host's ordinary TCP/UDP sockets.
+func (m *Machine) AddUserNet() error {
+	network, err := usernet.New()
+	if err != nil {
+		return fmt.Errorf("user-mode network: %w", err)
+	}
+	m.addNetwork(network)
+
+	return nil
+}
+
+func (m *Machine) addNetwork(backend io.ReadWriter) {
+	v := virtio.NewNet(virtioNetIRQ, m, backend, m.mem)
 	go v.TxThreadEntry()
 	go v.RxThreadEntry()
 	// 00:01.0 for Virtio net
 	m.pci.Devices = append(m.pci.Devices, v)
-
-	return nil
 }
 
 func (m *Machine) AddDisk(diskPath string) error {

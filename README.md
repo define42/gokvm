@@ -19,6 +19,7 @@ The latest version supports the following features:
 - [x] VNC server for virtio-gpu with keyboard and mouse input (`-vnc`)
 - [x] Built-in TLS RDP console with keyboard and mouse input (`-rdp`)
 - [x] Optional OpenH264 AVC420 compression for RDP (`-rdp-h264`)
+- [x] Built-in user-mode networking with DHCP, DNS, and outbound TCP/UDP (`-net user`)
 - [x] PVH Boot Protocol
 - [x] ISO boot via the El Torito boot catalog (no SeaBIOS/UEFI firmware required)
 
@@ -69,6 +70,38 @@ The Slackware-based Slax image with Linux 6.1.38 has been tested through to the
 desktop. Keep the ISO's default boot parameters; no extracted kernel, custom
 initrd, or driver blacklist is needed. For AVC420, build with the `openh264` tag
 and add `-rdp-h264` as described below.
+
+### Networking
+
+Add `-net user` for networking inside the gokvm process. It needs no TAP device,
+root privileges, host firewall rules, or helper daemon:
+
+```bash
+./gokvm boot -iso ./slax.iso -m 1G -net user \
+  -rdp 127.0.0.1:3390 -rdp-h264
+```
+
+Omit `-rdp-h264` when using the standard build. Slax requests an address
+automatically: the first guest receives `10.0.2.15/24`, with gateway and DNS
+server `10.0.2.2`. DNS uses the host's configured resolvers. Guest TCP/UDP
+connections to `10.0.2.2` reach host loopback services, except the built-in DNS
+and DHCP ports.
+
+This backend supports outbound IPv4 TCP/UDP. Incoming port forwarding and IPv6
+are not implemented. External ICMP/ping is not forwarded; check connectivity
+with a web browser or `wget https://github.com` in the guest. The network stack
+is built in Go and works with `CGO_ENABLED=0`; only optional OpenH264 requires cgo.
+
+The tested Slax image lacks its default CA certificate bundle. If its HTTPS
+tools report certificate errors, run these commands inside Slax, then retry:
+
+```bash
+update-ca-certificates
+ln -s certs/ca-certificates.crt /etc/ssl/cert.pem
+```
+
+Networking remains disabled by default (`-net none`). The existing `-t tap0`
+option attaches a host-managed TAP interface; it cannot be combined with `-net`.
 
 ### RDP console
 

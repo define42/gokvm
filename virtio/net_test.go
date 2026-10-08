@@ -2,8 +2,11 @@ package virtio_test
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -131,6 +134,7 @@ func TestRx(t *testing.T) {
 	q.Avail.Idx = 1
 	q.Desc[0].Addr = 0x100
 	q.Desc[0].Len = 0x200
+	q.Desc[0].Flags = 0x2 // VRING_DESC_F_WRITE
 	v.VirtQueue[0] = q
 
 	// Size of struct virtio_net_hdr_v1.
@@ -182,7 +186,7 @@ func TestNetNotifyTxKick(t *testing.T) {
 	}
 }
 
-func TestNetNotifyRxDropped(t *testing.T) {
+func TestNetNotifyRxDoesNotTransmit(t *testing.T) {
 	t.Parallel()
 
 	tap := &mockTapCloser{}
@@ -200,8 +204,7 @@ func TestNetNotifyRxDropped(t *testing.T) {
 		v.TxThreadEntry()
 	}()
 
-	// Notifying the RX queue must be silently dropped, never reaching the
-	// TX path.
+	// Notifying the RX queue must never reach the TX path.
 	v.Notify(0) // RX
 
 	time.Sleep(50 * time.Millisecond)
@@ -218,10 +221,12 @@ func TestNetNotifyRxDropped(t *testing.T) {
 type mockTapCloser struct {
 	bytes.Buffer
 	closed bool
+	closes int
 }
 
 func (m *mockTapCloser) Close() error {
 	m.closed = true
+	m.closes++
 
 	return nil
 }
@@ -238,6 +243,12 @@ func TestNetClose(t *testing.T) {
 
 	if !tap.closed {
 		t.Fatal("tap was not closed")
+	}
+	if err := v.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if tap.closes != 1 {
+		t.Fatalf("backend closed %d times; want once", tap.closes)
 	}
 }
 
@@ -340,5 +351,209 @@ func TestNetConcurrentCloseAndNotify(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("concurrent Close+Notify deadlocked")
+	}
+}
+
+// packetBackend models an Ethernet backend whose reads never block and whose
+// readiness notification may be coalesced for multiple queued packets.
+type packetBackend struct {
+	packets chan []byte
+	ready   chan struct{}
+	reads   atomic.Int32
+	closes  atomic.Int32
+}
+
+func newPacketBackend() *packetBackend {
+	return &packetBackend{packets: make(chan []byte, 4), ready: make(chan struct{}, 1)}
+}
+
+func (b *packetBackend) Ready() <-chan struct{} { return b.ready }
+
+func (b *packetBackend) Read(p []byte) (int, error) {
+	b.reads.Add(1)
+	select {
+	case packet := <-b.packets:
+		return copy(p, packet), nil
+	default:
+		return 0, syscall.EAGAIN
+	}
+}
+
+func (b *packetBackend) Write(p []byte) (int, error) { return len(p), nil }
+
+func (b *packetBackend) Close() error {
+	b.closes.Add(1)
+
+	return nil
+}
+
+type netIRQNotifier struct {
+	mockInjector
+	interrupts chan struct{}
+}
+
+func (n *netIRQNotifier) InjectVirtioNetIRQ() error {
+	n.interrupts <- struct{}{}
+
+	return nil
+}
+
+func awaitNetEvent(t *testing.T, event <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-event:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for network worker")
+	}
+}
+
+func startNetRX(t *testing.T, v *virtio.Net) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		v.RxThreadEntry()
+	}()
+	t.Cleanup(func() {
+		if err := v.Close(); err != nil {
+			t.Error(err)
+		}
+		awaitNetEvent(t, done)
+	})
+}
+
+func TestNetBackendReadyDrainsPackets(t *testing.T) {
+	t.Parallel()
+	b := newPacketBackend()
+	irq := &netIRQNotifier{interrupts: make(chan struct{}, 4)}
+	mem := make([]byte, 4096)
+	v := virtio.NewNet(9, irq, b, mem)
+	q := newSplitQueue()
+	q.Desc[0] = virtio.SplitDesc{Addr: 0x100, Len: 0x100, Flags: 2}
+	q.Desc[1] = virtio.SplitDesc{Addr: 0x200, Len: 0x100, Flags: 2}
+	q.Avail.Ring[1] = 1
+	q.Avail.Idx = 2
+	v.VirtQueue[0] = q
+	startNetRX(t, v)
+
+	b.packets <- []byte{0xaa}
+	b.packets <- []byte{0xbb}
+	b.ready <- struct{}{} // one readiness event must drain both packets
+	awaitNetEvent(t, irq.interrupts)
+	awaitNetEvent(t, irq.interrupts)
+
+	if mem[0x100+12] != 0xaa || mem[0x200+12] != 0xbb {
+		t.Fatalf("received payloads %#x/%#x; want 0xaa/0xbb", mem[0x100+12], mem[0x200+12])
+	}
+	if got := b.reads.Load(); got != 2 {
+		t.Fatalf("read backend %d times; want 2 (no read without a guest buffer)", got)
+	}
+}
+
+func TestNetRXBuffersPreservePendingPacket(t *testing.T) {
+	t.Parallel()
+	b := newPacketBackend()
+	irq := &netIRQNotifier{interrupts: make(chan struct{}, 4)}
+	mem := make([]byte, 4096)
+	v := virtio.NewNet(9, irq, b, mem)
+	t.Cleanup(func() { _ = v.Close() })
+	b.packets <- []byte{0xaa, 0xbb}
+	if err := v.Rx(); !errors.Is(err, virtio.ErrVQNotInit) {
+		t.Fatalf("Rx before queue setup: %v", err)
+	}
+	q := newSplitQueue()
+	v.VirtQueue[0] = q
+	if err := v.Rx(); !errors.Is(err, virtio.ErrNoRxBuf) {
+		t.Fatalf("Rx without guest buffers: %v", err)
+	}
+	if got := b.reads.Load(); got != 0 {
+		t.Fatalf("read backend %d times without a guest buffer", got)
+	}
+
+	q.Desc[0] = virtio.SplitDesc{Addr: 0x100, Len: 0x100, Flags: 2}
+	q.Avail.Idx = 1
+	startNetRX(t, v)
+	v.Notify(0) // the backend sends no new readiness event for this packet
+	awaitNetEvent(t, irq.interrupts)
+	if !bytes.Equal(mem[0x100+12:0x100+14], []byte{0xaa, 0xbb}) {
+		t.Fatal("RX queue notification did not deliver the pending packet")
+	}
+}
+
+func TestNetRXDescriptorChain(t *testing.T) {
+	t.Parallel()
+	payload := []byte{0xaa, 0xbb, 0xcc, 0xdd}
+	mem := make([]byte, 4096)
+	v := virtio.NewNet(9, &mockInjector{}, bytes.NewBuffer(payload), mem)
+	t.Cleanup(func() { _ = v.Close() })
+	q := newSplitQueue()
+	q.Desc[3] = virtio.SplitDesc{Addr: 0x100, Len: 13, Flags: 3, Next: 7}
+	q.Desc[7] = virtio.SplitDesc{Addr: 0x200, Len: 100, Flags: 2}
+	q.Avail.Ring[0] = 3
+	q.Avail.Idx = 1
+	v.VirtQueue[0] = q
+	original := *q.Desc
+	if err := v.Rx(); err != nil {
+		t.Fatal(err)
+	}
+	got := append([]byte{mem[0x100+12]}, mem[0x200:0x203]...)
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("descriptor chain payload: %x; want %x", got, payload)
+	}
+	if *q.Desc != original {
+		t.Fatal("RX changed guest descriptor metadata")
+	}
+	if q.Used.Idx != 1 || q.Used.Ring[0].ID != 3 || q.Used.Ring[0].Len != 16 || v.LastAvailIdx[0] != 1 {
+		t.Fatalf("incorrect completion: used=%+v, consumed=%d", q.Used.Ring[0], v.LastAvailIdx[0])
+	}
+}
+
+func TestNetRXShortBufferDoesNotMergePackets(t *testing.T) {
+	t.Parallel()
+	mem := bytes.Repeat([]byte{0xff}, 4096)
+	v := virtio.NewNet(9, &mockInjector{}, bytes.NewBuffer([]byte{0xaa, 0xbb}), mem)
+	t.Cleanup(func() { _ = v.Close() })
+	q := newSplitQueue()
+	q.Desc[0] = virtio.SplitDesc{Addr: 0x100, Len: 13, Flags: 2}
+	q.Desc[1] = virtio.SplitDesc{Addr: 0x200, Len: 100, Flags: 2}
+	q.Avail.Ring[1] = 1
+	q.Avail.Idx = 2
+	v.VirtQueue[0] = q
+	if err := v.Rx(); err != nil {
+		t.Fatal(err)
+	}
+	if v.LastAvailIdx[0] != 1 || q.Used.Idx != 1 || q.Used.Ring[0].Len != 0 {
+		t.Fatalf("short chain consumed another buffer: consumed=%d, used=%+v", v.LastAvailIdx[0], q.Used.Ring[0])
+	}
+	if mem[0x200] != 0xff {
+		t.Fatal("RX wrote an unrelated available buffer")
+	}
+}
+
+func TestNetRXRejectsInvalidDescriptors(t *testing.T) {
+	t.Parallel()
+	for name, desc := range map[string]virtio.SplitDesc{
+		"read only":    {Addr: 0x100, Len: 100},
+		"outside RAM":  {Addr: 0xfff, Len: 100, Flags: 2},
+		"address wrap": {Addr: ^uint64(0), Len: 100, Flags: 2},
+		"loop":         {Addr: 0x100, Len: 100, Flags: 3, Next: 0},
+		"bad next":     {Addr: 0x100, Len: 100, Flags: 3, Next: virtio.QueueSize},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			b := newPacketBackend()
+			v := virtio.NewNet(9, &mockInjector{}, b, make([]byte, 4096))
+			t.Cleanup(func() { _ = v.Close() })
+			q := newSplitQueue()
+			q.Desc[0] = desc
+			q.Avail.Idx = 1
+			v.VirtQueue[0] = q
+			if err := v.Rx(); !errors.Is(err, virtio.ErrNetDesc) {
+				t.Fatalf("Rx: %v; want invalid descriptor error", err)
+			}
+			if b.reads.Load() != 0 || q.Used.Idx != 0 {
+				t.Fatal("invalid descriptor consumed a packet")
+			}
+		})
 	}
 }

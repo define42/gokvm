@@ -24,6 +24,7 @@ func main() {
 			Params:     bootArgs.Params,
 			ParamsSet:  bootArgs.ParamsSet,
 			TapIfName:  bootArgs.TapIfName,
+			Network:    bootArgs.Network,
 			Disk:       bootArgs.Disk,
 			GPU:        bootArgs.GPU,
 			VNC:        bootArgs.VNC,

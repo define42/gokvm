@@ -19,6 +19,7 @@ var (
 	ErrNoRxPacket  = errors.New("no packet for rx")
 	ErrVQNotInit   = errors.New("vq not initialized")
 	ErrNoRxBuf     = errors.New("no buffer found for rx")
+	ErrNetDesc     = errors.New("invalid virtio-net descriptor chain")
 )
 
 const (
@@ -53,8 +54,13 @@ type Net struct {
 
 	txKick    chan interface{}
 	rxKick    chan os.Signal
+	rxNotify  chan struct{}
+	rxReady   <-chan struct{}
 	done      chan struct{}
 	closeOnce sync.Once
+	closeErr  error
+	queueMu   [netNumQueues]sync.Mutex
+	rxPacket  [netHdrLen + 65536]byte
 
 	irq         uint8
 	IRQInjector IRQInjector
@@ -110,13 +116,21 @@ func (v *Net) QueueReady(idx int, q *SplitQueue) {
 		return
 	}
 
+	v.queueMu[idx].Lock()
 	v.VirtQueue[idx] = q
+	v.queueMu[idx].Unlock()
+	v.Notify(idx)
 }
 
 func (v *Net) Notify(idx int) {
 	switch idx {
 	case netRxQueue:
-		// RX queue kick: silently drop. RX is driven by SIGIO.
+		// The backend may already hold packets from when the guest ran out
+		// of receive buffers. Retry when the guest replenishes the queue.
+		select {
+		case v.rxNotify <- struct{}{}:
+		default:
+		}
 	case netTxQueue:
 		// TX queue kick: non-blocking send.
 		select {
@@ -130,6 +144,7 @@ func (v *Net) Notify(idx int) {
 
 func (v *Net) RxThreadEntry() {
 	log.Println("virtio-net: RxThreadEntry started")
+	ready := v.rxReady
 
 	for {
 		select {
@@ -139,29 +154,27 @@ func (v *Net) RxThreadEntry() {
 
 			return
 		case <-v.rxKick:
-			for v.Rx() == nil {
+		case <-v.rxNotify:
+		case _, ok := <-ready:
+			if !ok {
+				ready = nil
 			}
+		}
+		for v.Rx() == nil {
 		}
 	}
 }
 
 func (v *Net) Rx() error {
-	// read raw packet from tap device
-	packet := make([]byte, 4096)
-
-	n, err := v.tap.Read(packet)
-	if err != nil {
-		return ErrNoRxPacket
-	}
-
-	// Prepend struct virtio_net_hdr_v1. With VIRTIO_NET_F_MRG_RXBUF not
-	// negotiated, num_buffers (bytes 10:12) must be 1.
-	frame := make([]byte, netHdrLen+n)
-	frame[10] = 1
-	copy(frame[netHdrLen:], packet[:n])
-	packet = frame
-
 	const sel = netRxQueue
+	v.queueMu[sel].Lock()
+	defer v.queueMu[sel].Unlock()
+
+	select {
+	case <-v.done:
+		return ErrNoRxPacket
+	default:
+	}
 
 	q := v.VirtQueue[sel]
 	if q == nil {
@@ -175,52 +188,66 @@ func (v *Net) Rx() error {
 		return ErrNoRxBuf
 	}
 
-	const NONE = uint16(256)
-	headDescID := NONE
-	prevDescID := NONE
-	uidx := LoadU16(&used.Idx)
-
-	for len(packet) > 0 {
-		descID := avail.Ring[v.LastAvailIdx[sel]%QueueSize]
-
-		// head of vring chain
-		if headDescID == NONE {
-			headDescID = descID
-
-			// This structure is holding both the
-			// index of the descriptor chain and the
-			// number of bytes that were written to
-			// memory as part of serving the request.
-			used.Ring[uidx%QueueSize].ID = uint32(headDescID)
-			used.Ring[uidx%QueueSize].Len = 0
-		}
-
-		desc := &q.Desc[descID]
-		l := uint32(len(packet))
-
-		if l > desc.Len {
-			l = desc.Len
-		}
-
-		copy(v.Mem[desc.Addr:desc.Addr+uint64(l)], packet[:l])
-
-		packet = packet[l:]
-		desc.Len = l
-
-		used.Ring[uidx%QueueSize].Len += l
-
-		if prevDescID != NONE {
-			q.Desc[prevDescID].Flags |= descFNext
-			q.Desc[prevDescID].Next = descID
-		}
-
-		prevDescID = descID
-		v.LastAvailIdx[sel]++
+	head := avail.Ring[v.LastAvailIdx[sel]%QueueSize]
+	buffers, capacity, err := v.rxBuffers(q, head)
+	if err != nil {
+		return err
 	}
 
+	// Read only after the guest posts a buffer: taking a packet earlier
+	// would drop DHCP/DNS replies while the receive queue is empty.
+	packet := v.rxPacket[:]
+	n, err := v.tap.Read(packet[netHdrLen:])
+	if err != nil || n == 0 {
+		return ErrNoRxPacket
+	}
+	packet = packet[:netHdrLen+n]
+	packet[10] = 1 // virtio_net_hdr_v1.num_buffers
+
+	uidx := LoadU16(&used.Idx)
+	used.Ring[uidx%QueueSize] = SplitUsedElem{ID: uint32(head)}
+	if len(packet) <= capacity {
+		used.Ring[uidx%QueueSize].Len = uint32(len(packet))
+		for _, buf := range buffers {
+			copied := copy(buf, packet)
+			packet = packet[copied:]
+			if len(packet) == 0 {
+				break
+			}
+		}
+	}
+
+	// MRG_RXBUF is not advertised: each available chain is one packet.
+	// Drop oversized packets without borrowing another available buffer
+	// or changing the descriptors owned by the guest.
+	v.LastAvailIdx[sel]++
 	StoreAddU16(&used.Idx, 1)
 
 	return v.Interrupt()
+}
+
+func (v *Net) rxBuffers(q *SplitQueue, head uint16) ([][]byte, int, error) {
+	var buffers [][]byte
+	capacity := 0
+	descID := head
+	for range QueueSize {
+		if descID >= QueueSize {
+			return nil, 0, ErrNetDesc
+		}
+		desc := q.Desc[descID]
+		if desc.Flags&descFWrite == 0 || desc.Addr > uint64(len(v.Mem)) ||
+			uint64(desc.Len) > uint64(len(v.Mem))-desc.Addr {
+			return nil, 0, ErrNetDesc
+		}
+		buffers = append(buffers, v.Mem[desc.Addr:desc.Addr+uint64(desc.Len)])
+		capacity += int(desc.Len)
+		if desc.Flags&descFNext == 0 {
+			return buffers, capacity, nil
+		}
+		descID = desc.Next
+	}
+
+	return nil, 0, ErrNetDesc
 }
 
 func (v *Net) TxThreadEntry() {
@@ -252,6 +279,14 @@ func (v *Net) TxThreadEntry() {
 
 func (v *Net) Tx() error {
 	const sel = netTxQueue
+	v.queueMu[sel].Lock()
+	defer v.queueMu[sel].Unlock()
+
+	select {
+	case <-v.done:
+		return ErrNoTxPacket
+	default:
+	}
 
 	q := v.VirtQueue[sel]
 	if q == nil {
@@ -316,16 +351,16 @@ func (v *Net) IOPort() uint64 { return 0 }
 func (v *Net) Size() uint64 { return 0 }
 
 func (v *Net) Close() error {
-	log.Println("virtio-net: Close called")
-	signal.Stop(v.rxKick)
+	v.closeOnce.Do(func() {
+		log.Println("virtio-net: Close called")
+		signal.Stop(v.rxKick)
+		close(v.done)
+		if c, ok := v.tap.(io.Closer); ok {
+			v.closeErr = c.Close()
+		}
+	})
 
-	v.closeOnce.Do(func() { close(v.done) })
-
-	if c, ok := v.tap.(io.Closer); ok {
-		return c.Close()
-	}
-
-	return nil
+	return v.closeErr
 }
 
 func NewNet(irq uint8, irqInjector IRQInjector, tap io.ReadWriter, mem []byte) *Net {
@@ -334,6 +369,7 @@ func NewNet(irq uint8, irqInjector IRQInjector, tap io.ReadWriter, mem []byte) *
 		IRQInjector: irqInjector,
 		txKick:      make(chan interface{}, QueueSize),
 		rxKick:      make(chan os.Signal, 1),
+		rxNotify:    make(chan struct{}, 1),
 		done:        make(chan struct{}),
 		tap:         tap,
 	}
@@ -342,7 +378,13 @@ func NewNet(irq uint8, irqInjector IRQInjector, tap io.ReadWriter, mem []byte) *
 		return irqInjector.InjectVirtioNetIRQ()
 	})
 
-	signal.Notify(res.rxKick, syscall.SIGIO)
+	// Userspace backends signal readiness directly. TAP continues to use
+	// SIGIO and its nonblocking file descriptor.
+	if backend, ok := tap.(interface{ Ready() <-chan struct{} }); ok {
+		res.rxReady = backend.Ready()
+	} else {
+		signal.Notify(res.rxKick, syscall.SIGIO)
+	}
 
 	return res
 }

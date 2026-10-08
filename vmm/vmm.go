@@ -25,6 +25,8 @@ import (
 
 var errDownloadISO = errors.New("download ISO failed")
 
+var errNetworkConfig = errors.New("network must be 'user' or 'none' and cannot be combined with a TAP interface")
+
 // These parameters describe gaps in gokvm's direct Linux boot environment, not
 // ISO-specific policy. The ISO's own boot config still supplies the distro
 // command line; this list only adds the host/VMM plumbing that a real firmware
@@ -44,6 +46,7 @@ type Config struct {
 	Params     string
 	ParamsSet  bool
 	TapIfName  string
+	Network    string
 	Disk       string
 	GPU        string
 	VNC        string
@@ -77,6 +80,11 @@ func New(c Config) *VMM {
 
 // Init instantiates a machine.
 func (v *VMM) Init() (initErr error) {
+	if (v.Network != "" && v.Network != "none" && v.Network != "user") ||
+		(v.Network != "" && v.TapIfName != "") {
+		return errNetworkConfig
+	}
+
 	m, err := machine.New(v.Dev, v.NCPUs, v.MemSize)
 	if err != nil {
 		return err
@@ -91,6 +99,12 @@ func (v *VMM) Init() (initErr error) {
 		if err := m.AddTapIf(v.TapIfName); err != nil {
 			return err
 		}
+	}
+	if v.Network == "user" {
+		if err := m.AddUserNet(); err != nil {
+			return err
+		}
+		log.Print("User-mode network: DHCP 10.0.2.15, gateway/DNS 10.0.2.2")
 	}
 
 	if len(v.Disk) > 0 {
