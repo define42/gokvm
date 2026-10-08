@@ -40,7 +40,10 @@ func (d *mockDisplay) Flush(width, height int, img *image.RGBA) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	d.width, d.height, d.img = width, height, img
+	d.width, d.height = width, height
+	// Flush only lends the pixels for this call; retain an owned snapshot.
+	d.img = image.NewRGBA(img.Bounds())
+	copy(d.img.Pix, img.Pix)
 	d.flushes++
 
 	return nil

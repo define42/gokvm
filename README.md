@@ -63,7 +63,7 @@ to the guest. Try it with `make tinycore`, which builds gokvm and boots
 Slax can boot directly from its ISO with its normal graphical startup:
 
 ```bash
-./gokvm boot -iso ./slax.iso -m 1G -rdp 127.0.0.1:3390
+./gokvm boot -iso ./slax.iso -m 2G -rdp 127.0.0.1:3390
 ```
 
 The Slackware-based Slax image with Linux 6.1.38 has been tested through to the
@@ -77,9 +77,14 @@ Add `-net user` for networking inside the gokvm process. It needs no TAP device,
 root privileges, host firewall rules, or helper daemon:
 
 ```bash
-./gokvm boot -iso ./slax.iso -m 1G -net user \
+./gokvm boot -iso ./slax.iso -m 2G -net user \
   -rdp 127.0.0.1:3390 -rdp-h264
 ```
+
+Use at least 2 GB for browser workloads. A 1 GB Slax guest can reach the desktop,
+but complex websites can fill both RAM and Slax's compressed swap, making the
+whole desktop unresponsive while RDP remains connected. Check `free -m` and
+`vmstat 1` inside the guest when this happens; additional tabs may need more RAM.
 
 Omit `-rdp-h264` when using the standard build. Slax requests an address
 automatically: the first guest receives `10.0.2.15/24`, with gateway and DNS
@@ -188,6 +193,12 @@ to 60 fps. Frame notifications avoid waiting for a separate polling cycle,
 and slow clients receive the latest available frame when they are ready.
 Actual frame rate depends on guest rendering, host CPU, and client decoding.
 Bitmap RDP remains capped at 30 fps.
+
+Virtio-gpu currently provides a 2D framebuffer without guest 3D acceleration.
+Complex browser pages can therefore be limited by software rendering inside
+the guest even when AVC420 is active. For choppy scrolling, first check the
+server's `using OpenH264 AVC420 graphics` message to confirm the session is
+using the faster graphics path.
 
 Run the protocol, input, framebuffer, and listener tests without booting a VM:
 

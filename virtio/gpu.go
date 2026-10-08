@@ -129,6 +129,7 @@ type GPU struct {
 	resources map[uint32]*gpuResource
 	scanout   [gpuNumScanouts]uint32
 	frame     *image.RGBA // Last presented scanout, without the hardware cursor.
+	composite *image.RGBA // Reusable cursor composition, borrowed only during Flush.
 	cursor    gpuCursor
 
 	VirtQueue    [gpuNumQueues]*SplitQueue
@@ -593,9 +594,9 @@ func (g *GPU) transferToHost2D(res *gpuResource, x, y, w, h uint32, offset uint6
 	bpp := uint32(gpuBytesPerPixel)
 	stride := res.width * bpp
 
-	// Full-frame fast path: a single contiguous copy.
+	// Full-width rows are contiguous in the backing store.
 	if offset == 0 && x == 0 && y == 0 && w == res.width {
-		total := int(stride) * int(res.height)
+		total := int(stride) * int(min(h, res.height))
 		if total > len(res.data) {
 			total = len(res.data)
 		}
@@ -714,7 +715,7 @@ func (g *GPU) flush(res *gpuResource) {
 		return
 	}
 
-	g.frame = resourceImage(res, false)
+	g.frame = resourceImageInto(res, false, g.frame)
 	g.present()
 }
 
@@ -732,7 +733,10 @@ func (g *GPU) present() {
 		position := image.Pt(g.cursor.x, g.cursor.y)
 		rect := cursor.Bounds().Add(position)
 		if rect.Overlaps(img.Bounds()) {
-			img = image.NewRGBA(g.frame.Bounds())
+			if g.composite == nil || g.composite.Bounds() != g.frame.Bounds() {
+				g.composite = image.NewRGBA(g.frame.Bounds())
+			}
+			img = g.composite
 			copy(img.Pix, g.frame.Pix)
 			// DRM cursor pixels use premultiplied alpha, matching image.RGBA.
 			draw.Draw(img, rect, cursor, image.Point{}, draw.Over)
@@ -745,6 +749,13 @@ func (g *GPU) present() {
 }
 
 func resourceImage(res *gpuResource, cursor bool) *image.RGBA {
+	return resourceImageInto(res, cursor, nil)
+}
+
+// resourceImageInto reuses the GPU's private scanout storage. Display.Flush
+// borrows this storage only until it returns; remote displays publish their
+// own immutable copies. Cursor UPDATE still takes a separate shape snapshot.
+func resourceImageInto(res *gpuResource, cursor bool, img *image.RGBA) *image.RGBA {
 	rOff, gOff, bOff, aOff, hasAlpha := formatOffsets(res.format)
 	if cursor && !hasAlpha {
 		// Linux creates dumb buffers as XRGB even when they hold an ARGB
@@ -753,7 +764,27 @@ func resourceImage(res *gpuResource, cursor bool) *image.RGBA {
 		aOff = 6 - rOff - gOff - bOff
 		hasAlpha = true
 	}
-	img := image.NewRGBA(image.Rect(0, 0, int(res.width), int(res.height)))
+	bounds := image.Rect(0, 0, int(res.width), int(res.height))
+	if img == nil || img.Bounds() != bounds {
+		img = image.NewRGBA(bounds)
+	}
+
+	// Linux scanouts normally use BGRX. Converting complete words avoids
+	// four dynamically indexed channel reads and per-channel bounds checks.
+	if rOff == 2 && gOff == 1 && bOff == 0 {
+		alpha := uint32(0)
+		if !hasAlpha {
+			alpha = 0xff000000
+		}
+		pixels := min(len(img.Pix), len(res.data)) &^ 3
+		for i := 0; i < pixels; i += 4 {
+			pixel := binary.LittleEndian.Uint32(res.data[i:])
+			rgba := pixel&0xff00ff00 | (pixel>>16)&0xff | (pixel&0xff)<<16 | alpha
+			binary.LittleEndian.PutUint32(img.Pix[i:], rgba)
+		}
+
+		return img
+	}
 
 	pixels := int(res.width) * int(res.height)
 	for i := 0; i < pixels; i++ {
