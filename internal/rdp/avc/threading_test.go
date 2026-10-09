@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	openh264 "github.com/define42/gokvm/pkg/h264"
+	"github.com/define42/gokvm/pkg/h264/api"
 )
 
 //nolint:paralleltest,tparallel // Sequential subtests bound codec reference-picture memory.
@@ -25,6 +26,143 @@ func TestOpenH264SlicesRoundTrip(t *testing.T) {
 			decodeSlicedFrames(t, threads, frames)
 		})
 	}
+}
+
+func TestOpenH264ProductionPolicy(t *testing.T) {
+	encoder, err := NewEncoderWithOptions(320, 240, Options{Threads: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer encoder.Close()
+
+	codec, ok := encoder.codec.(*openH264Encoder)
+	if !ok {
+		t.Fatalf("codec type = %T", encoder.codec)
+	}
+	var effective api.SEncParamExt
+	if rv := codec.codec.Raw().GetOption(api.ENCODER_OPTION_SVC_ENCODE_PARAM_EXT, &effective); rv != 0 {
+		t.Fatalf("GetOption returned %d", rv)
+	}
+	if got, want := effective.IMultipleThreadIdc, uint16(encoder.Threads()); got != want {
+		t.Fatalf("codec workers = %d, slices = %d", got, want)
+	}
+	if got := effective.UiIntraPeriod; got != codecIntraPeriod {
+		t.Fatalf("codec intra period = %d, want %d", got, codecIntraPeriod)
+	}
+	if got := effective.ILoopFilterDisableIdc; got != codecLoopFilterDisableIDC {
+		t.Fatalf("codec loop-filter disable IDC = %d, want %d", got, codecLoopFilterDisableIDC)
+	}
+
+	decoder, err := openh264.NewDecoder(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer decoder.Close()
+	img := image.NewRGBA(image.Rect(0, 0, 320, 240))
+	decoded := 0
+	for index := range 152 {
+		x, y := 2*(index%160), 2*((index/160)%120)
+		value := color.RGBA{R: byte(index + 1), G: byte(index*17 + 1), B: byte(index*31 + 1), A: 255}
+		region := image.Rect(x, y, x+2, y+2)
+		draw.Draw(img, region, &image.Uniform{C: value}, image.Point{}, draw.Src)
+		data, encodeErr := encoder.EncodeDamage(img, []image.Rectangle{region}, false)
+		if encodeErr != nil {
+			t.Fatalf("encode frame %d: %v", index, encodeErr)
+		}
+		if got, want := hasNAL(data, 5), index == 0; got != want {
+			t.Fatalf("frame %d IDR = %t, want %t", index, got, want)
+		}
+		picture, decodeErr := decoder.Decode(data)
+		if decodeErr != nil {
+			t.Fatalf("decode frame %d: %v", index, decodeErr)
+		}
+		if picture != nil {
+			decoded++
+		}
+	}
+	data, err := encoder.Encode(img, true)
+	if err != nil {
+		t.Fatalf("encode forced IDR: %v", err)
+	}
+	if !hasNAL(data, 5) {
+		t.Fatal("forced refresh did not produce an IDR")
+	}
+	picture, err := decoder.Decode(data)
+	if err != nil {
+		t.Fatalf("decode forced IDR: %v", err)
+	}
+	if picture != nil {
+		decoded++
+	}
+	rest, err := decoder.Flush()
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded += len(rest)
+	if decoded != 153 {
+		t.Fatalf("decoded %d frames, want 153", decoded)
+	}
+}
+
+func TestOpenH264ParallelSlicesMatchSequential(t *testing.T) {
+	const width, height, slices = 320, 240, 4
+	sequential := newFixedSliceTestEncoder(t, width, height, slices, 1)
+	defer sequential.Close()
+	parallel := newFixedSliceTestEncoder(t, width, height, slices, slices)
+	defer parallel.Close()
+
+	images, _ := slicedDesktopFrames(width, height, true)
+	for index := range 6 {
+		raw := referenceI420(width, height, images[index%len(images)])
+		luma := width * height
+		chroma := luma / 4
+		frame := &openh264.Frame{
+			Width: width, Height: height, Timestamp: int64(index * 1000 / FrameRate),
+			Y: raw[:luma], U: raw[luma : luma+chroma], V: raw[luma+chroma:],
+		}
+		want, wantType, err := sequential.Encode(frame)
+		if err != nil {
+			t.Fatalf("sequential frame %d: %v", index, err)
+		}
+		got, gotType, err := parallel.Encode(frame)
+		if err != nil {
+			t.Fatalf("parallel frame %d: %v", index, err)
+		}
+		if gotType != wantType {
+			t.Fatalf("frame %d type = %d, want %d", index, gotType, wantType)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("frame %d parallel output differs: got %d bytes, want %d", index, len(got), len(want))
+		}
+	}
+}
+
+func newFixedSliceTestEncoder(t *testing.T, width, height, slices, workers int) *openh264.Encoder {
+	t.Helper()
+	param, err := openh264.DefaultEncoderParams(width, height, api.UNSPECIFIED_BIT_RATE, FrameRate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	param.IUsageType = api.CAMERA_VIDEO_REAL_TIME
+	param.IRCMode = api.RC_OFF_MODE
+	param.IMultipleThreadIdc = uint16(workers)
+	param.ILoopFilterDisableIdc = 2
+	param.BUseLoadBalancing = false
+	param.BEnableFrameSkip = false
+	param.BEnableBackgroundDetection = false
+	param.BEnableAdaptiveQuant = false
+	param.IEntropyCodingModeFlag = 0
+	layer := &param.SSpatialLayers[0]
+	layer.IDLayerQp = codecQP
+	layer.UiProfileIdc = api.PRO_BASELINE
+	layer.SSliceArgument.UiSliceMode = api.SM_FIXEDSLCNUM_SLICE
+	layer.SSliceArgument.UiSliceNum = uint32(slices)
+
+	encoder, err := openh264.NewEncoder(param)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoder
 }
 
 type decodedReference struct {

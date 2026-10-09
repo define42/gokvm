@@ -1,14 +1,20 @@
 // Port of codec/encoder/core/src/wels_task_management.cpp.
 //
-// The thread pool is not ported: the queued tasks of a list are executed
-// sequentially, in list order, on the calling goroutine, and the sink is
-// notified after each task exactly as the pool would do.
+// Fixed-slice encoding tasks can run on bounded worker goroutines. Other task
+// lists remain sequential because their upstream synchronization has not been
+// ported.
 
 package encoder
 
 import (
+	"sync"
+
 	"github.com/define42/gokvm/pkg/h264/api"
 )
+
+type threadIndexedTask interface {
+	setThreadIndex(int32)
+}
 
 // CreateTaskManage is the static IWelsTaskManage::CreateTaskManage.
 func CreateTaskManage(pCtx *sWelsEncCtx, iSpatialLayer int32, bNeedLock bool) IWelsTaskManage {
@@ -126,8 +132,8 @@ func (p *CWelsTaskManageBase) DestroyTasks() {
 	}
 }
 
-// OnTaskMinusOne: WelsEventSignal decrements the wait counter (and signals
-// the waiting thread when it reaches 0; nothing waits in the sequential port).
+// OnTaskMinusOne records completion after a task has finished. Parallel task
+// execution invokes sinks on the caller after all workers have joined.
 func (p *CWelsTaskManageBase) OnTaskMinusOne() {
 	p.m_iWaitTaskNum--
 }
@@ -142,30 +148,116 @@ func (p *CWelsTaskManageBase) OnTaskExecuted() WelsErrorType {
 	return ENC_RETURN_SUCCESS
 }
 
-// ExecuteTaskList: TASKLIST_TYPE** pTaskList (one row of m_pcAllTaskList) ->
-// *[MAX_DEPENDENCY_LAYER]*TASKLIST_TYPE. The tasks are run in queue order.
+// ExecuteTaskList runs a task row in queue order on the calling goroutine.
 func (p *CWelsTaskManageBase) ExecuteTaskList(pTaskList *[MAX_DEPENDENCY_LAYER]*TASKLIST_TYPE) WelsErrorType {
 	p.m_iWaitTaskNum = p.m_iTaskNum[p.m_iCurDid]
 	pTargetTaskList := pTaskList[p.m_iCurDid]
-	if 0 == p.m_iWaitTaskNum {
+	if p.m_iWaitTaskNum == 0 {
 		return ENC_RETURN_SUCCESS
 	}
 
-	iCurrentTaskCount := p.m_iWaitTaskNum //if directly use m_iWaitTaskNum in the loop make cause sync problem
-	iIdx := int32(0)
-	for iIdx < iCurrentTaskCount {
-		// m_pThreadPool->QueueTask (pTargetTaskList->getNode (iIdx)): run it now.
+	iCurrentTaskCount := p.m_iWaitTaskNum
+	iReturn := WelsErrorType(ENC_RETURN_SUCCESS)
+	for iIdx := int32(0); iIdx < iCurrentTaskCount; iIdx++ {
 		pTask := (*pTargetTaskList)[iIdx]
-		pTask.Execute()
+		if indexed, ok := pTask.(threadIndexedTask); ok {
+			indexed.setThreadIndex(0)
+		}
+		iReturn |= pTask.Execute()
 		if pSink := pTask.GetSink(); pSink != nil {
 			pSink.OnTaskExecuted()
 		}
-		iIdx++
 	}
 
-	// WelsEventWait (&m_hTaskEvent, &m_hEventMutex, m_iWaitTaskNum): all tasks are done.
+	if iReturn != ENC_RETURN_SUCCESS {
+		p.m_pEncCtx.iEncoderError |= iReturn
+	}
+	return iReturn
+}
 
-	return ENC_RETURN_SUCCESS
+// canExecuteTasksInParallel limits the concurrent path to the configuration
+// used by RDP. Dynamic slicing and GOM rate control still contain shared
+// updates that require the upstream synchronization strategy.
+func (p *CWelsTaskManageBase) canExecuteTasksInParallel(iTaskType ETaskType) bool {
+	if iTaskType != WELS_ENC_TASK_ENCODING || p.m_iThreadNum <= 1 || p.m_pEncCtx == nil || p.m_pEncCtx.pSvcParam == nil {
+		return false
+	}
+	param := p.m_pEncCtx.pSvcParam
+	if p.m_iCurDid < 0 || p.m_iCurDid >= param.ISpatialLayerNum ||
+		param.IUsageType != api.CAMERA_VIDEO_REAL_TIME ||
+		param.IRCMode != api.RC_OFF_MODE ||
+		param.IEntropyCodingModeFlag != 0 ||
+		param.BUseLoadBalancing ||
+		param.BEnableBackgroundDetection ||
+		param.BEnableAdaptiveQuant ||
+		param.SSpatialLayers[p.m_iCurDid].SSliceArgument.UiSliceMode != api.SM_FIXEDSLCNUM_SLICE {
+		return false
+	}
+	pTaskList := p.m_pcAllTaskList[iTaskType][p.m_iCurDid]
+	if pTaskList == nil {
+		return false
+	}
+	for _, pTask := range *pTaskList {
+		if _, ok := pTask.(threadIndexedTask); !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// executeTaskListParallel assigns one private bitstream buffer to each worker.
+// A worker processes its lane in order, so a buffer is never used by two tasks
+// concurrently. Task results and sink notifications are reduced after the
+// barrier on the caller goroutine.
+func (p *CWelsTaskManageBase) executeTaskListParallel(pTaskList *[MAX_DEPENDENCY_LAYER]*TASKLIST_TYPE) WelsErrorType {
+	p.m_iWaitTaskNum = p.m_iTaskNum[p.m_iCurDid]
+	pTargetTaskList := pTaskList[p.m_iCurDid]
+	iTaskCount := p.m_iWaitTaskNum
+	if iTaskCount == 0 {
+		return ENC_RETURN_SUCCESS
+	}
+
+	iWorkerCount := p.m_iThreadNum
+	if iWorkerCount > iTaskCount {
+		iWorkerCount = iTaskCount
+	}
+	if iWorkerCount > MAX_THREADS_NUM {
+		iWorkerCount = MAX_THREADS_NUM
+	}
+
+	var taskResults [MAX_THREADS_NUM]WelsErrorType
+	var workers sync.WaitGroup
+	workers.Add(int(iWorkerCount))
+	for iWorker := int32(0); iWorker < iWorkerCount; iWorker++ {
+		go func(iThreadIdx int32) {
+			defer workers.Done()
+			iResult := WelsErrorType(ENC_RETURN_SUCCESS)
+			for iTask := iThreadIdx; iTask < iTaskCount; iTask += iWorkerCount {
+				pTask := (*pTargetTaskList)[iTask]
+				if indexed, ok := pTask.(threadIndexedTask); ok {
+					indexed.setThreadIndex(iThreadIdx)
+				}
+				iResult |= pTask.Execute()
+			}
+			taskResults[iThreadIdx] = iResult
+		}(iWorker)
+	}
+	workers.Wait()
+
+	iReturn := WelsErrorType(ENC_RETURN_SUCCESS)
+	for iWorker := int32(0); iWorker < iWorkerCount; iWorker++ {
+		iReturn |= taskResults[iWorker]
+	}
+	for iTask := int32(0); iTask < iTaskCount; iTask++ {
+		if pSink := (*pTargetTaskList)[iTask].GetSink(); pSink != nil {
+			pSink.OnTaskExecuted()
+		}
+	}
+	if iReturn != ENC_RETURN_SUCCESS {
+		p.m_pEncCtx.iEncoderError |= iReturn
+	}
+
+	return iReturn
 }
 
 func (p *CWelsTaskManageBase) InitFrame(kiCurDid int32) {
@@ -176,11 +268,13 @@ func (p *CWelsTaskManageBase) InitFrame(kiCurDid int32) {
 }
 
 func (p *CWelsTaskManageBase) ExecuteTasks(iTaskType ETaskType) WelsErrorType {
+	if p.canExecuteTasksInParallel(iTaskType) {
+		return p.executeTaskListParallel(&p.m_pcAllTaskList[iTaskType])
+	}
 	return p.ExecuteTaskList(&p.m_pcAllTaskList[iTaskType])
 }
 
-// GetThreadPoolThreadNum returns the thread count the (not ported) thread
-// pool would have been configured with.
+// GetThreadPoolThreadNum returns the configured slice worker count.
 func (p *CWelsTaskManageBase) GetThreadPoolThreadNum() int32 {
 	return p.m_iThreadNum
 }
@@ -194,9 +288,21 @@ func (p *CWelsTaskManageOne) Init(pEncCtx *sWelsEncCtx) WelsErrorType {
 }
 
 func (p *CWelsTaskManageOne) ExecuteTasks(iTaskType ETaskType) WelsErrorType {
+	p.m_iWaitTaskNum = int32(len(*p.m_cEncodingTaskList[0]))
+	iReturn := WelsErrorType(ENC_RETURN_SUCCESS)
 	for len(*p.m_cEncodingTaskList[0]) > 0 {
-		(*p.m_cEncodingTaskList[0])[0].Execute()
+		pTask := (*p.m_cEncodingTaskList[0])[0]
+		if indexed, ok := pTask.(threadIndexedTask); ok {
+			indexed.setThreadIndex(0)
+		}
+		iReturn |= pTask.Execute()
+		if pSink := pTask.GetSink(); pSink != nil {
+			pSink.OnTaskExecuted()
+		}
 		*p.m_cEncodingTaskList[0] = (*p.m_cEncodingTaskList[0])[1:]
 	}
-	return ENC_RETURN_SUCCESS
+	if iReturn != ENC_RETURN_SUCCESS {
+		p.m_pEncCtx.iEncoderError |= iReturn
+	}
+	return iReturn
 }

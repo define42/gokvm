@@ -72,7 +72,8 @@ Run `make slax` to build gokvm with the software-only pure-Go H.264 encoder and
 boot the local `slax.iso` with two guest CPUs, 2 GB of memory, user-mode
 networking, and H.264 RDP listening on `127.0.0.1:3390`. It requests four
 encoder slices, bounded by the existing host-budget calculation. The bundled
-codec emits those slices sequentially and needs no native H.264 library.
+codec encodes those fixed slices concurrently with bounded Go workers and needs
+no native H.264 library.
 
 With `make slax` running, use `make rdp` in another terminal to open FreeRDP and
 connect to `127.0.0.1:3390` with automatic resizing. Run `make freerdp` first to
@@ -268,14 +269,14 @@ The server logs `using pure-Go H.264 AVC420 graphics` after negotiation. Clients
 without AVC420 support receive bitmap updates automatically. The server does not
 load a shared codec library, and AVC420 is available in normal builds.
 
-The bundled OpenH264 port can divide a frame into slices, which it encodes
-sequentially on the calling goroutine. The default `-rdp-h264-threads 0` requests
-up to two slices. Explicit values from 1 to 16 request a slice count;
-`-rdp-h264-threads 1` requests one slice. The count is fixed for the session and
-bounded by the existing calculation using the Go runtime CPU limit, guest vCPU
-count, and one CPU for host work, with a minimum of one slice. The codec may use
-fewer slices for small pictures. Frames remain ordered, and a slow client
-receives the latest frame without building a queue.
+The bundled OpenH264 port can divide an RDP frame into fixed slices and encode
+them concurrently. The default `-rdp-h264-threads 0` requests one slice and one
+codec worker. Explicit values from 1 to 16 request a slice count; the bundled
+codec schedules those slices on at most four workers. The slice count is fixed
+for the session and bounded by the existing calculation using the Go runtime
+CPU limit, guest vCPU count, and one CPU for host work, with a minimum of one.
+The codec may use fewer slices and workers for small pictures. Frames remain
+ordered, and a slow client receives the latest frame without building a queue.
 
 Use `-rdp-stats` to log performance measurements every five seconds while frames
 are active, plus a summary when the client disconnects. Statistics include frame
@@ -286,32 +287,38 @@ default and also work with bitmap RDP. For example:
 
 ```bash
 ./gokvm boot -iso ./slax.iso -m 2G -net user \
-  -rdp 127.0.0.1:3390 -rdp-h264 -rdp-h264-threads 2 -rdp-stats
+  -rdp 127.0.0.1:3390 -rdp-h264 -rdp-h264-threads 1 -rdp-stats
 ```
 
 Try slice counts of 1, 2, and 4 while scrolling the same page, then compare
-encoding time, payload size, and responsiveness. Because this codec processes
-slices sequentially, extra slices can add overhead and reduce compression; one
-slice is the usual performance choice. Guest rendering, color conversion, and
-client acknowledgement waits can also limit frame rate. These options require no
-changes to the RDP client command. `-rdp-h264-threads` requires `-rdp-h264`;
-`-rdp-stats` requires `-rdp`.
+encoding time, payload size, and responsiveness. Multiple slices reduce
+software-encoding latency when CPU cores are available, while adding slice
+headers and sometimes reducing compression. Guest rendering, color conversion,
+and client acknowledgement waits can also limit frame rate. These options
+require no changes to the RDP client command. `-rdp-h264-threads` requires
+`-rdp-h264`; `-rdp-stats` requires `-rdp`.
 
 AVC420 uses lossy YUV 4:2:0 compression and software encoding, so small colored
 text can be softer than bitmap output. AVC444 and hardware encoding are not
 implemented. TLS and authentication behavior are the same as for bitmap RDP.
 
-The H.264 path sends changed frames at up to 60 fps. Virtio-gpu dirty rectangles
-limit pixel conversion and framebuffer copying to changed regions; the session
-retains its image and catches up safely after skipping intermediate frames.
+The H.264 path sends changed frames at up to 60 fps. The ordered RDP transport
+uses IDR frames for stream initialization, resize, refresh, and codec recovery
+instead of inserting periodic IDRs. The RDP encoder disables the H.264 deblocking
+filter to reduce software-encoding latency. Virtio-gpu dirty rectangles limit
+pixel conversion and framebuffer copying to changed regions; the session retains
+its image and catches up safely after skipping intermediate frames.
 Bitmap output updates changed 64×64 tiles, while H.264 updates a persistent YUV
 image and sends repaint rectangles with its compressed video. H.264 still
 encodes a complete video picture, using references to earlier frames.
 
 Frame notifications avoid waiting for a separate polling cycle, and a slow client
-receives the latest available image when ready. Resizing and refresh requests
-repaint the whole desktop. Serial/VGA/VESA fallbacks still publish full images.
-Actual frame rate depends on guest rendering, host CPU, and client decoding;
+receives the latest available image when ready. The server keeps a two-frame
+decode window and adapts H.264 pacing from normal frame-acknowledgment turnaround
+and the client's reported queued bytes, backing off quickly and recovering
+gradually. Resizing and refresh requests repaint the whole desktop.
+Serial/VGA/VESA fallbacks still publish full images. Actual frame rate depends
+on guest rendering, host CPU, and client decoding;
 bitmap RDP remains capped at 30 fps.
 
 Virtio-gpu currently provides a 2D framebuffer without guest 3D acceleration.

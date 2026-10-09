@@ -132,7 +132,7 @@ func (s *Session) Resize(width, height int) (bool, error) {
 		if err := s.writeGraphics(append(deleteSurface, graphicsSurface(width, height)...)); err != nil {
 			return false, err
 		}
-		g.inFlight = nil
+		g.resetAcknowledgments()
 		g.notifyChanged()
 		s.storeSize(width, height)
 		d.notifyChanged()

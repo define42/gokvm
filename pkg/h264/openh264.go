@@ -8,8 +8,9 @@
 //   - A small idiomatic wrapper: Decoder and Encoder, working on Frame values
 //     with tightly packed I420 planes.
 //
-// The port is single-threaded and contains no assembly; its output is
-// bit-exact with the C reference implementation.
+// The port contains no assembly. Its audited fixed-slice encoder path can use
+// bounded Go workers; decoding and other encoder modes remain sequential. Its
+// output is bit-exact with the C reference implementation.
 package openh264
 
 import (

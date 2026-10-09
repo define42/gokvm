@@ -13,8 +13,8 @@ import (
 // FrameRate is the maximum frame rate of the RDP AVC420 encoder.
 const FrameRate = 60
 
-// MaxThreads limits the requested H.264 slice count. The historical name
-// matches the command-line option; the bundled codec encodes slices sequentially.
+// MaxThreads limits the requested H.264 slice count. The encoder schedules
+// those slices on at most four workers.
 const MaxThreads = 16
 
 const maxDimension = 4096

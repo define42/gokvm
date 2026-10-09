@@ -12,27 +12,38 @@ import (
 )
 
 const (
-	graphicsChannelName = "Microsoft::Windows::RDS::Graphics\x00"
-	graphicsChannelID   = 1
-	graphicsMaxMessage  = 8 << 20
-	graphicsMaxIncoming = 1 << 20
-	graphicsMaxFrames   = 2
-	graphicsMaxRegions  = 128
-	graphicsVersion81   = 0x00080105
+	graphicsChannelName      = "Microsoft::Windows::RDS::Graphics\x00"
+	graphicsChannelID        = 1
+	graphicsMaxMessage       = 8 << 20
+	graphicsMaxIncoming      = 1 << 20
+	graphicsMaxFrames        = 2
+	graphicsMaxRegions       = 128
+	graphicsVersion81        = 0x00080105
+	graphicsMinFrameInterval = time.Second / 60
+	graphicsMaxFrameInterval = 250 * time.Millisecond
 )
 
 // graphicsState implements the AVC420 subset of MS-RDPEGFX over MS-RDPEDYC.
 // mu serializes negotiation, frame acknowledgments, and complete DVC messages.
 // A single reader owns both inbound reassembly buffers.
+type graphicsPendingFrame struct {
+	id     uint32
+	sentAt time.Time
+}
+
 type graphicsState struct {
-	mu        sync.Mutex
-	supported bool
-	ready     bool
-	closed    bool
-	ackOff    bool
-	frameID   uint32
-	inFlight  []uint32
-	changed   chan struct{}
+	mu            sync.Mutex
+	supported     bool
+	ready         bool
+	closed        bool
+	ackOff        bool
+	frameID       uint32
+	inFlight      []graphicsPendingFrame
+	averageBytes  uint64
+	ackTurnaround time.Duration
+	frameInterval time.Duration
+	baseInterval  time.Duration
+	changed       chan struct{}
 }
 
 // BeginGraphics starts optional AVC420 negotiation. A false result means the
@@ -69,6 +80,28 @@ func (s *Session) GraphicsCanSend() bool {
 	defer s.graphics.mu.Unlock()
 
 	return s.graphics.canSend() && s.DisplayReady()
+}
+
+// GraphicsFrameInterval returns acknowledgement-adapted graphics pacing.
+// Ordinary frame acknowledgements report client queue depth; their turnaround
+// also provides a fallback for clients that report queue depth as unavailable.
+// Slowdown is immediate, while recovery is deliberately gradual.
+func (s *Session) GraphicsFrameInterval(base time.Duration) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	if s.graphics == nil {
+		return base
+	}
+	g := s.graphics
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.baseInterval = base
+	if g.frameInterval < base {
+		g.frameInterval = base
+	}
+
+	return min(g.frameInterval, graphicsMaxFrameInterval)
 }
 
 // GraphicsChanged wakes the single video writer when negotiation or frame
@@ -144,8 +177,9 @@ func (s *Session) WriteAVC420Damage(annexB []byte, regions []image.Rectangle) (b
 	if err := s.writeGraphics(frame); err != nil {
 		return false, err
 	}
+	g.observeFrame(len(frame))
 	if !g.ackOff {
-		g.inFlight = append(g.inFlight, g.frameID)
+		g.inFlight = append(g.inFlight, graphicsPendingFrame{id: g.frameID, sentAt: time.Now()})
 	}
 
 	return true, nil
@@ -203,22 +237,30 @@ func (s *Session) readGraphicsPDU(command uint16, data []byte) error {
 		if !g.ready || len(data) != 12 {
 			return errors.New("rdp: invalid graphics frame acknowledgment")
 		}
-		if binary.LittleEndian.Uint32(data) == ^uint32(0) {
+		queueDepth := binary.LittleEndian.Uint32(data)
+		if queueDepth == ^uint32(0) {
 			g.ackOff = true
-			g.inFlight = nil
+			g.resetAcknowledgments()
 			g.notifyChanged()
 
 			return nil
 		}
+		wasOff := g.ackOff
 		g.ackOff = false
 		frameID := binary.LittleEndian.Uint32(data[4:])
-		for i, id := range g.inFlight {
-			if id == frameID {
+		for i, frame := range g.inFlight {
+			if frame.id == frameID {
 				g.inFlight = g.inFlight[i+1:]
+				g.adaptAcknowledgments(queueDepth, frame, time.Now())
 				g.notifyChanged()
 
 				return nil
 			}
+		}
+		// A normal acknowledgement opts the client back in after suspension,
+		// even though frames sent while acknowledgements were off are untracked.
+		if wasOff {
+			g.notifyChanged()
 		}
 	case 0x10: // Optional persistent cache offer; we import no cache entries.
 		if len(data) < 2 || len(data) != 2+int(binary.LittleEndian.Uint16(data))*12 {
@@ -235,6 +277,63 @@ func (s *Session) readGraphicsPDU(command uint16, data []byte) error {
 	}
 
 	return nil
+}
+
+func (g *graphicsState) observeFrame(bytes int) {
+	sample := uint64(bytes)
+	if g.averageBytes == 0 {
+		g.averageBytes = sample
+
+		return
+	}
+	g.averageBytes = (7*g.averageBytes + sample) / 8
+}
+
+func (g *graphicsState) resetAcknowledgments() {
+	g.inFlight = nil
+	g.averageBytes = 0
+	g.ackTurnaround = 0
+	g.frameInterval = 0
+}
+
+func (g *graphicsState) adaptAcknowledgments(queueDepth uint32, frame graphicsPendingFrame, now time.Time) {
+	base := g.baseInterval
+	if base <= 0 {
+		base = graphicsMinFrameInterval
+	}
+	if elapsed := now.Sub(frame.sentAt); elapsed > 0 {
+		if g.ackTurnaround == 0 {
+			g.ackTurnaround = elapsed
+		} else {
+			g.ackTurnaround += (elapsed - g.ackTurnaround) / 8
+		}
+	}
+
+	target := base
+	if turnaround := g.ackTurnaround / graphicsMaxFrames; turnaround > target {
+		target = turnaround
+	}
+	if queueDepth != 0 && g.averageBytes != 0 {
+		buffered := (uint64(queueDepth) + g.averageBytes - 1) / g.averageBytes
+		maxBuffered := uint64(0)
+		if base < graphicsMaxFrameInterval {
+			maxBuffered = uint64(graphicsMaxFrameInterval/base) - 1
+		}
+		buffered = min(buffered, maxBuffered)
+		target = max(target, base*time.Duration(1+buffered))
+	}
+	target = min(target, graphicsMaxFrameInterval)
+
+	current := max(g.frameInterval, base)
+	if target >= current {
+		g.frameInterval = target
+
+		return
+	}
+	// Recover by at least a quarter frame interval, or one quarter of the
+	// remaining gap. This avoids an immediate burst after congestion clears.
+	step := max(base/4, (current-target)/4)
+	g.frameInterval = max(target, current-step)
 }
 
 func selectGraphicsCapabilities(data []byte) (uint32, uint32, error) {
@@ -389,14 +488,24 @@ func avc420Frame(width, height int, frameID, timestamp uint32, annexB []byte) []
 func avc420FrameDamage(width, height int, frameID, timestamp uint32,
 	annexB []byte, regions []image.Rectangle,
 ) []byte {
-	start := make([]byte, 8)
-	binary.LittleEndian.PutUint32(start, timestamp)
-	binary.LittleEndian.PutUint32(start[4:], frameID)
-	data := graphicsPDU(0x0b, start)
+	// Allocate the complete START_FRAME, WIRE_TO_SURFACE_1 and END_FRAME
+	// sequence once. The encoded access unit is the only large copy.
+	metadataLength := 4 + 10*len(regions)
+	wireLength := 17 + metadataLength + len(annexB)
+	data := make([]byte, 16+8+wireLength+12)
+
+	start := data[:16]
+	binary.LittleEndian.PutUint16(start, 0x0b)
+	binary.LittleEndian.PutUint32(start[4:], uint32(len(start)))
+	binary.LittleEndian.PutUint32(start[8:], timestamp)
+	binary.LittleEndian.PutUint32(start[12:], frameID)
+
+	wirePDU := data[16 : 16+8+wireLength]
+	binary.LittleEndian.PutUint16(wirePDU, 1)
+	binary.LittleEndian.PutUint32(wirePDU[4:], uint32(len(wirePDU)))
 	// WIRE_TO_SURFACE_1 describes the complete coded desktop; its AVC420
 	// metadata mask tells the client which decoded regions to repaint.
-	metadataLength := 4 + 10*len(regions)
-	wire := make([]byte, 17+metadataLength+len(annexB))
+	wire := wirePDU[8:]
 	put16(wire, 2, 0x0b)
 	wire[4] = 0x20
 	put16(wire, 9, width)
@@ -416,9 +525,11 @@ func avc420FrameDamage(width, height int, frameID, timestamp uint32,
 		wire[offset], wire[offset+1] = 22, 100
 	}
 	copy(wire[17+metadataLength:], annexB)
-	data = append(data, graphicsPDU(1, wire)...)
-	end := make([]byte, 4)
-	binary.LittleEndian.PutUint32(end, frameID)
 
-	return append(data, graphicsPDU(0x0c, end)...)
+	end := data[len(data)-12:]
+	binary.LittleEndian.PutUint16(end, 0x0c)
+	binary.LittleEndian.PutUint32(end[4:], uint32(len(end)))
+	binary.LittleEndian.PutUint32(end[8:], frameID)
+
+	return data
 }

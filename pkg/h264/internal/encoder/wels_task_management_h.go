@@ -1,7 +1,7 @@
 // Port of codec/encoder/core/inc/wels_task_management.h.
 //
-// The port is single-threaded: the thread pool, events and locks are
-// dropped and the task lists are executed sequentially.
+// The OS thread pool, events, and locks are replaced by bounded Go workers
+// for the audited fixed-slice path. Other task lists execute sequentially.
 
 package encoder
 
@@ -23,7 +23,7 @@ type IWelsTaskManage interface {
 // append, begin -> [0] (nil when empty), pop_front -> [1:], getNode(i) -> [i].
 type TASKLIST_TYPE []IWelsBaseTask
 
-// CWelsTaskManageBase runs the encoding tasks (sequentially in this port).
+// CWelsTaskManageBase runs sequential tasks and bounded fixed-slice workers.
 type CWelsTaskManageBase struct {
 	// protected:
 	m_pEncCtx *sWelsEncCtx

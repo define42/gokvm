@@ -7,6 +7,8 @@ import (
 	"sync"
 )
 
+const dynamicTransportBatchSize = 16 << 10
+
 type dynamicEndpoint struct {
 	phase byte // 0 disabled, 1 requested, 2 opening, 3 open, 4 closed
 	data  fragmentBuffer
@@ -15,13 +17,14 @@ type dynamicEndpoint struct {
 // dynamicState owns the single drdynvc transport and its two independent
 // logical channels. The write lock prevents fragmented messages interleaving.
 type dynamicState struct {
-	mu       sync.Mutex
-	writeMu  sync.Mutex
-	channel  uint16
-	phase    byte // 0 idle, 1 capability exchange, 2 ready
-	static   fragmentBuffer
-	graphics dynamicEndpoint
-	display  dynamicEndpoint
+	mu         sync.Mutex
+	writeMu    sync.Mutex
+	writeBatch []byte // Reused under writeMu.
+	channel    uint16
+	phase      byte // 0 idle, 1 capability exchange, 2 ready
+	static     fragmentBuffer
+	graphics   dynamicEndpoint
+	display    dynamicEndpoint
 }
 
 func (d *dynamicState) endpoint(id uint32) *dynamicEndpoint {
@@ -165,7 +168,7 @@ func (s *Session) readDynamic(data []byte) error {
 			g := s.graphics
 			g.mu.Lock()
 			g.ready, g.closed = false, true
-			g.inFlight = nil
+			g.resetAcknowledgments()
 			g.notifyChanged()
 			g.mu.Unlock()
 		}
@@ -299,21 +302,44 @@ func (s *Session) writeDynamic(id uint32, data []byte) error {
 	defer d.writeMu.Unlock()
 	total := len(data)
 	first := true
+	batch := d.writeBatch[:0]
+	if len(data) != 0 && cap(batch) < dynamicTransportBatchSize {
+		batch = make([]byte, 0, dynamicTransportBatchSize)
+	}
+	defer func() { d.writeBatch = batch[:0] }()
 	for len(data) > 0 {
-		header := []byte{0x30, byte(id)}
+		var header [14]byte
+		headerLength := 10 // Static-channel header followed by DYNVC_DATA.
+		header[8], header[9] = 0x30, byte(id)
 		if first && len(data) > 1598 {
-			header = []byte{0x28, byte(id), 0, 0, 0, 0}
-			binary.LittleEndian.PutUint32(header[2:], uint32(total))
+			headerLength = 14 // Static-channel header followed by DYNVC_DATA_FIRST.
+			header[8], header[9] = 0x28, byte(id)
+			binary.LittleEndian.PutUint32(header[10:], uint32(total))
 		}
-		size := min(1600-len(header), len(data))
-		if err := s.writeStatic(d.channel, append(header, data[:size]...)); err != nil {
+		dynamicHeaderLength := headerLength - 8
+		size := min(1600-dynamicHeaderLength, len(data))
+		binary.LittleEndian.PutUint32(header[:4], uint32(dynamicHeaderLength+size))
+		binary.LittleEndian.PutUint32(header[4:8], 3)
+		packetSize := channelTPKTSize(headerLength + size)
+		if len(batch) != 0 && len(batch)+packetSize > cap(batch) {
+			if err := s.writeWire(batch); err != nil {
+				return err
+			}
+			batch = batch[:0]
+		}
+		var err error
+		batch, err = appendChannelTPKT(batch, d.channel, header[:headerLength], data[:size])
+		if err != nil {
 			return err
 		}
 		data = data[size:]
 		first = false
 	}
+	if len(batch) == 0 {
+		return nil
+	}
 
-	return nil
+	return s.writeWire(batch)
 }
 
 // segmentGraphics emits uncompressed RDP 8.0 bulk segments. H.264 already

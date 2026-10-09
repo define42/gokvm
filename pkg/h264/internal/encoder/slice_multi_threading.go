@@ -1,8 +1,7 @@
 // Port of codec/encoder/core/src/slice_multi_threading.cpp.
 //
-// Slice based multiple threading support. The port is sequential: thread
-// handles, events and mutexes are dropped; the work runs in the order the
-// task manager executes it (see wels_task_management.go).
+// Slice-based worker support. Thread handles, events, and mutexes are dropped;
+// the task manager assigns each bounded Go worker a private bitstream buffer.
 
 package encoder
 
@@ -220,7 +219,7 @@ func RequestMtResource(ppCtx **sWelsEncCtx, pCodingParam *SWelsSvcCodingParam, i
 		pSmt.pThreadPEncCtx[iIdx].pWelsPEncCtx = *ppCtx
 		pSmt.pThreadPEncCtx[iIdx].iSliceIndex = iIdx
 		pSmt.pThreadPEncCtx[iIdx].iThreadIndex = iIdx
-		// thread handles / events are not ported (sequential execution).
+		// Persistent thread handles and events are unnecessary for frame-scoped Go workers.
 		iIdx++
 	}
 
@@ -251,7 +250,7 @@ func ReleaseMtResource(ppCtx **sWelsEncCtx) {
 		return
 	}
 
-	// events / mutexes are not ported (sequential execution).
+	// Frame-scoped workers have joined before these resources are released.
 	pSmt.pThreadPEncCtx = nil
 
 	for i := 0; i < MAX_THREADS_NUM; i++ {

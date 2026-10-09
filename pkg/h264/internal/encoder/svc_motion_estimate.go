@@ -165,11 +165,11 @@ func WelsMotionEstimateInitialPoint(pFuncList *SWelsFuncPtrList, pMe *SWelsME, p
 		}
 	}
 
-	if pFuncList.pfCheckDirectionalMv(pSad, pMe, ksMvStartMin, ksMvStartMax, iStrideEnc, iStrideRef, &iSadCost) {
+	if pFuncList.pfCheckDirectionalMv(pSad, pMe, ksMvStartMin, ksMvStartMax, iStrideEnc, iStrideRef, &pMe.iDirectionalSadCost) {
 		sMv = pMe.sDirectionalMv
 		pRefMb = pMe.pColoRefMb
 		iRefMbOff = pMe.iColoRefMbOff + int(int32(sMv.iMvY)*iStrideRef+int32(sMv.iMvX))
-		iBestSadCost = iSadCost
+		iBestSadCost = pMe.iDirectionalSadCost
 	}
 
 	UpdateMeResults(sMv, uint32(iBestSadCost), pRefMb, iRefMbOff, pMe)
@@ -245,7 +245,7 @@ func WelsDiamondSearch(pFuncList *SWelsFuncPtrList, pMe *SWelsME, pSlice *SSlice
 	iBestCost := int32(pMe.uiSadCost)
 
 	iTimeThreshold := int32(ITERATIVE_TIMES)
-	var iSadCosts [4]int32
+	iSadCosts := pSlice.sMbCacheInfo.iDiamondSad[:]
 
 	for iTimeThreshold != 0 {
 		iTimeThreshold--
@@ -254,11 +254,11 @@ func WelsDiamondSearch(pFuncList *SWelsFuncPtrList, pMe *SWelsME, pSlice *SSlice
 		if !CheckMvInRange(pMe.sMv, ksMvStartMin, ksMvStartMax) {
 			continue
 		}
-		pSad(kpEncMb, kiEncMbOff, kiStrideEnc, pRefMb, iRefMbOff, kiStrideRef, iSadCosts[:])
+		pSad(kpEncMb, kiEncMbOff, kiStrideEnc, pRefMb, iRefMbOff, kiStrideRef, iSadCosts)
 
 		var iX, iY int32
 
-		kbIsBestCostWorse := WelsMeSadCostSelect(iSadCosts[:], kpMvdCost, kiMvdCostOff, &iBestCost, iMvDx, iMvDy, &iX, &iY)
+		kbIsBestCostWorse := WelsMeSadCostSelect(iSadCosts, kpMvdCost, kiMvdCostOff, &iBestCost, iMvDx, iMvDy, &iX, &iY)
 		if kbIsBestCostWorse {
 			break
 		}

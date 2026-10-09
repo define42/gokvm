@@ -431,7 +431,7 @@ func (d *RDPDisplay) writeFrames(
 		var paced <-chan time.Time
 		pendingFrame := changed && session.DisplayReady() && !suppressed.Load()
 		ackBlocked := pendingFrame && writer.graphics && !session.GraphicsCanSend()
-		writer.stats.waiting(ackBlocked, writer.nextFrame)
+		writer.stats.waiting(ackBlocked, writer.frameDeadline())
 		if pendingFrame && !ackBlocked {
 			paced, err = writer.writeWhenReady(d.framebuffer, timer)
 			if err != nil {
@@ -475,6 +475,7 @@ type rdpFrameWriter struct {
 	sequence  uint64
 	force     bool
 	nextFrame time.Time
+	lastFrame time.Time
 	pointer   rdpPointerWriter
 	slices    int
 	stats     rdpFrameStats
@@ -497,6 +498,7 @@ func (w *rdpFrameWriter) updateSize() error {
 	w.width, w.height = width, height
 	w.force = true
 	w.nextFrame = time.Time{}
+	w.lastFrame = time.Time{}
 	w.pointer = rdpPointerWriter{}
 	w.session.ResetPointerCache()
 
@@ -504,12 +506,14 @@ func (w *rdpFrameWriter) updateSize() error {
 }
 
 func (w *rdpFrameWriter) writeWhenReady(display *framebuffer, timer *time.Timer) (<-chan time.Time, error) {
-	if delay := time.Until(w.nextFrame); delay > 0 {
+	deadline := w.frameDeadline()
+	if delay := time.Until(deadline); delay > 0 {
 		timer.Reset(delay)
 
 		return timer.C, nil
 	}
-	w.nextFrame = time.Now().Add(w.frameInterval())
+	w.lastFrame = time.Now()
+	w.nextFrame = w.lastFrame.Add(w.frameInterval())
 	start := w.stats.begin()
 	damage := display.copyFrameChanges(&w.frame, w.force)
 	w.stats.copy.add(w.stats.elapsed(start))
@@ -542,10 +546,25 @@ func (w *rdpFrameWriter) updateGraphics(conn net.Conn) bool {
 
 func (w *rdpFrameWriter) frameInterval() time.Duration {
 	if w.graphics {
-		return time.Second / avc.FrameRate
+		base := time.Second / avc.FrameRate
+		if w.session != nil {
+			return w.session.GraphicsFrameInterval(base)
+		}
+
+		return base
 	}
 
 	return time.Second / 30
+}
+
+// frameDeadline recomputes the deadline from the last send so ACK feedback can
+// slow an already scheduled frame. nextFrame remains the initial/test hook.
+func (w *rdpFrameWriter) frameDeadline() time.Time {
+	if !w.lastFrame.IsZero() {
+		return w.lastFrame.Add(w.frameInterval())
+	}
+
+	return w.nextFrame
 }
 
 func (w *rdpFrameWriter) close() {

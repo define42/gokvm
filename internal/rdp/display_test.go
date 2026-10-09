@@ -153,7 +153,7 @@ func TestGraphicsResizeResetsSurfaceAndRetiresOldAcknowledgments(t *testing.T) {
 	conn := &graphicsTestConn{}
 	s := &Session{
 		Width: 1024, Height: 768, conn: conn, dynamic: graphicsDynamicFixture(3),
-		graphics: &graphicsState{ready: true, frameID: 40, inFlight: []uint32{39, 40}},
+		graphics: &graphicsState{ready: true, frameID: 40, inFlight: []graphicsPendingFrame{{id: 39}, {id: 40}}},
 	}
 	changed := s.DisplayChanged()
 	if changed != s.DisplayChanged() {
@@ -196,7 +196,7 @@ func TestGraphicsResizeResetsSurfaceAndRetiresOldAcknowledgments(t *testing.T) {
 	if err := s.readGraphicsPDU(0x0d, ack); err != nil {
 		t.Fatal(err)
 	}
-	if len(s.graphics.inFlight) != 1 || s.graphics.inFlight[0] != 41 {
+	if len(s.graphics.inFlight) != 1 || s.graphics.inFlight[0].id != 41 {
 		t.Fatal("late acknowledgment retired a frame in the new geometry")
 	}
 	if resized, err := s.Resize(1920, 1080); err != nil || resized {

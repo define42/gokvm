@@ -330,8 +330,10 @@ func WelsMdI16x16(pFunc *SWelsFuncPtrList, pCurDqLayer *SDqLayer, pMbCache *SMbC
 	iAvailCount = int32(g_kiIntra16AvaliMode[iOffset][4])
 	kpAvailMode = g_kiIntra16AvaliMode[iOffset][:]
 	if iAvailCount > 3 && pFunc.sSampleDealingFuncs.pfIntra16x16Combined3 != nil {
-		iBestCost = pFunc.sSampleDealingFuncs.pfIntra16x16Combined3(pDec, iDecOff, iLineSizeDec, pEnc, iEncOff, iLineSizeEnc, &iBestMode,
+		pMbCache.iBestModeScratch = iBestMode
+		iBestCost = pFunc.sSampleDealingFuncs.pfIntra16x16Combined3(pDec, iDecOff, iLineSizeDec, pEnc, iEncOff, iLineSizeEnc, &pMbCache.iBestModeScratch,
 			iLambda, pDst /*temp*/, 0)
+		iBestMode = pMbCache.iBestModeScratch
 		iCurMode = int32(kpAvailMode[3])
 		pFunc.pfGetLumaI16x16Pred[iCurMode](pDst, 0, pDec, iDecOff, iLineSizeDec)
 		iCurCost = pFunc.sSampleDealingFuncs.pfMdCost[BLOCK_16x16](pDst, 0, 16, pEnc, iEncOff, iLineSizeEnc) + iLambda*4
@@ -425,12 +427,14 @@ func WelsMdI4x4(pEncCtx *sWelsEncCtx, pWelsMd *SWelsMD, pCurMb *SMB, pMbCache *S
 		iBestMode = int32(kpAvailMode[0])
 
 		if pFunc.sSampleDealingFuncs.pfIntra4x4Combined3 != nil && (iAvailCount >= 6) {
+			pMbCache.iBestModeScratch = iBestMode
 			iDstOff := int(iBestPredBufferNum << 4)
 
 			iBestCost = pFunc.sSampleDealingFuncs.pfIntra4x4Combined3(pDecMb, iCurDecOff, kiLineSizeDec, pEncMb, iCurEncOff, kiLineSizeEnc,
 				pMbCache.pMemPredBlk4, iDstOff,
-				&iBestMode,
+				&pMbCache.iBestModeScratch,
 				lambda[lambdaIdx(iPredMode == 2)], lambda[lambdaIdx(iPredMode == 1)], lambda[lambdaIdx(iPredMode == 0)])
+			iBestMode = pMbCache.iBestModeScratch
 			//     ST64(&pMbCache->pMemPredBlk4[iBestMode<<4], LD64(mem_pred_blk4_temp));
 			//     ST64(&pMbCache->pMemPredBlk4[8+(iBestMode<<4)], LD64(mem_pred_blk4_temp+8));
 
@@ -727,8 +731,10 @@ func WelsMdIntraChroma(pFunc *SWelsFuncPtrList, pCurDqLayer *SDqLayer, pMbCache 
 	iAvailCount = int32(g_kiIntraChromaAvailMode[iOffset][4])
 	kpAvailMode = g_kiIntraChromaAvailMode[iOffset][:]
 	if iAvailCount > 3 && pFunc.sSampleDealingFuncs.pfIntra8x8Combined3 != nil {
-		iBestCost = pFunc.sSampleDealingFuncs.pfIntra8x8Combined3(pDecCb, iDecCbOff, kiLineSizeDec, pEncCb, iEncCbOff, kiLineSizeEnc, &iBestMode,
+		pMbCache.iBestModeScratch = iBestMode
+		iBestCost = pFunc.sSampleDealingFuncs.pfIntra8x8Combined3(pDecCb, iDecCbOff, kiLineSizeDec, pEncCb, iEncCbOff, kiLineSizeEnc, &pMbCache.iBestModeScratch,
 			iLambda, pDstChma, 0, pDecCr, iDecCrOff, pEncCr, iEncCrOff)
+		iBestMode = pMbCache.iBestModeScratch
 		iCurMode = int32(kpAvailMode[3])
 		pFunc.pfGetChromaPred[iCurMode](pDstChma, 0, pDecCb, iDecCbOff, kiLineSizeDec)  //Cb
 		pFunc.pfGetChromaPred[iCurMode](pDstChma, 64, pDecCr, iDecCrOff, kiLineSizeDec) //Cr
@@ -1673,11 +1679,11 @@ func WelsMdInterMb(pEncCtx *sWelsEncCtx, pWelsMd *SWelsMD, pSlice *SSlice, pCurM
 	bMbTopLeftAvailPskip := kuiNeighborAvail&TOPLEFT_MB_POS != 0 && common.IS_SKIP(pCurMb.Add(-kiMbWidth-1).uiMbType)
 	bMbTopRightAvailPskip := kuiNeighborAvail&TOPRIGHT_MB_POS != 0 && common.IS_SKIP(pCurMb.Add(-kiMbWidth+1).uiMbType)
 	bTrySkip := bMbLeftAvailPskip || bMbTopAvailPskip || bMbTopLeftAvailPskip || bMbTopRightAvailPskip
-	bKeepSkip := bMbLeftAvailPskip && bMbTopAvailPskip && bMbTopRightAvailPskip
+	pMbCache.bKeepSkipScratch = bMbLeftAvailPskip && bMbTopAvailPskip && bMbTopRightAvailPskip
 	bSkip := false
 
 	//try BGD skip
-	if pEncCtx.pFuncList.pfInterMdBackgroundDecision(pEncCtx, pWelsMd, pSlice, pCurMb, pMbCache, &bKeepSkip) {
+	if pEncCtx.pFuncList.pfInterMdBackgroundDecision(pEncCtx, pWelsMd, pSlice, pCurMb, pMbCache, &pMbCache.bKeepSkipScratch) {
 		return
 	}
 
@@ -1690,7 +1696,7 @@ func WelsMdInterMb(pEncCtx *sWelsEncCtx, pWelsMd *SWelsMD, pSlice *SSlice, pCurM
 	bSkip = WelsMdInterJudgePskip(pEncCtx, pWelsMd, pSlice, pCurMb, pMbCache, bTrySkip)
 
 	if bSkip {
-		if bKeepSkip {
+		if pMbCache.bKeepSkipScratch {
 			WelsMdInterDecidedPskip(pEncCtx, pSlice, pCurMb, pMbCache)
 			return
 		}

@@ -15,6 +15,8 @@ func WelsDctMb(pRes []int16, pEncMb []uint8, iEncMbOff int, iEncStride int32, pB
 	pfDctFourT4(pRes[192:], pEncMb, iEncMbOff+8*int(iEncStride)+8, iEncStride, pBestPred, iBestPredOff+136, 16)
 }
 
+// Fixed generic calls in the hot paths below are intentional: the Go port has
+// no SIMD alternatives, and indirect calls force local scratch onto the heap.
 func WelsEncRecI16x16Y(pEncCtx *sWelsEncCtx, pCurMb *SMB, pMbCache *SMbCache) {
 	var aDctT4Dc [16]int16
 	pFuncList := pEncCtx.pFuncList
@@ -35,9 +37,9 @@ func WelsEncRecI16x16Y(pEncCtx *sWelsEncCtx, pCurMb *SMB, pMbCache *SMbCache) {
 
 	WelsDctMb(pRes, pMbCache.SPicData.pEncMb[0], pMbCache.SPicData.iEncMbOff[0], kiEncStride, pBestPred, 0, pEncCtx.pFuncList.pfDctFourT4)
 
-	pFuncList.pfTransformHadamard4x4Dc(aDctT4Dc[:], pRes)
-	pFuncList.pfQuantizationDc4x4(aDctT4Dc[:], int16(int32(pFF[0])<<1), pMF[0]>>1)
-	pFuncList.pfScan4x4(pMbCache.pDct.iLumaI16x16Dc[:], aDctT4Dc[:])
+	WelsHadamardT4Dc_c(aDctT4Dc[:], pRes)
+	WelsQuant4x4Dc_c(aDctT4Dc[:], int16(int32(pFF[0])<<1), pMF[0]>>1)
+	WelsScan4x4DcAc_c(pMbCache.pDct.iLumaI16x16Dc[:], aDctT4Dc[:])
 	uiCountI16x16Dc = uint32(pFuncList.pfGetNoneZeroCount(pMbCache.pDct.iLumaI16x16Dc[:]))
 
 	for i := 0; i < 4; i++ {
@@ -61,7 +63,7 @@ func WelsEncRecI16x16Y(pEncCtx *sWelsEncCtx, pCurMb *SMB, pMbCache *SMbCache) {
 			WelsIHadamard4x4Dc(aDctT4Dc[:])
 			WelsDequantLumaDc4x4(aDctT4Dc[:], int32(uiQp))
 		} else {
-			pFuncList.pfDequantizationIHadamard4x4(aDctT4Dc[:], common.G_kuiDequantCoeff[uiQp][0]>>2)
+			WelsDequantIHadamard4x4_c(aDctT4Dc[:], common.G_kuiDequantCoeff[uiQp][0]>>2)
 		}
 	}
 
@@ -94,7 +96,7 @@ func WelsEncRecI16x16Y(pEncCtx *sWelsEncCtx, pCurMb *SMB, pMbCache *SMbCache) {
 		pFuncList.pfIDctFourT4(pPred, iPredOff+int(kiRecStride)*8, kiRecStride, pBestPred, 128, 16, pRes[128:])
 		pFuncList.pfIDctFourT4(pPred, iPredOff+int(kiRecStride)*8+8, kiRecStride, pBestPred, 136, 16, pRes[192:])
 	} else if uiCountI16x16Dc > 0 {
-		pFuncList.pfIDctI16x16Dc(pPred, iPredOff, kiRecStride, pBestPred, 0, 16, aDctT4Dc[:])
+		WelsIDctRecI16x16Dc_c(pPred, iPredOff, kiRecStride, pBestPred, 0, 16, aDctT4Dc[:])
 	} else {
 		pFuncList.pfCopy16x16Aligned(pPred, iPredOff, kiRecStride, pBestPred, 0, 16)
 	}
@@ -147,7 +149,6 @@ func WelsEncRecI4x4Y(pEncCtx *sWelsEncCtx, pCurMb *SMB, pMbCache *SMbCache, uiI4
 }
 
 func WelsEncInterY(pFuncList *SWelsFuncPtrList, pCurMb *SMB, pMbCache *SMbCache) {
-	pfQuantizationFour4x4Max := pFuncList.pfQuantizationFour4x4Max
 	pfSetMemZeroSize64 := pFuncList.pfSetMemZeroSize64
 	pfScan4x4 := pFuncList.pfScan4x4
 	pfCalculateSingleCtr4x4 := pFuncList.pfCalculateSingleCtr4x4
@@ -166,7 +167,7 @@ func WelsEncInterY(pFuncList *SWelsFuncPtrList, pCurMb *SMB, pMbCache *SMbCache)
 	iResOff := 0
 	iBlockOff := 0
 	for i := 0; i < 4; i++ {
-		pfQuantizationFour4x4Max(pRes[iResOff:], pFF, pMF, aMax[i<<2:])
+		WelsQuantFour4x4Max_c(pRes[iResOff:], pFF, pMF, aMax[i<<2:])
 		iSingleCtr8x8[i] = 0
 		for j := 0; j < 4; j++ {
 			if aMax[(i<<2)+j] == 0 {
@@ -214,8 +215,6 @@ func WelsEncInterY(pFuncList *SWelsFuncPtrList, pCurMb *SMB, pMbCache *SMbCache)
 }
 
 func WelsEncRecUV(pFuncList *SWelsFuncPtrList, pCurMb *SMB, pMbCache *SMbCache, pRes []int16, iUV int32) {
-	pfQuantizationHadamard2x2 := pFuncList.pfQuantizationHadamard2x2
-	pfQuantizationFour4x4Max := pFuncList.pfQuantizationFour4x4Max
 	pfSetMemZeroSize64 := pFuncList.pfSetMemZeroSize64
 	pfScan4x4Ac := pFuncList.pfScan4x4Ac
 	pfCalculateSingleCtr4x4 := pFuncList.pfCalculateSingleCtr4x4
@@ -240,9 +239,9 @@ func WelsEncRecUV(pFuncList *SWelsFuncPtrList, pCurMb *SMB, pMbCache *SMbCache, 
 	}
 	pFF := g_kiQuantInterFF[iIntraFlag*6+int32(kiQp)][:]
 
-	uiNoneZeroCountMbDc = uint8(pfQuantizationHadamard2x2(pRes, int16(int32(pFF[0])<<1), pMF[0]>>1, aDct2x2[:], iChromaDc))
+	uiNoneZeroCountMbDc = uint8(WelsHadamardQuant2x2_c(pRes, int16(int32(pFF[0])<<1), pMF[0]>>1, aDct2x2[:], iChromaDc))
 
-	pfQuantizationFour4x4Max(pRes, pFF, pMF, aMax[:])
+	WelsQuantFour4x4Max_c(pRes, pFF, pMF, aMax[:])
 
 	iResOff := 0
 	iBlockOff := 0
@@ -321,7 +320,7 @@ func WelsTryPYskip(pEncCtx *sWelsEncCtx, pCurMb *SMB, pMbCache *SMbCache) bool {
 	iResOff := 0
 	iBlockOff := 0
 	for i := 0; i < 4; i++ {
-		pEncCtx.pFuncList.pfQuantizationFour4x4Max(pRes[iResOff:], pFF, pMF, aMax[:])
+		WelsQuantFour4x4Max_c(pRes[iResOff:], pFF, pMF, aMax[:])
 
 		for j := 0; j < 4; j++ {
 			if uint16(aMax[j]) > 1 {
@@ -354,13 +353,13 @@ func WelsTryPUVskip(pEncCtx *sWelsEncCtx, pCurMb *SMB, pMbCache *SMbCache, iUV i
 	pMF := g_kiQuantMF[kuiQp][:]
 	pFF := g_kiQuantInterFF[kuiQp][:]
 
-	if pEncCtx.pFuncList.pfQuantizationHadamard2x2Skip(pRes, int16(int32(pFF[0])<<1), pMF[0]>>1) != 0 {
+	if WelsHadamardQuant2x2Skip_c(pRes, int16(int32(pFF[0])<<1), pMF[0]>>1) != 0 {
 		return false
 	} else {
 		var aMax [4]int16 // uint16_t aMax[4] in C, passed as (int16_t*)
 		iSingleCtrMb := int32(0)
 		pBlock := pMbCache.pDct.iChromaBlock[((iUV-1)<<2)*16:]
-		pEncCtx.pFuncList.pfQuantizationFour4x4Max(pRes, pFF, pMF, aMax[:])
+		WelsQuantFour4x4Max_c(pRes, pFF, pMF, aMax[:])
 
 		iResOff := 0
 		iBlockOff := 0

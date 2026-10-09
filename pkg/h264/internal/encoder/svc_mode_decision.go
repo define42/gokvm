@@ -24,17 +24,17 @@ func WelsMdSpatialelInterMbIlfmdNoilp(pEncCtx *sWelsEncCtx, pWelsMd *SWelsMD, pS
 	kbMbTopRightAvailPskip := kuiNeighborAvail&TOPRIGHT_MB_POS != 0 && common.IS_SKIP(pCurMb.Add(-kiMbWidth+1).uiMbType)
 
 	bTrySkip := kbMbLeftAvailPskip || kbMbTopAvailPskip || kbMbTopLeftAvailPskip || kbMbTopRightAvailPskip
-	bKeepSkip := kbMbLeftAvailPskip && kbMbTopAvailPskip && kbMbTopRightAvailPskip
+	pMbCache.bKeepSkipScratch = kbMbLeftAvailPskip && kbMbTopAvailPskip && kbMbTopRightAvailPskip
 	bSkip := false
 
-	if pEncCtx.pFuncList.pfInterMdBackgroundDecision(pEncCtx, pWelsMd, pSlice, pCurMb, pMbCache, &bKeepSkip) {
+	if pEncCtx.pFuncList.pfInterMdBackgroundDecision(pEncCtx, pWelsMd, pSlice, pCurMb, pMbCache, &pMbCache.bKeepSkipScratch) {
 		return
 	}
 
 	//step 1: try SKIP
 	bSkip = WelsMdInterJudgePskip(pEncCtx, pWelsMd, pSlice, pCurMb, pMbCache, bTrySkip)
 
-	if bSkip && bKeepSkip {
+	if bSkip && pMbCache.bKeepSkipScratch {
 		WelsMdInterDecidedPskip(pEncCtx, pSlice, pCurMb, pMbCache)
 		return
 	}

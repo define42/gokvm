@@ -45,6 +45,14 @@ type CWelsSliceEncodingTask struct {
 	m_iSliceIdx  int32
 	m_iSliceSize int32
 	m_iThreadIdx int32
+
+	// Go-only: bounded task workers assign stable bitstream-buffer ownership.
+	m_bThreadIndexAssigned bool
+}
+
+func (p *CWelsSliceEncodingTask) setThreadIndex(iThreadIdx int32) {
+	p.m_iThreadIdx = iThreadIdx
+	p.m_bThreadIndexAssigned = true
 }
 
 // NewCWelsSliceEncodingTask is the C++ constructor (new CWelsSliceEncodingTask (pSink, pCtx, iSliceIdx)).

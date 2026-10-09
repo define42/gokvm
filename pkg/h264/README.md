@@ -68,12 +68,12 @@ C++ counterpart. The conventions are in [PORTING.md](PORTING.md).
 
 ## Differences from the C library
 
-* **Single-threaded execution.** Thread-count options are accepted and affect
-  the encoder's bitstream layout (slicing, deblocking across slices) exactly
-  as in C, but the work runs sequentially on the calling goroutine. With the
-  thread count set to "auto" (0), the encoder uses `runtime.NumCPU()`, as C
-  does, so set an explicit count if you need output that is the same on every
-  machine.
+* **Selective encoder concurrency.** Fixed-slice, CAVLC camera encoding with
+  rate control, load balancing, background detection, and adaptive quantization
+  disabled uses bounded Go workers. Decoding and other encoder modes run
+  sequentially. With the thread count set to "auto" (0), the encoder requests
+  `runtime.NumCPU()` and then clamps it to four, as C does, so set an explicit
+  count if you need output that is the same on every machine.
 * **No SIMD.** Expect it to be several times slower than the assembly-optimized
   C build.
 * **Memory safety.** Where the C code would read or write out of bounds on

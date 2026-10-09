@@ -81,7 +81,7 @@ func parseBootArgs(args []string) (*BootArgs, error) {
 	bootCmd.BoolVar(&c.RDPH264, "rdp-h264", false,
 		"enable pure-Go H.264 AVC420 graphics for compatible RDP clients")
 	bootCmd.IntVar(&c.RDPH264Threads, "rdp-h264-threads", 0,
-		"H.264 slices: 0 selects up to 2 automatically, "+
+		"H.264 slices: 0 selects one automatically, "+
 			"1..16 requests a count within the host budget (requires -rdp-h264)")
 	bootCmd.BoolVar(&c.RDPStats, "rdp-stats", false, "log RDP performance statistics every 5 seconds")
 	bootCmd.StringVar(&c.Audio, "audio", "", "audio output: rdp (virtio-snd playback through RDP) or none (default)")

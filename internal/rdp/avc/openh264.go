@@ -8,9 +8,20 @@ import (
 )
 
 const (
-	codecGOPSize = 150
-	codecQP      = 20
+	// RDP runs the AVC stream over an ordered reliable channel and explicitly
+	// requests IDRs for initialization, refreshes, resizes, and encode retries.
+	// Avoid periodic IDR latency and full-desktop repaints between those events.
+	codecIntraPeriod          uint32 = 0
+	codecLoopFilterDisableIDC int32  = 1
+	codecQP                          = 20
 )
+
+// codecConfig keeps policy alternatives private while allowing benchmarks to
+// compare them through the same construction path used in production.
+type codecConfig struct {
+	intraPeriod          uint32
+	loopFilterDisableIDC int32
+}
 
 type openH264Encoder struct {
 	codec         *openh264.Encoder
@@ -19,6 +30,13 @@ type openH264Encoder struct {
 }
 
 func newCodecEncoder(width, height, threads int) (codecEncoder, int, error) {
+	return newCodecEncoderWithConfig(width, height, threads, codecConfig{
+		intraPeriod:          codecIntraPeriod,
+		loopFilterDisableIDC: codecLoopFilterDisableIDC,
+	})
+}
+
+func newCodecEncoderWithConfig(width, height, threads int, config codecConfig) (codecEncoder, int, error) {
 	slices := min(threads, (height+15)/16)
 	param, err := openh264.DefaultEncoderParams(width, height, api.UNSPECIFIED_BIT_RATE, FrameRate)
 	if err != nil {
@@ -26,11 +44,12 @@ func newCodecEncoder(width, height, threads int) (codecEncoder, int, error) {
 	}
 
 	param.IUsageType = api.CAMERA_VIDEO_REAL_TIME
-	param.UiIntraPeriod = codecGOPSize
+	param.UiIntraPeriod = config.intraPeriod
 	param.ITemporalLayerNum = 1
 	param.INumRefFrame = 1
 	param.IRCMode = api.RC_OFF_MODE
-	param.IMultipleThreadIdc = 1
+	param.ILoopFilterDisableIdc = config.loopFilterDisableIDC
+	param.IMultipleThreadIdc = uint16(slices)
 	param.BUseLoadBalancing = false
 	param.BEnableFrameSkip = false
 	param.BEnableSceneChangeDetect = false

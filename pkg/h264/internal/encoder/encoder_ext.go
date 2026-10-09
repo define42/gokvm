@@ -2,9 +2,8 @@
 //
 // The C++ code is translated function by function. The CMemoryAlign
 // parameters are dropped (see doc.go); allocations use make/new and frees
-// assign nil. The multi-threading branches (iMultipleThreadIdc > 1) are kept
-// structurally and call the (sequential) slice threading / task management
-// ports; thread joining and handles are dropped.
+// assign nil. The fixed-slice RDP encoder path uses bounded Go workers;
+// persistent OS thread handles and joins are dropped.
 
 package encoder
 
@@ -1971,7 +1970,7 @@ func WelsUninitEncoderExt(ppCtx **sWelsEncCtx) {
 		"WelsUninitEncoderExt(), pCtx= %p, iMultipleThreadIdc= %d.",
 		*ppCtx, iMultipleThreadIdc)
 
-	// (single-threaded port: there are no slice threads to join)
+	// Slice workers are scoped to one frame and have already joined here.
 
 	if (*ppCtx).pVpp != nil {
 		(*ppCtx).pVpp.FreeSpatialPictures(*ppCtx)
@@ -2269,9 +2268,8 @@ func WelsInitCurrentLayer(pCtx *sWelsEncCtx, kiWidth int32, kiHeight int32) {
 	} else {
 		pNalHdExt.BDiscardableFlag = false
 	}
-	pNalHdExt.BIdrFlag = (pParamInternal.iFrameNum == 0) &&
-		((pCtx.eNalType == common.NAL_UNIT_CODED_SLICE_IDR) ||
-			(pCtx.eSliceType == common.I_SLICE))
+	pNalHdExt.BIdrFlag = pCtx.eSliceType == common.I_SLICE ||
+		((pParamInternal.iFrameNum == 0) && pCtx.eNalType == common.NAL_UNIT_CODED_SLICE_IDR)
 	pNalHdExt.UiTemporalId = pCtx.uiTemporalId
 
 	// pEncPic pData

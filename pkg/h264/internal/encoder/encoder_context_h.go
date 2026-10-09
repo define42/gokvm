@@ -58,8 +58,8 @@ type SStrideTables struct {
 // sWelsEncCtx is the encoder context (struct TagWelsEncCtx).
 //
 // Dropped members: pMemAlign (CMemoryAlign, see doc.go), mutexEncoderError
-// (single-threaded), the STAT_OUTPUT statistics (sStatData, sPerInfo) and the
-// ENABLE_FRAME_DUMP flags (bDependencyRecFlag).
+// (worker results are reduced after joining), the STAT_OUTPUT statistics
+// (sStatData, sPerInfo) and the ENABLE_FRAME_DUMP flags (bDependencyRecFlag).
 type sWelsEncCtx struct {
 	sLogCtx common.SLogContext
 

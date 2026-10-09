@@ -99,10 +99,10 @@
 //   - Static (file-local) helpers and file-local tables are owned by the
 //     .go port of their .cpp file; cross-file tables live in the *_h.go file
 //     of the header that declares them (or encoder_data_tables.go).
-//   - The encoder is single-threaded: thread pools, events and mutexes are
-//     dropped; the task classes (wels_task_*.h) keep a minimal shape and run
-//     their tasks sequentially. SSliceThreading keeps only the per-thread
-//     data the sequential path needs.
+//   - Fixed-slice CAVLC camera encoding with disabled rate control and load
+//     balancing runs on bounded Go worker goroutines. Each worker owns its
+//     slice bitstream buffer; results are reduced after a WaitGroup barrier.
+//     Other task modes remain sequential.
 //
 // The original code is licensed under the BSD 2-Clause license reproduced
 // above; this port is distributed under the same terms.

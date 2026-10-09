@@ -1,7 +1,7 @@
 // Port of codec/encoder/core/inc/mt_defs.h.
 //
-// The port is single-threaded: thread handles, events and mutexes are
-// dropped; only the per-thread data the sequential path uses is kept.
+// Thread handles, events, and mutexes are dropped. Bounded Go workers retain
+// only the per-worker data and bitstream buffers needed by slice encoding.
 
 package encoder
 
@@ -21,7 +21,7 @@ type SSliceThreadPrivateData struct {
 	iThreadIndex int32 // thread index, zero based
 }
 
-// SSliceThreading holds the slice threading resources (sequential placeholder).
+// SSliceThreading holds the slice worker resources.
 // Dropped: eventNamespace, pThreadHandles, all WELS_EVENT / WELS_MUTEX members.
 type SSliceThreading struct {
 	pThreadPEncCtx []SSliceThreadPrivateData // C SSliceThreadPrivateData*: thread context, [iThreadIdx]

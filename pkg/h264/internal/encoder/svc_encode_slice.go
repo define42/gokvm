@@ -427,7 +427,6 @@ func WelsISliceMdEnc(pEncCtx *sWelsEncCtx, pSlice *SSlice) int32 { //pMd + encod
 	iNextMbIdx := kiSliceFirstMbXY
 	kiTotalNumMb := int32(pCurLayer.iMbWidth) * int32(pCurLayer.iMbHeight)
 	iCurMbIdx, iNumMbCoded := int32(0), int32(0)
-	kiSliceIdx := pSlice.iSliceIdx
 	kuiChromaQpIndexOffset := pCurLayer.sLayerInfo.pPpsP.uiChromaQpIndexOffset
 
 	var sMd SWelsMD
@@ -468,8 +467,9 @@ func WelsISliceMdEnc(pEncCtx *sWelsEncCtx, pSlice *SSlice) int32 { //pMd + encod
 			return iEncReturn
 		}
 
-		pCurMb.uiSliceIdc = uint16(kiSliceIdx)
-
+		// uiSliceIdc and neighbour availability are initialized for the whole
+		// picture before workers start. Rewriting the ID here races with
+		// deblocking in an already completed slice.
 		pEncCtx.pFuncList.pfMdBackgroundInfoUpdate(pCurLayer, pCurMb, pMbCache.bCollocatedPredFlag, common.I_SLICE)
 		pEncCtx.pFuncList.pfRc.pfWelsRcMbInfoUpdate(pEncCtx, pCurMb, sMd.iCostLuma, pSlice)
 
@@ -574,7 +574,7 @@ func WelsISliceMdEncDynamic(pEncCtx *sWelsEncCtx, pSlice *SSlice) int32 { //pMd 
 // WelsPSliceMdEnc encapsulates two kinds of reconstruction:
 // first. store base or highest Dependency Layer with only one quality (without CS RS reconstruction)
 // second. lower than highest Dependency Layer, and for every Dependency Layer with one quality layer(single layer)
-func WelsPSliceMdEnc(pEncCtx *sWelsEncCtx, pSlice *SSlice, kbIsHighestDlayerFlag bool) int32 { //pMd + encoding
+func WelsPSliceMdEnc(pEncCtx *sWelsEncCtx, pSlice *SSlice, kbIsHighestDlayerFlag bool, pfInterMd PInterMdFunc) int32 { //pMd + encoding
 	kpShExt := &pSlice.sSliceHeaderExt
 	kpSh := &kpShExt.sSliceHeader
 	kiSliceFirstMbXY := kpSh.iFirstMbInSlice
@@ -587,10 +587,10 @@ func WelsPSliceMdEnc(pEncCtx *sWelsEncCtx, pSlice *SSlice, kbIsHighestDlayerFlag
 	}
 
 	//pMb loop
-	return WelsMdInterMbLoop(pEncCtx, pSlice, &sMd, kiSliceFirstMbXY)
+	return WelsMdInterMbLoop(pEncCtx, pSlice, &sMd, kiSliceFirstMbXY, pfInterMd)
 }
 
-func WelsPSliceMdEncDynamic(pEncCtx *sWelsEncCtx, pSlice *SSlice, kbIsHighestDlayerFlag bool) int32 {
+func WelsPSliceMdEncDynamic(pEncCtx *sWelsEncCtx, pSlice *SSlice, kbIsHighestDlayerFlag bool, pfInterMd PInterMdFunc) int32 {
 	kpShExt := &pSlice.sSliceHeaderExt
 	kpSh := &kpShExt.sSliceHeader
 	kiSliceFirstMbXY := kpSh.iFirstMbInSlice
@@ -603,7 +603,7 @@ func WelsPSliceMdEncDynamic(pEncCtx *sWelsEncCtx, pSlice *SSlice, kbIsHighestDla
 	}
 
 	//mb loop
-	return WelsMdInterMbLoopOverDynamicSlice(pEncCtx, pSlice, &sMd, kiSliceFirstMbXY)
+	return WelsMdInterMbLoopOverDynamicSlice(pEncCtx, pSlice, &sMd, kiSliceFirstMbXY, pfInterMd)
 }
 
 func WelsCodePSlice(pEncCtx *sWelsEncCtx, pSlice *SSlice) int32 {
@@ -614,15 +614,11 @@ func WelsCodePSlice(pEncCtx *sWelsEncCtx, pSlice *SSlice) int32 {
 	kbHighestSpatial := pEncCtx.pSvcParam.ISpatialLayerNum ==
 		(int32(pCurLayer.sLayerInfo.sNalHeaderExt.UiDependencyId) + 1)
 
-	//MD switch
+	pfInterMd := PInterMdFunc(WelsMdInterMb)
 	if kbBaseAvail && kbHighestSpatial {
-		//initial pMd pointer
-		pEncCtx.pFuncList.pfInterMd = WelsMdInterMbEnhancelayer
-	} else {
-		//initial pMd pointer
-		pEncCtx.pFuncList.pfInterMd = WelsMdInterMb
+		pfInterMd = WelsMdInterMbEnhancelayer
 	}
-	return WelsPSliceMdEnc(pEncCtx, pSlice, kbHighestSpatial)
+	return WelsPSliceMdEnc(pEncCtx, pSlice, kbHighestSpatial, pfInterMd)
 }
 
 func WelsCodePOverDynamicSlice(pEncCtx *sWelsEncCtx, pSlice *SSlice) int32 {
@@ -633,15 +629,11 @@ func WelsCodePOverDynamicSlice(pEncCtx *sWelsEncCtx, pSlice *SSlice) int32 {
 	kbHighestSpatial := pEncCtx.pSvcParam.ISpatialLayerNum ==
 		(int32(pCurLayer.sLayerInfo.sNalHeaderExt.UiDependencyId) + 1)
 
-	//MD switch
+	pfInterMd := PInterMdFunc(WelsMdInterMb)
 	if kbBaseAvail && kbHighestSpatial {
-		//initial pMd pointer
-		pEncCtx.pFuncList.pfInterMd = WelsMdInterMbEnhancelayer
-	} else {
-		//initial pMd pointer
-		pEncCtx.pFuncList.pfInterMd = WelsMdInterMb
+		pfInterMd = WelsMdInterMbEnhancelayer
 	}
-	return WelsPSliceMdEncDynamic(pEncCtx, pSlice, kbHighestSpatial)
+	return WelsPSliceMdEncDynamic(pEncCtx, pSlice, kbHighestSpatial, pfInterMd)
 }
 
 // 1st index: 0: for P pSlice; 1: for I pSlice;
@@ -1399,7 +1391,6 @@ func WelsCodeOneSlice(pEncCtx *sWelsEncCtx, pCurSlice *SSlice, kiNalType int32) 
 		kiDynamicSliceFlag = 1
 	}
 	if common.I_SLICE == pEncCtx.eSliceType {
-		pNalHeadExt.BIdrFlag = true
 		pCurSlice.sScaleShift = 0
 	} else {
 		kuiTemporalId := uint32(pNalHeadExt.UiTemporalId)
@@ -1561,7 +1552,7 @@ func WelsInitInterMDStruc(pCurMb *SMB, pMvdCostTable []uint16, iMvdCostTableOff 
 
 // WelsMdInterMbLoop is for inter non-dynamic pSlice.
 // pWelsMd: void* that is a SWelsMD*.
-func WelsMdInterMbLoop(pEncCtx *sWelsEncCtx, pSlice *SSlice, pWelsMd *SWelsMD, kiSliceFirstMbXY int32) int32 {
+func WelsMdInterMbLoop(pEncCtx *sWelsEncCtx, pSlice *SSlice, pWelsMd *SWelsMD, kiSliceFirstMbXY int32, pfInterMd PInterMdFunc) int32 {
 	pMd := pWelsMd
 	pBs := pSlice.pSliceBsa
 	pCurLayer := pEncCtx.pCurDqLayer
@@ -1574,7 +1565,6 @@ func WelsMdInterMbLoop(pEncCtx *sWelsEncCtx, pSlice *SSlice, pWelsMd *SWelsMD, k
 	kiTotalNumMb := int32(pCurLayer.iMbWidth) * int32(pCurLayer.iMbHeight)
 	kiMvdInterTableStride := pEncCtx.iMvdCostTableStride
 	pMvdCostTable, iMvdCostTableOff := pEncCtx.pMvdCostTable, int(pEncCtx.iMvdCostTableSize)
-	kiSliceIdx := pSlice.iSliceIdx
 	kuiChromaQpIndexOffset := pCurLayer.sLayerInfo.pPpsP.uiChromaQpIndexOffset
 	iEncReturn := int32(ENC_RETURN_SUCCESS)
 	var sDss SDynamicSlicingStack
@@ -1602,7 +1592,7 @@ func WelsMdInterMbLoop(pEncCtx *sWelsEncCtx, pSlice *SSlice, pWelsMd *SWelsMD, k
 
 		for { // TRY_REENCODING:
 			WelsInitInterMDStruc(pCurMb, pMvdCostTable, iMvdCostTableOff, kiMvdInterTableStride, pMd)
-			pEncCtx.pFuncList.pfInterMd(pEncCtx, pMd, pSlice, pCurMb, pMbCache)
+			pfInterMd(pEncCtx, pMd, pSlice, pCurMb, pMbCache)
 			//mb_qp
 
 			//step (4): save from the MD process from future use
@@ -1630,8 +1620,9 @@ func WelsMdInterMbLoop(pEncCtx *sWelsEncCtx, pSlice *SSlice, pWelsMd *SWelsMD, k
 			return iEncReturn
 		}
 
+		// uiSliceIdc is initialized before workers start; deblocking in another
+		// completed slice can read it while this slice is still encoding.
 		//step (7): reconstruct current MB
-		pCurMb.uiSliceIdc = uint16(kiSliceIdx)
 		OutputPMbWithoutConstructCsRsNoCopy(pEncCtx, pCurLayer, pSlice, pCurMb)
 
 		//step (8): update status and other parameters
@@ -1654,7 +1645,7 @@ func WelsMdInterMbLoop(pEncCtx *sWelsEncCtx, pSlice *SSlice, pWelsMd *SWelsMD, k
 }
 
 // WelsMdInterMbLoopOverDynamicSlice is only for inter dynamic slicing.
-func WelsMdInterMbLoopOverDynamicSlice(pEncCtx *sWelsEncCtx, pSlice *SSlice, pWelsMd *SWelsMD, kiSliceFirstMbXY int32) int32 {
+func WelsMdInterMbLoopOverDynamicSlice(pEncCtx *sWelsEncCtx, pSlice *SSlice, pWelsMd *SWelsMD, kiSliceFirstMbXY int32, pfInterMd PInterMdFunc) int32 {
 	pMd := pWelsMd
 	pBs := pSlice.pSliceBsa
 	pCurLayer := pEncCtx.pCurDqLayer
@@ -1709,7 +1700,7 @@ func WelsMdInterMbLoopOverDynamicSlice(pEncCtx *sWelsEncCtx, pSlice *SSlice, pWe
 
 		for { // TRY_REENCODING:
 			WelsInitInterMDStruc(pCurMb, pMvdCostTable, iMvdCostTableOff, kiMvdInterTableStride, pMd)
-			pEncCtx.pFuncList.pfInterMd(pEncCtx, pMd, pSlice, pCurMb, pMbCache)
+			pfInterMd(pEncCtx, pMd, pSlice, pCurMb, pMbCache)
 			//mb_qp
 
 			//step (4): save from the MD process from future use

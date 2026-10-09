@@ -1,7 +1,7 @@
 // Port of codec/encoder/core/src/wels_task_encoder.cpp.
 //
-// The tasks run sequentially (see wels_task_management.go); the mutexes that
-// guard the shared thread state in C are dropped.
+// Fixed-slice tasks use stable worker indexes so every worker owns one private
+// bitstream buffer without a lock.
 
 package encoder
 
@@ -17,6 +17,7 @@ func (p *CWelsSliceEncodingTask) ctorCWelsSliceEncodingTask(pSink IWelsTaskSink,
 	p.m_eTaskResult = ENC_RETURN_SUCCESS
 	p.m_pCtx = pCtx
 	p.m_iSliceIdx = iSliceIdx
+	p.m_iThreadIdx = -1
 }
 
 // Destruct is the destructor CWelsSliceEncodingTask::~CWelsSliceEncodingTask (empty).
@@ -59,25 +60,31 @@ func (p *CWelsSliceEncodingTask) InitTask() WelsErrorType {
 	p.m_eNalRefIdc = p.m_pCtx.eNalPriority
 	p.m_bNeedPrefix = p.m_pCtx.bNeedPrefixNalFlag
 
-	p.m_iThreadIdx = p.QueryEmptyThread(p.m_pCtx.pSliceThreading.bThreadBsBufferUsage[:])
+	if !p.m_bThreadIndexAssigned {
+		p.m_iThreadIdx = p.QueryEmptyThread(p.m_pCtx.pSliceThreading.bThreadBsBufferUsage[:])
+	}
 
 	common.WelsLog(&p.m_pCtx.sLogCtx, api.WELS_LOG_DEBUG,
 		"[MT] CWelsSliceEncodingTask()InitTask for m_iSliceIdx %d, lock thread %d",
 		p.m_iSliceIdx, p.m_iThreadIdx)
-	if p.m_iThreadIdx < 0 {
+	if p.m_iThreadIdx < 0 || p.m_iThreadIdx >= MAX_THREADS_NUM ||
+		p.m_pCtx.pSliceThreading.pThreadBsBuffer[p.m_iThreadIdx] == nil {
 		common.WelsLog(&p.m_pCtx.sLogCtx, api.WELS_LOG_WARNING,
 			"[MT] CWelsSliceEncodingTask InitTask(), Cannot find available thread for m_iSliceIdx = %d", p.m_iSliceIdx)
+		p.releaseThreadBuffer()
 		return ENC_RETURN_UNEXPECTED
 	}
 
 	iReturn := InitOneSliceInThread(p.m_pCtx, &p.m_pSlice, p.m_iThreadIdx, int32(p.m_pCtx.uiDependencyId), p.m_iSliceIdx)
 	if iReturn != ENC_RETURN_SUCCESS {
+		p.releaseThreadBuffer()
 		return iReturn
 	}
 	p.m_pSliceBs = &p.m_pSlice.sSliceBs
 
 	iReturn = SetSliceBoundaryInfo(p.m_pCtx.pCurDqLayer, p.m_pSlice, p.m_iSliceIdx)
 	if iReturn != ENC_RETURN_SUCCESS {
+		p.releaseThreadBuffer()
 		return iReturn
 	}
 
@@ -89,17 +96,19 @@ func (p *CWelsSliceEncodingTask) InitTask() WelsErrorType {
 	return ENC_RETURN_SUCCESS
 }
 
-func (p *CWelsSliceEncodingTask) FinishTask() {
+func (p *CWelsSliceEncodingTask) releaseThreadBuffer() {
+	if p.m_bThreadIndexAssigned || p.m_iThreadIdx < 0 || p.m_iThreadIdx >= MAX_THREADS_NUM {
+		return
+	}
 	p.m_pCtx.pSliceThreading.bThreadBsBufferUsage[p.m_iThreadIdx] = false
+	p.m_iThreadIdx = -1
+}
 
+func (p *CWelsSliceEncodingTask) FinishTask() {
 	common.WelsLog(&p.m_pCtx.sLogCtx, api.WELS_LOG_DEBUG,
 		"[MT] CWelsSliceEncodingTask()FinishTask for m_iSliceIdx %d, unlock thread %d",
 		p.m_iSliceIdx, p.m_iThreadIdx)
-
-	//sync multi-threading error
-	if ENC_RETURN_SUCCESS != p.m_eTaskResult {
-		p.m_pCtx.iEncoderError |= p.m_eTaskResult
-	}
+	p.releaseThreadBuffer()
 }
 
 func sliceTypeChar(eSliceType common.EWelsSliceType) string {

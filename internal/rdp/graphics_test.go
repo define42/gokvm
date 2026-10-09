@@ -85,6 +85,124 @@ func TestGraphicsChannelNegotiationAndAcknowledgments(t *testing.T) {
 	}
 }
 
+func TestGraphicsAcknowledgmentAdaptation(t *testing.T) {
+	t.Parallel()
+	const bytesPerFrame = 1000
+	base := time.Second / 60
+	now := time.Unix(100, 0)
+	g := graphicsState{
+		ready: true, baseInterval: base, averageBytes: bytesPerFrame,
+	}
+
+	// Three buffered frames slow 60 Hz pacing to 15 Hz immediately.
+	g.adaptAcknowledgments(3*bytesPerFrame,
+		graphicsPendingFrame{id: 1, sentAt: now.Add(-10 * time.Millisecond)}, now)
+	slow := 4 * base
+	if g.frameInterval != slow {
+		t.Fatalf("queue slowdown = %v, want %v", g.frameInterval, slow)
+	}
+
+	// QUEUE_DEPTH_UNAVAILABLE cannot prove an empty queue. A fast ACK still
+	// permits gradual recovery instead of snapping directly back to 60 Hz.
+	g.adaptAcknowledgments(0,
+		graphicsPendingFrame{id: 2, sentAt: now.Add(-10 * time.Millisecond)}, now)
+	if g.frameInterval <= base || g.frameInterval >= slow {
+		t.Fatalf("first recovery interval = %v, want between %v and %v", g.frameInterval, base, slow)
+	}
+	for id := uint32(3); id < 32; id++ {
+		g.adaptAcknowledgments(0,
+			graphicsPendingFrame{id: id, sentAt: now.Add(-10 * time.Millisecond)}, now)
+	}
+	if g.frameInterval != base {
+		t.Fatalf("recovered interval = %v, want %v", g.frameInterval, base)
+	}
+
+	g.resetAcknowledgments()
+	g.averageBytes = bytesPerFrame
+	g.adaptAcknowledgments(0,
+		graphicsPendingFrame{id: 32, sentAt: now.Add(-100 * time.Millisecond)}, now)
+	if want := 50 * time.Millisecond; g.frameInterval != want {
+		t.Fatalf("turnaround slowdown = %v, want %v", g.frameInterval, want)
+	}
+
+	g.resetAcknowledgments()
+	g.averageBytes = bytesPerFrame
+	g.adaptAcknowledgments(^uint32(0)-1,
+		graphicsPendingFrame{id: 33, sentAt: now.Add(-2 * time.Second)}, now)
+	if g.frameInterval != graphicsMaxFrameInterval {
+		t.Fatalf("maximum slowdown = %v, want %v", g.frameInterval, graphicsMaxFrameInterval)
+	}
+}
+
+func TestGraphicsAcknowledgmentIsolationAndReset(t *testing.T) {
+	t.Parallel()
+	base := time.Second / 60
+	now := time.Now()
+	g := &graphicsState{
+		ready: true, baseInterval: base, averageBytes: 1000,
+		frameInterval: 4 * base,
+		inFlight: []graphicsPendingFrame{
+			{id: 7, sentAt: now.Add(-10 * time.Millisecond)},
+			{id: 8, sentAt: now.Add(-10 * time.Millisecond)},
+		},
+	}
+	s := &Session{graphics: g}
+	ack := make([]byte, 12)
+	binary.LittleEndian.PutUint32(ack, 8000)
+	binary.LittleEndian.PutUint32(ack[4:], 99)
+	if err := s.readGraphicsPDU(0x0d, ack); err != nil {
+		t.Fatal(err)
+	}
+	if g.frameInterval != 4*base || len(g.inFlight) != 2 {
+		t.Fatal("unknown frame acknowledgment changed pacing or the send window")
+	}
+
+	qoe := make([]byte, 12)
+	binary.LittleEndian.PutUint32(qoe, 7)
+	binary.LittleEndian.PutUint32(qoe[4:], 1234)
+	binary.LittleEndian.PutUint16(qoe[8:], 20)
+	binary.LittleEndian.PutUint16(qoe[10:], 30)
+	if err := s.readGraphicsPDU(0x16, qoe); err != nil {
+		t.Fatal(err)
+	}
+	if g.frameInterval != 4*base || len(g.inFlight) != 2 {
+		t.Fatal("informational QoE acknowledgment changed pacing")
+	}
+
+	binary.LittleEndian.PutUint32(ack[4:], 7)
+	if err := s.readGraphicsPDU(0x0d, ack); err != nil {
+		t.Fatal(err)
+	}
+	if want := 9 * base; g.frameInterval != want ||
+		len(g.inFlight) != 1 || g.inFlight[0].id != 8 {
+		t.Fatalf("recognized acknowledgment: interval=%v in-flight=%v, want %v and frame 8",
+			g.frameInterval, g.inFlight, want)
+	}
+
+	binary.LittleEndian.PutUint32(ack, ^uint32(0))
+	if err := s.readGraphicsPDU(0x0d, ack); err != nil {
+		t.Fatal(err)
+	}
+	if !g.ackOff || len(g.inFlight) != 0 || g.averageBytes != 0 ||
+		g.ackTurnaround != 0 || g.frameInterval != 0 {
+		t.Fatal("suspended acknowledgments did not reset pacing state")
+	}
+
+	// The first ordinary ACK opts back in. Its untracked ID must not seed
+	// adaptation from the previous acknowledgment generation.
+	binary.LittleEndian.PutUint32(ack, 0)
+	binary.LittleEndian.PutUint32(ack[4:], 8)
+	if err := s.readGraphicsPDU(0x0d, ack); err != nil {
+		t.Fatal(err)
+	}
+	if g.ackOff || g.frameInterval != 0 {
+		t.Fatal("acknowledgment resume reused stale pacing state")
+	}
+	if got := s.GraphicsFrameInterval(base); got != base {
+		t.Fatalf("post-resume interval = %v, want %v", got, base)
+	}
+}
+
 func TestGraphicsChangesWakeWriter(t *testing.T) {
 	t.Parallel()
 	if new(Session).GraphicsChanged() != nil {

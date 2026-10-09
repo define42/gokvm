@@ -433,6 +433,74 @@ func (s *Session) writeMCS(data []byte) error {
 	return err
 }
 
+// writeWire writes one or more complete TPKT packets as a contiguous batch.
+// Callers must not reuse data until this synchronous call returns.
+func (s *Session) writeWire(data []byte) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	if s.writeTimeout != 0 {
+		if err := s.conn.SetWriteDeadline(time.Now().Add(s.writeTimeout)); err != nil {
+			return err
+		}
+	}
+	err := writeFull(s.conn, data)
+	if s.writeTimeout != 0 {
+		if clearErr := s.conn.SetWriteDeadline(time.Time{}); err == nil {
+			err = clearErr
+		}
+	}
+
+	return err
+}
+
+func channelTPKTSize(payloadLength int) int {
+	perLength := 1
+	if payloadLength >= 128 {
+		perLength = 2
+	}
+
+	return 4 + 3 + 6 + perLength + payloadLength
+}
+
+// appendChannelTPKT appends one complete server-to-client MCS channel packet.
+// header and payload remain caller-owned; their bytes are copied directly into
+// dst without constructing the intermediate static-channel, MCS, or TPKT
+// slices used by the general control-message path.
+func appendChannelTPKT(dst []byte, channel uint16, header, payload []byte) ([]byte, error) {
+	payloadLength := len(header) + len(payload)
+	if payloadLength > maxUserData {
+		return dst, errors.New("rdp: MCS data exceeds PER limit")
+	}
+	packetLength := channelTPKTSize(payloadLength)
+	start := len(dst)
+	if cap(dst)-start < packetLength {
+		capacity := max(cap(dst)*2, start+packetLength)
+		grown := make([]byte, start, capacity)
+		copy(grown, dst)
+		dst = grown
+	}
+	dst = dst[:start+packetLength]
+	packet := dst[start:]
+	packet[0], packet[1] = 3, 0
+	binary.BigEndian.PutUint16(packet[2:4], uint16(packetLength))
+	packet[4], packet[5], packet[6] = 2, 0xf0, 0x80
+	packet[7], packet[8], packet[9] = 0x68, 0, 1
+	packet[10], packet[11], packet[12] = byte(channel>>8), byte(channel), 0x70
+	offset := 13
+	if payloadLength < 128 {
+		packet[offset] = byte(payloadLength)
+		offset++
+	} else {
+		packet[offset], packet[offset+1] = byte(payloadLength>>8)|0x80, byte(payloadLength)
+		offset += 2
+	}
+	offset += copy(packet[offset:], header)
+	copy(packet[offset:], payload)
+
+	return dst, nil
+}
+
 func readTransport(r io.Reader) ([]byte, bool, error) {
 	var prefix [2]byte
 	if _, err := io.ReadFull(r, prefix[:]); err != nil {
@@ -484,15 +552,19 @@ func writeTPKT(w io.Writer, payload []byte) error {
 	packet[0] = 3
 	binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
 	copy(packet[4:], payload)
-	for len(packet) > 0 {
-		n, err := w.Write(packet)
+	return writeFull(w, packet)
+}
+
+func writeFull(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := w.Write(data)
 		if err != nil {
 			return err
 		}
 		if n == 0 {
 			return io.ErrShortWrite
 		}
-		packet = packet[n:]
+		data = data[n:]
 	}
 
 	return nil

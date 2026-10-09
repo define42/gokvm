@@ -15,7 +15,7 @@ func TestRDPEncoderSliceLimits(t *testing.T) {
 		name                     string
 		cpus, guest, limit, want int
 	}{
-		{"automatic", 8, 2, 0, 2},
+		{"automatic", 8, 2, 0, 1},
 		{"one slice", 8, 2, 1, 1},
 		{"explicit", 8, 2, 4, 4},
 		{"host and guest reservation", 8, 2, 16, 5},

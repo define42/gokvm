@@ -38,14 +38,15 @@ type SWelsME struct {
 	pMvdCost    []uint16
 	iMvdCostOff int
 
-	uSadPredISatd      uint32 // reuse the sad_pred as a temp pData (union uiSadPred / uiSatd)
-	uiSadCost          uint32 // used by ME and RC //max SAD should be max_delta*size+lambda*mvdsize = 255*256+91*33*2 = 65280 + 6006 = 71286 > (2^16)-1 = 65535
-	uiSatdCost         uint32 /* satd + lm * nbits */
-	uiSadCostThreshold uint32
-	iCurMeBlockPixX    int32
-	iCurMeBlockPixY    int32
-	uiBlockSize        uint8 /* BLOCK_WxH */
-	uiReserved         uint8
+	uSadPredISatd       uint32 // reuse the sad_pred as a temp pData (union uiSadPred / uiSatd)
+	uiSadCost           uint32 // used by ME and RC //max SAD should be max_delta*size+lambda*mvdsize = 255*256+91*33*2 = 65280 + 6006 = 71286 > (2^16)-1 = 65535
+	uiSatdCost          uint32 /* satd + lm * nbits */
+	uiSadCostThreshold  uint32
+	iCurMeBlockPixX     int32
+	iCurMeBlockPixY     int32
+	uiBlockSize         uint8 /* BLOCK_WxH */
+	uiReserved          uint8
+	iDirectionalSadCost int32 // scratch for runtime-selected directional-MV checks
 
 	// C uint8_t* pEncMb / pRefMb / pColoRefMb: pixel pointers -> (slice, offset).
 	// pEncMb: source picture; pRefMb/pColoRefMb: reference picture (pRefMb may also

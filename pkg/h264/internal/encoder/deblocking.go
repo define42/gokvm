@@ -203,6 +203,9 @@ func DeblockingBSMarginalMBAvcbase(pCurMb *SMB, pNeighMb *SMB, iEdge int32) uint
 	return uint32(pBS[0]) | uint32(pBS[1])<<8 | uint32(pBS[2])<<16 | uint32(pBS[3])<<24
 }
 
+// The Go port currently installs only the generic deblocking kernels. Calling
+// them directly lets escape analysis keep the per-edge scratch arrays on stack.
+
 // pPix: picture pixel pointer -> (slice, offset); pBS: uint8_t* to the 4 BS values of an edge (uiBS[d][e][:]).
 func FilteringEdgeLumaH(pfDeblocking *DeblockingFunc, pFilter *SDeblockingFilter, pPix []uint8, iPixOff int, iStride int32, pBS []uint8) {
 	var iTc [4]int8
@@ -210,7 +213,7 @@ func FilteringEdgeLumaH(pfDeblocking *DeblockingFunc, pFilter *SDeblockingFilter
 
 	if iAlpha|iBeta != 0 {
 		dbkTc0TblLookup(iTc[:], iIdexA, pBS, 0)
-		pfDeblocking.pfLumaDeblockingLT4Ver(pPix, iPixOff, iStride, iAlpha, iBeta, iTc[:])
+		common.DeblockLumaLt4V_c(pPix, iPixOff, iStride, iAlpha, iBeta, iTc[:])
 	}
 }
 
@@ -220,7 +223,7 @@ func FilteringEdgeLumaV(pfDeblocking *DeblockingFunc, pFilter *SDeblockingFilter
 
 	if iAlpha|iBeta != 0 {
 		dbkTc0TblLookup(iTc[:], iIdexA, pBS, 0)
-		pfDeblocking.pfLumaDeblockingLT4Hor(pPix, iPixOff, iStride, iAlpha, iBeta, iTc[:])
+		common.DeblockLumaLt4H_c(pPix, iPixOff, iStride, iAlpha, iBeta, iTc[:])
 	}
 }
 
@@ -228,7 +231,7 @@ func FilteringEdgeLumaIntraH(pfDeblocking *DeblockingFunc, pFilter *SDeblockingF
 	_, iAlpha, iBeta := dbkGetAlphaBetaFromQp(int32(pFilter.uiLumaQP), int32(pFilter.iSliceAlphaC0Offset), int32(pFilter.iSliceBetaOffset))
 
 	if iAlpha|iBeta != 0 {
-		pfDeblocking.pfLumaDeblockingEQ4Ver(pPix, iPixOff, iStride, iAlpha, iBeta)
+		common.DeblockLumaEq4V_c(pPix, iPixOff, iStride, iAlpha, iBeta)
 	}
 }
 
@@ -236,7 +239,7 @@ func FilteringEdgeLumaIntraV(pfDeblocking *DeblockingFunc, pFilter *SDeblockingF
 	_, iAlpha, iBeta := dbkGetAlphaBetaFromQp(int32(pFilter.uiLumaQP), int32(pFilter.iSliceAlphaC0Offset), int32(pFilter.iSliceBetaOffset))
 
 	if iAlpha|iBeta != 0 {
-		pfDeblocking.pfLumaDeblockingEQ4Hor(pPix, iPixOff, iStride, iAlpha, iBeta)
+		common.DeblockLumaEq4H_c(pPix, iPixOff, iStride, iAlpha, iBeta)
 	}
 }
 
@@ -246,7 +249,7 @@ func FilteringEdgeChromaH(pfDeblocking *DeblockingFunc, pFilter *SDeblockingFilt
 
 	if iAlpha|iBeta != 0 {
 		dbkTc0TblLookup(iTc[:], iIdexA, pBS, 1)
-		pfDeblocking.pfChromaDeblockingLT4Ver(pPixCb, iPixCbOff, pPixCr, iPixCrOff, iStride, iAlpha, iBeta, iTc[:])
+		common.DeblockChromaLt4V_c(pPixCb, iPixCbOff, pPixCr, iPixCrOff, iStride, iAlpha, iBeta, iTc[:])
 	}
 }
 
@@ -256,7 +259,7 @@ func FilteringEdgeChromaV(pfDeblocking *DeblockingFunc, pFilter *SDeblockingFilt
 
 	if iAlpha|iBeta != 0 {
 		dbkTc0TblLookup(iTc[:], iIdexA, pBS, 1)
-		pfDeblocking.pfChromaDeblockingLT4Hor(pPixCb, iPixCbOff, pPixCr, iPixCrOff, iStride, iAlpha, iBeta, iTc[:])
+		common.DeblockChromaLt4H_c(pPixCb, iPixCbOff, pPixCr, iPixCrOff, iStride, iAlpha, iBeta, iTc[:])
 	}
 }
 
@@ -264,7 +267,7 @@ func FilteringEdgeChromaIntraH(pfDeblocking *DeblockingFunc, pFilter *SDeblockin
 	_, iAlpha, iBeta := dbkGetAlphaBetaFromQp(int32(pFilter.uiChromaQP), int32(pFilter.iSliceAlphaC0Offset), int32(pFilter.iSliceBetaOffset))
 
 	if iAlpha|iBeta != 0 {
-		pfDeblocking.pfChromaDeblockingEQ4Ver(pPixCb, iPixCbOff, pPixCr, iPixCrOff, iStride, iAlpha, iBeta)
+		common.DeblockChromaEq4V_c(pPixCb, iPixCbOff, pPixCr, iPixCrOff, iStride, iAlpha, iBeta)
 	}
 }
 
@@ -272,7 +275,7 @@ func FilteringEdgeChromaIntraV(pfDeblocking *DeblockingFunc, pFilter *SDeblockin
 	_, iAlpha, iBeta := dbkGetAlphaBetaFromQp(int32(pFilter.uiChromaQP), int32(pFilter.iSliceAlphaC0Offset), int32(pFilter.iSliceBetaOffset))
 
 	if iAlpha|iBeta != 0 {
-		pfDeblocking.pfChromaDeblockingEQ4Hor(pPixCb, iPixCbOff, pPixCr, iPixCrOff, iStride, iAlpha, iBeta)
+		common.DeblockChromaEq4H_c(pPixCb, iPixCbOff, pPixCr, iPixCrOff, iStride, iAlpha, iBeta)
 	}
 }
 
@@ -388,9 +391,9 @@ func FilteringEdgeLumaHV(pfDeblocking *DeblockingFunc, pCurMb *SMB, pFilter *SDe
 	iIdexA, iAlpha, iBeta := dbkGetAlphaBetaFromQp(int32(pFilter.uiLumaQP), int32(pFilter.iSliceAlphaC0Offset), int32(pFilter.iSliceBetaOffset))
 	if iAlpha|iBeta != 0 {
 		dbkTc0TblLookup(iTc[:], iIdexA, uiBSx4[:], 0)
-		pfDeblocking.pfLumaDeblockingLT4Hor(pDestY, oY+(1<<2), iLineSize, iAlpha, iBeta, iTc[:])
-		pfDeblocking.pfLumaDeblockingLT4Hor(pDestY, oY+(2<<2), iLineSize, iAlpha, iBeta, iTc[:])
-		pfDeblocking.pfLumaDeblockingLT4Hor(pDestY, oY+(3<<2), iLineSize, iAlpha, iBeta, iTc[:])
+		common.DeblockLumaLt4H_c(pDestY, oY+(1<<2), iLineSize, iAlpha, iBeta, iTc[:])
+		common.DeblockLumaLt4H_c(pDestY, oY+(2<<2), iLineSize, iAlpha, iBeta, iTc[:])
+		common.DeblockLumaLt4H_c(pDestY, oY+(3<<2), iLineSize, iAlpha, iBeta, iTc[:])
 	}
 
 	// luma h
@@ -401,9 +404,9 @@ func FilteringEdgeLumaHV(pfDeblocking *DeblockingFunc, pCurMb *SMB, pFilter *SDe
 
 	pFilter.uiLumaQP = uint8(iCurQp)
 	if iAlpha|iBeta != 0 {
-		pfDeblocking.pfLumaDeblockingLT4Ver(pDestY, oY+int((1<<2)*iLineSize), iLineSize, iAlpha, iBeta, iTc[:])
-		pfDeblocking.pfLumaDeblockingLT4Ver(pDestY, oY+int((2<<2)*iLineSize), iLineSize, iAlpha, iBeta, iTc[:])
-		pfDeblocking.pfLumaDeblockingLT4Ver(pDestY, oY+int((3<<2)*iLineSize), iLineSize, iAlpha, iBeta, iTc[:])
+		common.DeblockLumaLt4V_c(pDestY, oY+int((1<<2)*iLineSize), iLineSize, iAlpha, iBeta, iTc[:])
+		common.DeblockLumaLt4V_c(pDestY, oY+int((2<<2)*iLineSize), iLineSize, iAlpha, iBeta, iTc[:])
+		common.DeblockLumaLt4V_c(pDestY, oY+int((3<<2)*iLineSize), iLineSize, iAlpha, iBeta, iTc[:])
 	}
 }
 
@@ -430,7 +433,7 @@ func FilteringEdgeChromaHV(pfDeblocking *DeblockingFunc, pCurMb *SMB, pFilter *S
 	iIdexA, iAlpha, iBeta := dbkGetAlphaBetaFromQp(int32(pFilter.uiChromaQP), int32(pFilter.iSliceAlphaC0Offset), int32(pFilter.iSliceBetaOffset))
 	if iAlpha|iBeta != 0 {
 		dbkTc0TblLookup(iTc[:], iIdexA, uiBSx4[:], 1)
-		pfDeblocking.pfChromaDeblockingLT4Hor(pDestCb, oCb+(2<<1), pDestCr, oCr+(2<<1), iLineSize, iAlpha, iBeta, iTc[:])
+		common.DeblockChromaLt4H_c(pDestCb, oCb+(2<<1), pDestCr, oCr+(2<<1), iLineSize, iAlpha, iBeta, iTc[:])
 	}
 
 	// chroma h
@@ -441,7 +444,7 @@ func FilteringEdgeChromaHV(pfDeblocking *DeblockingFunc, pCurMb *SMB, pFilter *S
 
 	pFilter.uiChromaQP = uint8(iCurQp)
 	if iAlpha|iBeta != 0 {
-		pfDeblocking.pfChromaDeblockingLT4Ver(pDestCb, oCb+int((2<<1)*iLineSize), pDestCr, oCr+int((2<<1)*iLineSize), iLineSize, iAlpha,
+		common.DeblockChromaLt4V_c(pDestCb, oCb+int((2<<1)*iLineSize), pDestCr, oCr+int((2<<1)*iLineSize), iLineSize, iAlpha,
 			iBeta, iTc[:])
 	}
 }
@@ -509,7 +512,7 @@ func DeblockingMbAvcbase(pFunc *SWelsFuncPtrList, pCurMb *SMB, pFilter *SDeblock
 	case common.MB_TYPE_INTRA4x4, common.MB_TYPE_INTRA16x16, common.MB_TYPE_INTRA_PCM:
 		DeblockingIntraMb(&pFunc.pfDeblocking, pCurMb, pFilter)
 	default:
-		pFunc.pfDeblocking.pfDeblockingBSCalc(pFunc, pCurMb, &uiBS, uiCurMbType, iMbStride, iLeftFlag, iTopFlag)
+		DeblockingBSCalc_c(pFunc, pCurMb, &uiBS, uiCurMbType, iMbStride, iLeftFlag, iTopFlag)
 		DeblockingInterMb(&pFunc.pfDeblocking, pCurMb, pFilter, &uiBS)
 	}
 }

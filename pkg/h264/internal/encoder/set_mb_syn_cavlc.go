@@ -95,7 +95,9 @@ func WriteBlockResidualCavlc(pFuncList *SWelsFuncPtrList, pCoffLevel []int16, iE
 
 	if iCalRunLevelFlag != 0 {
 		iCount := int32(0)
-		iTotalZeros = pFuncList.pfCavlcParamCal(pCoffLevel, uiRun[:], iLevel[:], &iTotalCoeffs, iEndIdx)
+		// No alternate CAVLC kernel exists in the Go port. The direct call keeps
+		// these per-block run and level buffers on the stack.
+		iTotalZeros = CavlcParamCal_c(pCoffLevel, uiRun[:], iLevel[:], &iTotalCoeffs, iEndIdx)
 		if iTotalCoeffs > 3 {
 			iCount = 3
 		} else {

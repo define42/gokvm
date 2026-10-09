@@ -58,6 +58,12 @@ type SMbCache struct {
 	iSadCost [4]int32                          // avail 1; unavail 0
 	sMbMvp   [common.MB_BLOCK4x4_NUM]SMVUnitXY // for write bs
 
+	// Scratch passed through runtime-selected function tables. Keeping it in
+	// the per-slice cache avoids one heap allocation per macroblock operation.
+	iDiamondSad      [4]int32
+	iBestModeScratch int32
+	bKeepSkipScratch bool
+
 	// for residual decoding (recovery) at the side of Encoder
 	pCoeffLevel []int16 // C int16_t*: MB_COEFF_LIST_SIZE entries (temp)
 

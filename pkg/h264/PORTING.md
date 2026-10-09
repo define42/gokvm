@@ -112,10 +112,12 @@ truncation match. Use Go `int` only for slice indices, offsets and lengths.
 
 ## Threads
 
-The port is single-threaded. Decoder and encoder threading options are accepted,
-but the work runs sequentially, which is valid because the C code yields the same
-output for any thread count. Drop locks, events, semaphores and thread pools.
-Keep the sequential path (`iThreadCount <= 1` or `!bMultiThread`) of every branch.
+The decoder remains single-threaded. The encoder runs the audited fixed-slice,
+CAVLC camera path with disabled rate control and load balancing on bounded Go
+workers; other modes stay sequential. Per-slice buffers must have stable worker
+ownership, shared results must be reduced after a `sync.WaitGroup` barrier, and
+new concurrent paths require race and bit-exactness tests. OS thread handles,
+events, and semaphores remain omitted.
 
 ## Checking your work
 
