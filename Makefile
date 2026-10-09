@@ -93,7 +93,10 @@ golangci: golangci-lint
 test: bzImage vmlinux vmlinux_PVH initrd vda.img CLOUDHV.fd
 	$(MAKE) generate
 	$(MAKE) golangci
-	unshare --user --net --map-root-user $(GO) test -timeout 30m -coverprofile c.out ./...
+	# A fresh network namespace starts with loopback down.
+	unshare --user --net --map-root-user \
+		sh -c 'ip link set lo up && exec "$$@"' sh \
+		"$(GO)" test -timeout 30m -coverprofile c.out ./...
 	$(GO) mod tidy -diff
 
 .PHONY: clean
