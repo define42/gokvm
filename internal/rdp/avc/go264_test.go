@@ -1,42 +1,31 @@
-//go:build openh264 && cgo
-
 package avc
 
 import (
 	"bytes"
-	"encoding/binary"
 	"image"
 	"image/color"
-	"os/exec"
-	"path/filepath"
-	"strings"
 	"testing"
+
+	go264 "github.com/oops1/go.264"
 )
 
-func TestNativeRoundTrip(t *testing.T) {
+func TestGo264RoundTrip(t *testing.T) {
 	t.Parallel()
-	if !Available() {
-		t.Fatal("OpenH264 unavailable in tagged build")
-	}
-	// Decode in a separate native process: this checks that emitted access units
-	// are independently consumable, including a P-frame and a forced refresh.
-	flags, err := exec.Command("pkg-config", "--cflags", "--libs", "openh264").Output()
-	if err != nil {
-		t.Fatal(err)
-	}
-	decoder := filepath.Join(t.TempDir(), "decode")
-	args := append([]string{"testdata/decode.c", "-o", decoder}, strings.Fields(string(flags))...)
-	if output, err := exec.Command("cc", args...).CombinedOutput(); err != nil {
-		t.Fatalf("build decoder: %v\n%s", err, output)
-	}
-
 	encoder, err := NewEncoder(64, 48)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer encoder.Close()
+	decoder := go264.NewDecoderWithConfig(go264.DecoderConfig{ForceSoftware: true})
+	defer func() {
+		if err := decoder.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+
 	img := image.NewRGBA(image.Rect(0, 0, 64, 48))
-	var stream bytes.Buffer
+	var first, firstCopy []byte
+	var packets [][]byte
 	var expected [][]byte
 	for index := range 3 {
 		fillColorBars(img, index)
@@ -57,34 +46,50 @@ func TestNativeRoundTrip(t *testing.T) {
 		if index == 1 && !hasNAL(data, 1) {
 			t.Fatal("interframe did not produce a P-frame")
 		}
-		stream.Write(binary.LittleEndian.AppendUint32(nil, uint32(len(data))))
-		stream.Write(data)
+		if index == 0 {
+			first, firstCopy = data, bytes.Clone(data)
+		}
+		packets = append(packets, data)
 		want := make([]byte, 64*48*3/2)
 		scaleI420(want, 64, 48, img)
 		expected = append(expected, want)
 	}
-	command := exec.Command(decoder)
-	command.Stdin = &stream
-	decoded, err := command.Output()
-	if err != nil {
-		t.Fatalf("decode access units: %v", err)
+	if !bytes.Equal(first, firstCopy) {
+		t.Fatal("a later encode mutated an earlier access unit")
 	}
-	if len(decoded) != 3*(8+64*48*3/2) {
-		t.Fatalf("decoded length = %d", len(decoded))
-	}
-	for index, want := range expected {
-		if binary.LittleEndian.Uint32(decoded) != 64 || binary.LittleEndian.Uint32(decoded[4:]) != 48 {
-			t.Fatalf("frame %d dimensions = %x", index, decoded[:8])
+
+	var decoded []*go264.Frame
+	for index, packet := range packets {
+		frames, err := decoder.Decode(packet)
+		if err != nil {
+			t.Fatalf("decode frame %d: %v", index, err)
 		}
-		pixels := decoded[8 : 8+len(want)]
+		decoded = append(decoded, frames...)
+	}
+	rest, err := decoder.Flush()
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded = append(decoded, rest...)
+	if len(decoded) != len(expected) {
+		t.Fatalf("decoded %d pictures, want %d", len(decoded), len(expected))
+	}
+	for index, frame := range decoded {
+		if frame.Width != 64 || frame.Height != 48 {
+			t.Fatalf("frame %d dimensions = %dx%d", index, frame.Width, frame.Height)
+		}
+		want := expected[index]
+		pixels := frame.AppendI420(nil)
+		if len(pixels) != len(want) {
+			t.Fatalf("frame %d decoded length = %d, want %d", index, len(pixels), len(want))
+		}
 		var difference int
 		for i, value := range want {
 			difference += max(int(value)-int(pixels[i]), int(pixels[i])-int(value))
 		}
-		if float64(difference)/float64(len(want)) > 3 {
-			t.Fatalf("frame %d average sample error = %f", index, float64(difference)/float64(len(want)))
+		if average := float64(difference) / float64(len(want)); average > 3 {
+			t.Fatalf("frame %d average sample error = %f", index, average)
 		}
-		decoded = decoded[8+len(want):]
 	}
 }
 

@@ -96,7 +96,7 @@ func (s *rdpFrameStats) sent(bytes int) {
 	}
 }
 
-func (s *rdpFrameStats) report(threads int, final bool) {
+func (s *rdpFrameStats) report(slices int, final bool) {
 	if !s.enabled {
 		return
 	}
@@ -109,9 +109,9 @@ func (s *rdpFrameStats) report(threads int, final bool) {
 	}
 	s.ack.update(!s.ack.start.IsZero(), now)
 	if s.frames != 0 || s.ack.total != 0 {
-		log.Printf("rdp: stats client=%s threads=%d frames=%d payload_bytes=%d elapsed=%.2fs "+
+		log.Printf("rdp: stats client=%s slices=%d frames=%d payload_bytes=%d elapsed=%.2fs "+
 			"avg/max copy=%s convert=%s encode=%s write=%s ack_wait=%s",
-			s.peer, threads, s.frames, s.bytes, now.Sub(s.start).Seconds(),
+			s.peer, slices, s.frames, s.bytes, now.Sub(s.start).Seconds(),
 			s.copy, s.convert, s.encode, s.write, s.ack.total.Round(time.Millisecond))
 	}
 	*s = rdpFrameStats{

@@ -1,5 +1,11 @@
+version: 2
+
 builds:
-- goos:
+- env:
+  - CGO_ENABLED=0
+  tags:
+  - go264_nohwaccel
+  goos:
   - linux
   goarch:
   - amd64

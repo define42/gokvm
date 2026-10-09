@@ -50,9 +50,6 @@ func BenchmarkI420(b *testing.B) {
 }
 
 func BenchmarkEncode(b *testing.B) {
-	if !Available() {
-		b.Skip("requires OpenH264")
-	}
 	frames := benchmarkFrames(1024, 768)
 	encoder, err := NewEncoder(1024, 768)
 	if err != nil {

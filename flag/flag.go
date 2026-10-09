@@ -79,10 +79,10 @@ func parseBootArgs(args []string) (*BootArgs, error) {
 		"RDP TLS certificate PEM file (default: temporary self-signed certificate)")
 	bootCmd.StringVar(&c.RDPKey, "rdp-key", "", "RDP TLS private key PEM file")
 	bootCmd.BoolVar(&c.RDPH264, "rdp-h264", false,
-		"enable OpenH264 AVC420 graphics for compatible RDP clients (requires an openh264 build)")
+		"enable pure-Go H.264 AVC420 graphics for compatible RDP clients")
 	bootCmd.IntVar(&c.RDPH264Threads, "rdp-h264-threads", 0,
-		"OpenH264 encoder workers: 0 selects up to 2 automatically, "+
-			"1..16 sets a limit within the CPU budget (requires -rdp-h264)")
+		"H.264 parallel slices: 0 selects up to 2 automatically, "+
+			"1..16 requests a count within the CPU budget (requires -rdp-h264)")
 	bootCmd.BoolVar(&c.RDPStats, "rdp-stats", false, "log RDP performance statistics every 5 seconds")
 	bootCmd.StringVar(&c.Audio, "audio", "", "audio output: rdp (virtio-snd playback through RDP) or none (default)")
 

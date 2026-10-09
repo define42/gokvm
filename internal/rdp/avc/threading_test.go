@@ -1,87 +1,93 @@
-//go:build openh264 && cgo
-
 package avc
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
-	"os/exec"
-	"path/filepath"
-	"strings"
 	"testing"
+
+	go264 "github.com/oops1/go.264"
 )
 
-//nolint:paralleltest,tparallel // Sequential subtests bound native decoder/reference-picture memory.
-func TestNativeThreadedRoundTrip(t *testing.T) {
+//nolint:paralleltest,tparallel // Sequential subtests bound codec reference-picture memory.
+func TestGo264ParallelSlicesRoundTrip(t *testing.T) {
 	t.Parallel()
-	flags, err := exec.Command("pkg-config", "--cflags", "--libs", "openh264").Output()
-	if err != nil {
-		t.Fatal(err)
-	}
-	decoder := filepath.Join(t.TempDir(), "decode")
-	args := append([]string{"testdata/decode.c", "-o", decoder}, strings.Fields(string(flags))...)
-	if output, err := exec.Command("cc", args...).CombinedOutput(); err != nil {
-		t.Fatalf("build decoder: %v\n%s", err, output)
-	}
-	// Sequential subtests bound native reference-picture memory. Each stream
+	// Sequential subtests bound codec reference-picture memory. Each stream
 	// changes resolution through a fresh encoder, just as an RDP resize does.
 	for _, threads := range []int{1, 2, 4, MaxThreads} {
 		t.Run(fmt.Sprint(threads), func(t *testing.T) {
-			var stream bytes.Buffer
 			var frames []decodedReference
 			for _, size := range [][2]int{{16, 16}, {64, 48}, {200, 200}, {320, 240}, {1024, 768}} {
-				frames = append(frames, threadedTestFrames(t, &stream, threads, size[0], size[1])...)
+				frames = append(frames, threadedTestFrames(t, threads, size[0], size[1])...)
 			}
-			command := exec.Command(decoder)
-			command.Stdin = &stream
-			decoded, err := command.Output()
-			if err != nil {
-				t.Fatalf("decode %d-worker stream: %v", threads, err)
-			}
-			for index, frame := range frames {
-				if len(decoded) < 8+len(frame.pixels) {
-					t.Fatalf("frame %d truncated at %d bytes", index, len(decoded))
-				}
-				width, height := binary.LittleEndian.Uint32(decoded), binary.LittleEndian.Uint32(decoded[4:])
-				if width != uint32(frame.width) || height != uint32(frame.height) {
-					t.Fatalf("frame %d dimensions %dx%d, want %dx%d", index, width, height, frame.width, frame.height)
-				}
-				var difference int
-				for i, value := range frame.pixels {
-					got := int(decoded[8+i])
-					difference += max(int(value)-got, got-int(value))
-				}
-				if average := float64(difference) / float64(len(frame.pixels)); average > 3 {
-					t.Fatalf("frame %d mean sample error %.3f", index, average)
-				}
-				decoded = decoded[8+len(frame.pixels):]
-			}
-			if len(decoded) != 0 {
-				t.Fatalf("unexpected trailing output: %d bytes", len(decoded))
-			}
+			decodeThreadedFrames(t, threads, frames)
 		})
 	}
 }
 
 type decodedReference struct {
 	width, height int
+	data          []byte
 	pixels        []byte
 }
 
-func threadedTestFrames(t *testing.T, stream *bytes.Buffer, threads, width, height int) []decodedReference {
+func decodeThreadedFrames(t *testing.T, threads int, frames []decodedReference) {
+	t.Helper()
+	decoder := go264.NewDecoderWithConfig(go264.DecoderConfig{ForceSoftware: true})
+	defer func() {
+		if err := decoder.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	var decoded []*go264.Frame
+	for index, frame := range frames {
+		pictures, err := decoder.Decode(frame.data)
+		if err != nil {
+			t.Fatalf("decode %d-slice frame %d: %v", threads, index, err)
+		}
+		decoded = append(decoded, pictures...)
+	}
+	rest, err := decoder.Flush()
+	if err != nil {
+		t.Fatalf("flush %d-slice stream: %v", threads, err)
+	}
+	decoded = append(decoded, rest...)
+	if len(decoded) != len(frames) {
+		t.Fatalf("decode %d-slice stream returned %d pictures, want %d", threads, len(decoded), len(frames))
+	}
+	for index, picture := range decoded {
+		frame := frames[index]
+		if picture.Width != frame.width || picture.Height != frame.height {
+			t.Fatalf("frame %d dimensions %dx%d, want %dx%d",
+				index, picture.Width, picture.Height, frame.width, frame.height)
+		}
+		decoded := picture.AppendI420(nil)
+		if len(decoded) != len(frame.pixels) {
+			t.Fatalf("frame %d decoded length = %d, want %d", index, len(decoded), len(frame.pixels))
+		}
+		var difference int
+		for i, value := range frame.pixels {
+			got := int(decoded[i])
+			difference += max(int(value)-got, got-int(value))
+		}
+		if average := float64(difference) / float64(len(frame.pixels)); average > 3 {
+			t.Fatalf("frame %d mean sample error %.3f", index, average)
+		}
+	}
+}
+
+func threadedTestFrames(t *testing.T, threads, width, height int) []decodedReference {
 	t.Helper()
 	encoder, err := NewEncoderWithOptions(width, height, Options{Threads: threads, Measure: true})
 	if err != nil {
-		t.Fatalf("initialize %dx%d/%d workers: %v", width, height, threads, err)
+		t.Fatalf("initialize %dx%d/%d slices: %v", width, height, threads, err)
 	}
 	defer encoder.Close()
 	actual := encoder.Threads()
 	if actual < 1 || actual > threads {
-		t.Fatalf("%dx%d requested %d workers, initialized %d", width, height, threads, actual)
+		t.Fatalf("%dx%d requested %d slices, initialized %d", width, height, threads, actual)
 	}
 	img := image.NewRGBA(image.Rect(0, 0, width, height))
 	draw.Draw(img, img.Rect, image.NewUniform(color.RGBA{R: 210, G: 225, B: 230, A: 255}), image.Point{}, draw.Src)
@@ -99,7 +105,7 @@ func threadedTestFrames(t *testing.T, stream *bytes.Buffer, threads, width, heig
 			kind = 1
 		}
 		if slices := countNAL(data, kind); slices < actual {
-			t.Fatalf("%dx%d frame %d: got %d slices for %d workers", width, height, index, slices, actual)
+			t.Fatalf("%dx%d frame %d: got %d slices, want at least %d", width, height, index, slices, actual)
 		}
 		if index != 1 && (!hasNAL(data, 7) || !hasNAL(data, 8)) {
 			t.Fatalf("frame %d lacks parameter sets", index)
@@ -108,9 +114,10 @@ func threadedTestFrames(t *testing.T, stream *bytes.Buffer, threads, width, heig
 		if stats.Conversion <= 0 || stats.Encoding <= 0 {
 			t.Fatalf("missing measurements: %+v", stats)
 		}
-		stream.Write(binary.LittleEndian.AppendUint32(nil, uint32(len(data))))
-		stream.Write(data)
-		frames = append(frames, decodedReference{width, height, referenceI420(width, height, img)})
+		frames = append(frames, decodedReference{
+			width: width, height: height, data: bytes.Clone(data),
+			pixels: referenceI420(width, height, img),
+		})
 	}
 
 	return frames

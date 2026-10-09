@@ -190,7 +190,7 @@ func TestParseBootArgsWithDefaults(t *testing.T) {
 		t.Errorf("RDP must be disabled by default: %+v", c)
 	}
 	if c.RDPH264Threads != 0 || c.RDPStats {
-		t.Errorf("RDP workers must default to auto and statistics must be disabled: %+v", c)
+		t.Errorf("RDP slices must default to auto and statistics must be disabled: %+v", c)
 	}
 
 	if c.NCPUs != 1 {
@@ -236,7 +236,7 @@ func TestRDPH264ThreadOptions(t *testing.T) {
 	}{
 		{name: "default", args: []string{"-rdp", "127.0.0.1:3389", "-rdp-h264"}},
 		{name: "auto", args: []string{"-rdp", "127.0.0.1:3389", "-rdp-h264", "-rdp-h264-threads=0"}},
-		{name: "serial", args: []string{"-rdp", "127.0.0.1:3389", "-rdp-h264", "-rdp-h264-threads=1"}, want: 1},
+		{name: "one-slice", args: []string{"-rdp", "127.0.0.1:3389", "-rdp-h264", "-rdp-h264-threads=1"}, want: 1},
 		{name: "maximum", args: []string{"-rdp", "127.0.0.1:3389", "-rdp-h264", "-rdp-h264-threads=16"}, want: 16},
 		{
 			name: "negative",
@@ -254,12 +254,12 @@ func TestRDPH264ThreadOptions(t *testing.T) {
 			err:  flag.ErrRDPH264Threads,
 		},
 		{
-			name: "workers-without-codec",
+			name: "slices-without-codec",
 			args: []string{"-rdp", "127.0.0.1:3389", "-rdp-h264-threads=2"},
 			err:  flag.ErrRDPH264Threads,
 		},
 		{name: "auto-without-rdp", args: []string{"-rdp-h264-threads=0"}, err: flag.ErrRDPH264Threads},
-		{name: "workers-without-rdp", args: []string{"-rdp-h264-threads=2"}, err: flag.ErrRDPH264Threads},
+		{name: "slices-without-rdp", args: []string{"-rdp-h264-threads=2"}, err: flag.ErrRDPH264Threads},
 		{name: "codec-without-rdp", args: []string{"-rdp-h264", "-rdp-h264-threads=2"}, err: flag.ErrRDPH264},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -269,7 +269,7 @@ func TestRDPH264ThreadOptions(t *testing.T) {
 				t.Fatalf("got %v, want %v", err, tc.err)
 			}
 			if err == nil && c.RDPH264Threads != tc.want {
-				t.Errorf("got %d workers, want %d", c.RDPH264Threads, tc.want)
+				t.Errorf("got %d slices, want %d", c.RDPH264Threads, tc.want)
 			}
 		})
 	}

@@ -29,7 +29,7 @@ var errNetworkConfig = errors.New("network must be 'user' or 'none' and cannot b
 
 var errAudioConfig = errors.New("audio must be 'none' or 'rdp'; 'rdp' requires an RDP listener")
 
-var errRDPH264ThreadsConfig = errors.New("RDP H.264 threads must be 0 (auto) or 1..16; a thread limit requires H.264")
+var errRDPH264ThreadsConfig = errors.New("RDP H.264 slices must be 0 (auto) or 1..16; a slice count requires H.264")
 
 var errRDPStatsConfig = errors.New("RDP statistics require an RDP listener")
 

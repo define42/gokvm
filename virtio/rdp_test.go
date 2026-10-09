@@ -20,13 +20,6 @@ var _ ConsoleDisplay = (*RDPDisplay)(nil)
 func TestRDPDisplayH264Configuration(t *testing.T) {
 	t.Parallel()
 	d, err := NewRDPDisplayWithConfig("127.0.0.1:0", RDPConfig{H264: true})
-	if !avc.Available() {
-		if d != nil || !errors.Is(err, avc.ErrUnavailable) {
-			t.Fatalf("H.264 without codec build: display %v, error %v", d, err)
-		}
-
-		return
-	}
 	if err != nil {
 		t.Fatal(err)
 	}

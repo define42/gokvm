@@ -26,13 +26,13 @@ import (
 
 const rdpResizeDelay = 150 * time.Millisecond
 
-// RDPConfig selects the server certificate, OpenH264 graphics, and audio playback.
+// RDPConfig selects the server certificate, H.264 AVC420 graphics, and audio playback.
 type RDPConfig struct {
 	TLS         *tls.Config
 	H264        bool
 	Audio       bool
-	H264Threads int // Encoder worker limit; zero chooses a bounded automatic limit.
-	GuestCPUs   int // Guest vCPUs to reserve when calculating the encoder CPU budget.
+	H264Threads int // Parallel slice request; zero chooses a bounded automatic count.
+	GuestCPUs   int // Guest vCPUs considered when bounding the encoder slice request.
 	Stats       bool
 }
 
@@ -44,7 +44,7 @@ type RDPDisplay struct {
 	listener       net.Listener
 	tls            *tls.Config
 	h264           bool
-	h264Threads    int
+	h264Slices     int
 	stats          bool
 	audio          *audio.Hub
 	connMu         sync.Mutex
@@ -72,14 +72,14 @@ func NewRDPDisplayWithTLS(addr string, config *tls.Config) (*RDPDisplay, error) 
 }
 
 // NewRDPDisplayWithConfig enables AVC420 for capable clients when H264 is set.
-// Other clients retain bitmap updates. H264 requires the openh264 build tag.
+// Other clients retain bitmap updates.
 func NewRDPDisplayWithConfig(addr string, options RDPConfig) (*RDPDisplay, error) {
 	if options.H264Threads < 0 || options.H264Threads > avc.MaxThreads ||
 		(options.H264Threads != 0 && !options.H264) {
 		return nil, errRDPThreads
 	}
 	if options.H264 {
-		// Fail before opening the listener if the native encoder is unavailable.
+		// Fail before opening the listener if the H.264 encoder cannot initialize.
 		encoder, err := avc.NewEncoder(1024, 768)
 		if err != nil {
 			return nil, err
@@ -107,7 +107,7 @@ func NewRDPDisplayWithConfig(addr string, options RDPConfig) (*RDPDisplay, error
 	display := &RDPDisplay{
 		framebuffer: newFramebuffer(), listener: listener, tls: config,
 		h264: options.H264, stats: options.Stats,
-		h264Threads: rdpEncoderThreads(runtime.GOMAXPROCS(0), options.GuestCPUs, options.H264Threads),
+		h264Slices: rdpEncoderSlices(runtime.GOMAXPROCS(0), options.GuestCPUs, options.H264Threads),
 	}
 	if options.Audio {
 		display.audio = audio.NewHub()
@@ -381,8 +381,8 @@ func (d *RDPDisplay) writeFrames(
 	}
 	writer := &rdpFrameWriter{
 		session: session, bitmap: bitmap, width: width, height: height, force: true,
-		threads: d.h264Threads,
-		stats:   rdpFrameStats{enabled: d.stats, peer: conn.RemoteAddr().String()},
+		slices: d.h264Slices,
+		stats:  rdpFrameStats{enabled: d.stats, peer: conn.RemoteAddr().String()},
 	}
 	writer.stats.start = writer.stats.begin()
 	defer writer.shutdown()
@@ -438,7 +438,7 @@ func (d *RDPDisplay) writeFrames(
 				return err
 			}
 		}
-		writer.stats.report(writer.actualThreads(), false)
+		writer.stats.report(writer.actualSlices(), false)
 
 		select {
 		case <-stop:
@@ -476,7 +476,7 @@ type rdpFrameWriter struct {
 	force     bool
 	nextFrame time.Time
 	pointer   rdpPointerWriter
-	threads   int
+	slices    int
 	stats     rdpFrameStats
 }
 
@@ -532,7 +532,7 @@ func (w *rdpFrameWriter) updateGraphics(conn net.Conn) bool {
 	}
 	w.graphics = ready
 	if ready {
-		log.Printf("rdp: client %s using OpenH264 AVC420 graphics", conn.RemoteAddr())
+		log.Printf("rdp: client %s using pure-Go H.264 AVC420 graphics", conn.RemoteAddr())
 	} else {
 		w.close()
 	}
@@ -556,11 +556,11 @@ func (w *rdpFrameWriter) close() {
 }
 
 func (w *rdpFrameWriter) shutdown() {
-	w.stats.report(w.actualThreads(), true)
+	w.stats.report(w.actualSlices(), true)
 	w.close()
 }
 
-func (w *rdpFrameWriter) actualThreads() int {
+func (w *rdpFrameWriter) actualSlices() int {
 	if w.avc != nil {
 		return w.avc.Threads()
 	}
@@ -596,14 +596,14 @@ func (w *rdpFrameWriter) write(frame vncFrame, damage []image.Rectangle, force b
 	if w.avc == nil {
 		width, height := w.session.Size()
 		encoder, err := avc.NewEncoderWithOptions(width, height, avc.Options{
-			Threads: max(1, w.threads), Measure: w.stats.enabled,
+			Threads: max(1, w.slices), Measure: w.stats.enabled,
 		})
 		if err != nil {
 			return false, err
 		}
 		w.avc = encoder
 		force = true // A new encoder starts an independent reference chain.
-		log.Printf("rdp: client %s OpenH264 workers=%d requested=%d", w.stats.peer, encoder.Threads(), max(1, w.threads))
+		log.Printf("rdp: client %s H.264 slices=%d requested=%d", w.stats.peer, encoder.Threads(), max(1, w.slices))
 	}
 	data, err := w.avc.EncodeDamage(img, damage, force)
 	if w.stats.enabled {

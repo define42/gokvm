@@ -177,7 +177,7 @@ func TestEncoderRefreshAndClose(t *testing.T) {
 	encoder.Close()
 	encoder.Close()
 	if codec.closed != 1 {
-		t.Fatalf("native close called %d times", codec.closed)
+		t.Fatalf("codec close called %d times", codec.closed)
 	}
 	if _, err := encoder.Encode(img, false); !errors.Is(err, ErrClosed) {
 		t.Fatalf("Encode after Close = %v", err)
@@ -202,6 +202,6 @@ func TestRejectMalformedRGBA(t *testing.T) {
 		}
 	}
 	if len(codec.forces) != 0 {
-		t.Fatal("malformed image reached native encoder")
+		t.Fatal("malformed image reached codec")
 	}
 }

@@ -1,5 +1,5 @@
-// Package avc provides the optional OpenH264 encoder used by the RDP graphics
-// pipeline. Build with -tags openh264 and cgo to enable the native codec.
+// Package avc provides the pure-Go H.264 encoder used by the RDP graphics
+// pipeline.
 package avc
 
 import (
@@ -13,17 +13,16 @@ import (
 // FrameRate is the maximum frame rate of the RDP AVC420 encoder.
 const FrameRate = 60
 
-// MaxThreads limits the number of slice workers used by one encoder.
+// MaxThreads limits the number of parallel slices used by one encoder.
 const MaxThreads = 16
 
 const maxDimension = 4096
 
 var (
-	ErrUnavailable = errors.New("OpenH264 support requires rebuilding with CGO_ENABLED=1 and -tags openh264")
-	ErrGeometry    = errors.New("invalid OpenH264 frame geometry")
-	ErrCodec       = errors.New("OpenH264 operation failed")
-	ErrClosed      = errors.New("OpenH264 encoder is closed")
-	ErrThreads     = errors.New("OpenH264 threads must be between 1 and 16")
+	ErrGeometry = errors.New("invalid H.264 frame geometry")
+	ErrCodec    = errors.New("H.264 encoding failed")
+	ErrClosed   = errors.New("H.264 encoder is closed")
+	ErrThreads  = errors.New("H.264 parallelism must be between 1 and 16")
 )
 
 // Options controls slice parallelism and optional per-frame measurements.
@@ -33,13 +32,13 @@ type Options struct {
 }
 
 // EncodeStats describes the most recent Encode or EncodeDamage call. Encoding
-// includes the native codec and copying its output into the returned Go slice.
+// includes the codec and preparing its output as the returned Go slice.
 type EncodeStats struct {
 	Conversion time.Duration
 	Encoding   time.Duration
 }
 
-type nativeEncoder interface {
+type codecEncoder interface {
 	encode([]byte, bool, int64) ([]byte, error)
 	close()
 }
@@ -47,7 +46,7 @@ type nativeEncoder interface {
 // Encoder produces Annex-B AVC access units, including parameter sets with IDR
 // frames. One goroutine must own the encoder, including calls to Close.
 type Encoder struct {
-	codec         nativeEncoder
+	codec         codecEncoder
 	width, height int
 	i420          []byte
 	source        image.Rectangle
@@ -65,9 +64,9 @@ func NewEncoder(width, height int) (*Encoder, error) {
 	return NewEncoderWithOptions(width, height, Options{Threads: 1})
 }
 
-// NewEncoderWithOptions fixes the output size and requested slice worker count.
-// Threads must be between 1 and MaxThreads. OpenH264 can reduce the actual count
-// for small pictures; Threads reports the initialized count.
+// NewEncoderWithOptions fixes the output size and requested parallel slice count.
+// Threads must be between 1 and MaxThreads. The codec reduces the slice count
+// for pictures with fewer macroblock rows; Threads reports the configured count.
 func NewEncoderWithOptions(width, height int, options Options) (*Encoder, error) {
 	if width < 16 || height < 16 || width > maxDimension || height > maxDimension || width%2 != 0 || height%2 != 0 {
 		return nil, ErrGeometry
@@ -76,7 +75,7 @@ func NewEncoderWithOptions(width, height int, options Options) (*Encoder, error)
 		return nil, ErrThreads
 	}
 
-	codec, threads, err := newNativeEncoder(width, height, options.Threads)
+	codec, threads, err := newCodecEncoder(width, height, options.Threads)
 	if err != nil {
 		return nil, err
 	}
@@ -88,7 +87,7 @@ func NewEncoderWithOptions(width, height int, options Options) (*Encoder, error)
 	}, nil
 }
 
-// Threads returns the actual slice worker count selected by OpenH264.
+// Threads returns the configured parallel slice count.
 func (e *Encoder) Threads() int { return e.threads }
 
 // LastStats returns measurements for the most recent encode call. Measurements
@@ -152,7 +151,7 @@ func (e *Encoder) EncodeDamage(img *image.RGBA, regions []image.Rectangle, force
 	return data, err
 }
 
-// Close releases all native buffers and is safe to call more than once.
+// Close releases all codec buffers and is safe to call more than once.
 func (e *Encoder) Close() {
 	if e.codec != nil {
 		e.codec.close()

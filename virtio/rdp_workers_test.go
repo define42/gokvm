@@ -9,14 +9,14 @@ import (
 	"github.com/bobuhiro11/gokvm/internal/rdp"
 )
 
-func TestRDPEncoderThreadLimits(t *testing.T) {
+func TestRDPEncoderSliceLimits(t *testing.T) {
 	t.Parallel()
 	for _, tt := range []struct {
 		name                     string
 		cpus, guest, limit, want int
 	}{
 		{"automatic", 8, 2, 0, 2},
-		{"serial", 8, 2, 1, 1},
+		{"one slice", 8, 2, 1, 1},
 		{"explicit", 8, 2, 4, 4},
 		{"host and guest reservation", 8, 2, 16, 5},
 		{"small host", 1, 8, 4, 1},
@@ -25,8 +25,9 @@ func TestRDPEncoderThreadLimits(t *testing.T) {
 		{"maximum", 32, 1, 16, 16},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := rdpEncoderThreads(tt.cpus, tt.guest, tt.limit); got != tt.want {
-				t.Fatalf("worker count: got %d, want %d", got, tt.want)
+			t.Parallel()
+			if got := rdpEncoderSlices(tt.cpus, tt.guest, tt.limit); got != tt.want {
+				t.Fatalf("slice count: got %d, want %d", got, tt.want)
 			}
 		})
 	}
@@ -60,13 +61,13 @@ func TestRDPFramePacingKeepsLatestFrame(t *testing.T) {
 	}
 }
 
-func TestRDPWorkerConfigValidation(t *testing.T) {
+func TestRDPSliceConfigValidation(t *testing.T) {
 	t.Parallel()
 	for _, options := range []RDPConfig{
 		{H264Threads: -1}, {H264Threads: 17, H264: true}, {H264Threads: 1},
 	} {
 		if _, err := NewRDPDisplayWithConfig("invalid-address", options); !errors.Is(err, errRDPThreads) {
-			t.Fatalf("invalid worker options reached listener creation: %v", err)
+			t.Fatalf("invalid slice options reached listener creation: %v", err)
 		}
 	}
 }

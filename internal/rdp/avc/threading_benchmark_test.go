@@ -7,18 +7,15 @@ import (
 	"time"
 )
 
-// BenchmarkThreadedDesktop includes persistent RGB-to-I420 conversion and native
+// BenchmarkThreadedDesktop includes persistent RGB-to-I420 conversion and H.264
 // encoding. It alternates two deterministic desktop views, either scrolling the
 // main content pane by eight pixels or changing a small widget. The timing and
 // compressed size metrics separate CPU savings from slice overhead. Only two
 // RGBA images and one encoder are retained at a time.
 func BenchmarkThreadedDesktop(b *testing.B) {
-	if !Available() {
-		b.Skip("requires OpenH264")
-	}
 	for _, workload := range []string{"Scroll", "Widget"} {
 		for _, threads := range []int{1, 2, 4} {
-			b.Run(fmt.Sprintf("1080p/%s/%dWorkers", workload, threads), func(b *testing.B) {
+			b.Run(fmt.Sprintf("1080p/%s/%dSlices", workload, threads), func(b *testing.B) {
 				frames, regions := threadedDesktopFrames(1920, 1080, workload == "Scroll")
 				encoder, err := NewEncoderWithOptions(1920, 1080, Options{Threads: threads, Measure: true})
 				if err != nil {
@@ -45,7 +42,7 @@ func BenchmarkThreadedDesktop(b *testing.B) {
 				b.ReportMetric(float64(conversion.Nanoseconds())/float64(b.N), "convert_ns/frame")
 				b.ReportMetric(float64(encoding.Nanoseconds())/float64(b.N), "encode_ns/frame")
 				b.ReportMetric(float64(bytes)/float64(b.N), "bytes/frame")
-				b.ReportMetric(float64(encoder.Threads()), "workers")
+				b.ReportMetric(float64(encoder.Threads()), "slices")
 			})
 		}
 	}

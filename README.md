@@ -18,7 +18,7 @@ The latest version supports the following features:
 - [x] virtio-gpu (virtio 1.0, 2D; frames written to PNG via `-g`)
 - [x] VNC server for virtio-gpu with keyboard and mouse input (`-vnc`)
 - [x] Built-in TLS RDP console with keyboard and mouse input (`-rdp`)
-- [x] Optional OpenH264 AVC420 compression for RDP (`-rdp-h264`)
+- [x] Optional pure-Go H.264 AVC420 compression for RDP (`-rdp-h264`)
 - [x] RDP initial resolution and live single-monitor resizing with virtio-gpu hotplug
 - [x] Virtio-snd playback through the built-in RDP server (`-audio rdp`)
 - [x] Built-in user-mode networking with DHCP, DNS, and outbound TCP/UDP (`-net user`)
@@ -68,15 +68,15 @@ Slax can boot directly from its ISO with its normal graphical startup:
 ./gokvm boot -iso ./slax.iso -m 2G -rdp 127.0.0.1:3390
 ```
 
-Run `make slax` to build gokvm with OpenH264 and boot the local `slax.iso` with
-two guest CPUs, 2 GB of memory, user-mode networking, and H.264 RDP listening on
-`127.0.0.1:3390`. It requests four encoder threads, bounded by the available CPU
-budget. Install the dependencies listed under
-[OpenH264 graphics](#openh264-graphics) first.
+Run `make slax` to build gokvm with the software-only pure-Go H.264 encoder and
+boot the local `slax.iso` with two guest CPUs, 2 GB of memory, user-mode
+networking, and H.264 RDP listening on `127.0.0.1:3390`. It requests four
+parallel encoder slices, bounded by the available CPU budget. The server needs
+no native H.264 library.
 
 With `make slax` running, use `make rdp` in another terminal to open FreeRDP and
 connect to `127.0.0.1:3390` with automatic resizing. Run `make freerdp` first to
-build the local H.264 client using the [dependencies below](#openh264-graphics).
+build the local H.264 client using the [dependencies below](#h264-graphics).
 `make rdp` prefers `tools/freerdp/bin/xfreerdp` and enables AVC420. Without the
 local build, it finds `xfreerdp3` or `xfreerdp` on your PATH and reports a fallback
 to bitmap updates if that client lacks H.264. To use a custom client, run
@@ -85,8 +85,8 @@ console's self-signed TLS certificate.
 
 The Slackware-based Slax image with Linux 6.1.38 has been tested through to the
 desktop. Keep the ISO's default boot parameters; no extracted kernel, custom
-initrd, or driver blacklist is needed. For AVC420, build with the `openh264` tag
-and add `-rdp-h264` as described below.
+initrd, or driver blacklist is needed. For AVC420, add `-rdp-h264` as described
+below; no special server build tag is required.
 
 ### Networking
 
@@ -103,7 +103,7 @@ but complex websites can fill both RAM and Slax's compressed swap, making the
 whole desktop unresponsive while RDP remains connected. Check `free -m` and
 `vmstat 1` inside the guest when this happens; additional tabs may need more RAM.
 
-Omit `-rdp-h264` when using the standard build. Slax requests an address
+Omit `-rdp-h264` to use bitmap updates. Slax requests an address
 automatically: the first guest receives `10.0.2.15/24`, with gateway and DNS
 server `10.0.2.2`. DNS uses the host's configured resolvers. Guest TCP/UDP
 connections to `10.0.2.2` reach host loopback services, except the built-in DNS
@@ -112,7 +112,7 @@ and DHCP ports.
 This backend supports outbound IPv4 TCP/UDP. Incoming port forwarding and IPv6
 are not implemented. External ICMP/ping is not forwarded; check connectivity
 with a web browser or `wget https://github.com` in the guest. The network stack
-is built in Go and works with `CGO_ENABLED=0`; only optional OpenH264 requires cgo.
+and H.264 encoder are built in Go and work with `CGO_ENABLED=0`.
 
 The tested Slax image lacks its default CA certificate bundle. If its HTTPS
 tools report certificate errors, run these commands inside Slax, then retry:
@@ -157,7 +157,7 @@ connection closes.
 
 The RDP session uses the client's requested desktop size and supports live
 single-monitor resizing. By default it sends uncompressed bitmap updates with
-16-, 24-, or 32-bit color. The optional OpenH264 build adds compressed AVC420 graphics.
+16-, 24-, or 32-bit color. The `-rdp-h264` option adds compressed AVC420 graphics.
 It includes the same serial/VGA/VESA fallbacks as VNC. Both `-rdp` and `-vnc` can
 be supplied to view the same guest at once; connected viewers share its keyboard
 and mouse. Optional audio playback uses `-audio rdp`. Clipboard, microphone input,
@@ -207,15 +207,15 @@ start it with Slax's desktop, put the script at `~/.local/bin/gokvm-resize` and
 add `sh "$HOME/.local/bin/gokvm-resize" &` before the line that starts Fluxbox in
 `~/.fluxbox/startup`. Desktops that already apply preferred modes need no helper.
 
-#### OpenH264 graphics
+#### H.264 graphics
 
-Build with the `openh264` tag to enable H.264/AVC420 over the RDP graphics
-pipeline. This requires cgo, a C compiler, `pkg-config`, and the
-[OpenH264](https://github.com/cisco/openh264) development library. On Debian or
-Ubuntu, the build packages are `build-essential pkg-config libopenh264-dev`.
+The server uses the pure-Go [go.264](https://github.com/oops1/go.264) encoder for
+H.264/AVC420 over the RDP graphics pipeline. It needs no C compiler,
+`pkg-config`, or native codec library. A normal build includes AVC420 support;
+the software-only build below also excludes go.264's optional hardware backends:
 
 ```bash
-CGO_ENABLED=1 go build -tags openh264 -o gokvm .
+CGO_ENABLED=0 go build -tags go264_nohwaccel -o gokvm .
 ./gokvm boot -iso ./TinyCore-current.iso -rdp 127.0.0.1:3389 -rdp-h264 -m 512M
 ```
 
@@ -264,24 +264,23 @@ Xcursor support can show a second pointer in this case. VNC and PNG outputs
 continue receiving an image with the guest cursor composed into it, including
 when used alongside RDP.
 
-The server logs `using OpenH264 AVC420 graphics` after negotiation. Clients
-without AVC420 support receive bitmap updates automatically. The tagged binary
-links to the OpenH264 shared library, which must remain installed at runtime.
-Normal builds need no OpenH264 dependency and report a clear error if
-`-rdp-h264` is requested.
+The server logs `using pure-Go H.264 AVC420 graphics` after negotiation. Clients
+without AVC420 support receive bitmap updates automatically. The server does not
+load a shared codec library, and AVC420 is available in normal builds.
 
-OpenH264 can encode slices of the same frame on multiple CPU cores. The default
-`-rdp-h264-threads 0` selects up to two encoder workers. Explicit values from 1 to
-16 set a worker limit; `-rdp-h264-threads 1` forces serial encoding. The worker
-limit is fixed for the session and bounded by the Go runtime CPU limit minus
-the guest vCPU count and one CPU for host work, including audio, with a minimum
-of one encoder worker. OpenH264 may use fewer workers for small pictures.
-Frames remain ordered, and a slow client receives the latest frame without
-building a queue.
+go.264 can divide a frame into slices and process those slices in parallel. The
+default `-rdp-h264-threads 0` requests up to two slices. Explicit values from 1
+to 16 request a slice count; `-rdp-h264-threads 1` requests one slice. The count
+is fixed for the session and bounded by the Go runtime CPU limit minus the guest
+vCPU count and one CPU for host work, including audio, with a minimum of one
+slice. This is a parallel slice count, not a strict worker cap: the Go scheduler
+decides how many encoder goroutines run simultaneously, and small pictures may
+use fewer slices. Frames remain ordered, and a slow client receives the latest
+frame without building a queue.
 
 Use `-rdp-stats` to log performance measurements every five seconds while frames
 are active, plus a summary when the client disconnects. Statistics include frame
-and compressed payload byte counts, actual worker count, average/maximum time
+and compressed payload byte counts, actual slice count, average/maximum time
 for framebuffer copying, color conversion, H.264 encoding and network writes,
 and time spent waiting for client acknowledgements. Statistics are disabled by
 default and also work with bitmap RDP. For example:
@@ -291,8 +290,8 @@ default and also work with bitmap RDP. For example:
   -rdp 127.0.0.1:3390 -rdp-h264 -rdp-h264-threads 2 -rdp-stats
 ```
 
-Try worker limits of 1, 2, and 4 while scrolling the same page, then compare
-encoding time and responsiveness. More workers help when encoding is the
+Try slice counts of 1, 2, and 4 while scrolling the same page, then compare
+encoding time and responsiveness. More slices can help when encoding is the
 bottleneck; guest rendering, color conversion, and client acknowledgement waits
 can also limit frame rate. These options require no changes to the RDP client
 command. `-rdp-h264-threads` requires `-rdp-h264`; `-rdp-stats` requires `-rdp`.
@@ -317,15 +316,15 @@ bitmap RDP remains capped at 30 fps.
 Virtio-gpu currently provides a 2D framebuffer without guest 3D acceleration.
 Complex browser pages can therefore be limited by software rendering inside
 the guest even when AVC420 is active. For choppy scrolling, first check the
-server's `using OpenH264 AVC420 graphics` message to confirm the session is
+server's `using pure-Go H.264 AVC420 graphics` message to confirm the session is
 using the faster graphics path.
 
 #### Audio playback
 
 Add `-audio rdp` to expose a virtio-snd card and play guest audio through the
 connected RDP client. The tested Slax ISO already includes the Linux
-`virtio_snd` driver. Audio itself needs no native library or special build tag
-in gokvm; `-rdp-h264` still requires the OpenH264 build described above.
+`virtio_snd` driver. Neither audio nor H.264 needs a native library or special
+build tag in gokvm.
 
 ```bash
 ./gokvm boot -iso ./slax.iso -m 2G -net user \
@@ -358,11 +357,11 @@ go test ./internal/rdp ./virtio ./flag ./vmm -short
 go test -race ./internal/rdp ./virtio ./vmm -run 'Test(RDP|GPU|Modern|Framebuffer|SerialMirror)'
 ```
 
-With the OpenH264 development library installed, also run the native encoder
-roundtrip and graphics pipeline tests:
+Run the pure-Go encoder roundtrip and graphics pipeline tests without cgo or
+hardware-backend probing:
 
 ```bash
-go test -tags openh264 -short ./internal/rdp/... ./virtio ./vmm ./flag
+CGO_ENABLED=0 go test -tags go264_nohwaccel -short ./internal/rdp/... ./virtio ./vmm ./flag
 ```
 
 ## Go package

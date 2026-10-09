@@ -13,11 +13,13 @@ require (
 	github.com/google/gopacket v1.1.19
 	github.com/insomniacslk/dhcp v0.0.0-20240710054256-ddd8a41251c9
 	github.com/miekg/dns v1.1.73
+	github.com/oops1/go.264 v1.12.0
 	golang.org/x/image v0.46.0
 	gvisor.dev/gvisor v0.0.0-20260413194555-9680d69bf798
 )
 
 require (
+	github.com/ebitengine/purego v0.10.0 // indirect
 	github.com/google/btree v1.1.2 // indirect
 	github.com/pierrec/lz4/v4 v4.1.14 // indirect
 	github.com/sirupsen/logrus v1.10.2 // indirect
