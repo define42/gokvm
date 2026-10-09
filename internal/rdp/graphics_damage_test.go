@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"image"
+	"math/rand/v2"
 	"slices"
 	"testing"
 )
@@ -106,14 +107,15 @@ func TestGraphicsAVC420DamageMessageLimit(t *testing.T) {
 	t.Parallel()
 	regions := make([]image.Rectangle, graphicsMaxRegions)
 	for index := range regions {
-		regions[index] = image.Rect(32+index%8*32, 32+index/8*16, 34+index%8*32, 34+index/8*16)
+		x, y := 35+index%16*32, 35+index/16*32
+		regions[index] = image.Rect(x, y, x+2, y+2)
 	}
-	regions = avc420Regions(640, 480, regions)
-	if len(regions) != graphicsMaxRegions {
-		t.Fatalf("region limit changed: %d", len(regions))
+	normalized := avc420Regions(640, 480, regions)
+	if len(normalized) != graphicsMaxRegions {
+		t.Fatalf("region limit changed: %d", len(normalized))
 	}
-	annexB := make([]byte, avc420MaxPayload(len(regions))+1)
-	frame := avc420FrameDamage(640, 480, 1, 0, annexB[:len(annexB)-1], regions)
+	annexB := make([]byte, avc420MaxPayload(len(normalized))+1)
+	frame := avc420FrameDamage(640, 480, 1, 0, annexB[:len(annexB)-1], normalized)
 	if len(segmentGraphics(frame)) > graphicsMaxMessage {
 		t.Fatal("maximum accepted frame exceeds the complete DVC message limit")
 	}
@@ -130,6 +132,105 @@ func TestGraphicsAVC420DamageMessageLimit(t *testing.T) {
 	}
 	if sent, err := session.WriteAVC420Damage(nil, nil); err == nil || sent {
 		t.Fatalf("empty encoded frame accepted: %t, %v", sent, err)
+	}
+}
+
+func TestGraphicsAVC420DamageDoesNotOverlap(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name    string
+		regions []image.Rectangle
+		want    []image.Rectangle
+	}{
+		{
+			"adjacent-before-expansion",
+			[]image.Rectangle{image.Rect(0, 64, 128, 128), image.Rect(64, 128, 192, 192)},
+			[]image.Rectangle{image.Rect(0, 48, 208, 208)},
+		},
+		{
+			"duplicate-and-contained",
+			[]image.Rectangle{image.Rect(32, 32, 96, 96), image.Rect(32, 32, 96, 96), image.Rect(48, 48, 64, 64)},
+			[]image.Rectangle{image.Rect(16, 16, 112, 112)},
+		},
+		{
+			// The third region merges with the second; its enlarged bounding
+			// box then overlaps the already-visited first region.
+			"unsorted-transitive-merge",
+			[]image.Rectangle{image.Rect(80, 80, 96, 96), image.Rect(0, 0, 48, 160), image.Rect(32, 0, 160, 48)},
+			[]image.Rectangle{image.Rect(0, 0, 176, 176)},
+		},
+		{
+			"touching-edges-are-disjoint",
+			[]image.Rectangle{image.Rect(18, 18, 30, 30), image.Rect(34, 18, 46, 30)},
+			[]image.Rectangle{image.Rect(16, 16, 32, 32), image.Rect(32, 16, 48, 32)},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			conn := &graphicsTestConn{}
+			session := &Session{
+				Width: 640, Height: 480, conn: conn,
+				graphics: &graphicsState{ready: true}, dynamic: graphicsDynamicFixture(3),
+			}
+			payload := []byte{0, 0, 1, 0x41, 0x55}
+			if sent, err := session.WriteAVC420Damage(payload, test.regions); err != nil || !sent {
+				t.Fatalf("send damage: %t, %v", sent, err)
+			}
+			messages := graphicsOutputFixture(t, conn.outgoing.Bytes())
+			got, encoded := decodeAVC420DamageFixture(t, decodeZGFXFixture(t, messages[0][2:]), 640, 480, 1)
+			if !slices.Equal(got, test.want) || !bytes.Equal(encoded, payload) {
+				t.Fatalf("wire damage=%v want=%v payload=%x", got, test.want, encoded)
+			}
+			checkAVCDamageCoverage(t, 640, 480, test.regions, got)
+		})
+	}
+}
+
+func TestGraphicsAVC420DamageRandomCoverage(t *testing.T) {
+	t.Parallel()
+	random := rand.New(rand.NewPCG(17, 31)) //nolint:gosec // Deterministic test geometry, not security randomness.
+	for range 200 {
+		regions := make([]image.Rectangle, 1+random.IntN(graphicsMaxRegions))
+		for index := range regions {
+			x, y := random.IntN(400)-50, random.IntN(300)-50
+			regions[index] = image.Rect(x, y, x+random.IntN(80), y+random.IntN(80))
+		}
+		checkAVCDamageCoverage(t, 302, 206, regions, avc420Regions(302, 206, regions))
+	}
+}
+
+func checkAVCDamageCoverage(t *testing.T, width, height int, input, output []image.Rectangle) {
+	t.Helper()
+	bounds := image.Rect(0, 0, width, height)
+	if len(output) == 0 || len(output) > graphicsMaxRegions {
+		t.Fatalf("invalid output region count: %d", len(output))
+	}
+	for i, rect := range output {
+		if rect.Empty() || !rect.In(bounds) {
+			t.Fatalf("invalid output rectangle: %v", rect)
+		}
+		for _, other := range output[i+1:] {
+			if rect.Overlaps(other) {
+				t.Fatalf("FreeRDP would skip %v because it overlaps %v", rect, other)
+			}
+		}
+	}
+	for _, rect := range input {
+		rect = rect.Intersect(bounds)
+		if rect.Empty() {
+			continue
+		}
+		covered := false
+		for _, candidate := range output {
+			if rect.In(candidate) {
+				covered = true
+
+				break
+			}
+		}
+		if !covered {
+			t.Fatalf("dirty pixels lost: %v absent from %v", rect, output)
+		}
 	}
 }
 

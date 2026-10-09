@@ -353,6 +353,20 @@ func avc420Regions(width, height int, regions []image.Rectangle) []image.Rectang
 		// Include neighboring samples affected by chroma and filtering, then
 		// repaint complete H.264 macroblocks. Right/bottom remain exclusive.
 		rect = damage.Align(rect.Inset(-1), 16, bounds)
+		// Expansion can make originally disjoint damage overlap. FreeRDP's
+		// threaded YUV conversion skips an entire rectangle when it overlaps
+		// a later one, leaving stale pixels. Send disjoint repaint regions.
+		for index := 0; index < len(result); {
+			if !rect.Overlaps(result[index]) {
+				index++
+
+				continue
+			}
+			rect = rect.Union(result[index])
+			result = append(result[:index], result[index+1:]...)
+			// A bounding union can overlap regions we already examined.
+			index = 0
+		}
 		if rect == bounds {
 			return []image.Rectangle{bounds}
 		}

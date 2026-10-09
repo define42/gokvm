@@ -1,10 +1,41 @@
 package vmm
 
 import (
+	"errors"
 	"net"
 	"testing"
 	"time"
 )
+
+func TestRDPPerformanceConfigBeforeMachineInit(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		config Config
+		want   error
+	}{
+		{name: "negative-threads", config: Config{RDPH264: true, RDPH264Threads: -1}, want: errRDPH264ThreadsConfig},
+		{name: "excessive-threads", config: Config{RDPH264: true, RDPH264Threads: 17}, want: errRDPH264ThreadsConfig},
+		{
+			name:   "threads-without-h264",
+			config: Config{RDP: "127.0.0.1:0", RDPH264Threads: 2},
+			want:   errRDPH264ThreadsConfig,
+		},
+		{name: "stats-without-rdp", config: Config{RDPStats: true}, want: errRDPStatsConfig},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			tc.config.Dev = "/missing-kvm-device"
+			v := New(tc.config)
+			if err := v.Init(); !errors.Is(err, tc.want) {
+				t.Fatalf("got %v, want configuration error %v before opening KVM", err, tc.want)
+			}
+			if v.Machine != nil {
+				t.Fatal("invalid RDP configuration created a machine")
+			}
+		})
+	}
+}
 
 func TestRDPDisplayConfiguration(t *testing.T) {
 	t.Parallel()

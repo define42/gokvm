@@ -14,30 +14,36 @@ var ErrRDPOptions = errors.New("RDP certificate and key must be provided togethe
 
 var ErrRDPH264 = errors.New("-rdp-h264 requires -rdp")
 
+var ErrRDPH264Threads = errors.New("-rdp-h264-threads must be 0 (auto) or 1..16 and requires -rdp-h264")
+
+var ErrRDPStats = errors.New("-rdp-stats requires -rdp")
+
 var ErrNetwork = errors.New("-net must be 'user' or 'none' and cannot be combined with -t")
 
 var ErrAudio = errors.New("-audio must be 'none' or 'rdp'; 'rdp' requires -rdp")
 
 type BootArgs struct {
-	Kernel     string
-	MemSize    int
-	NCPUs      int
-	Dev        string
-	Initrd     string
-	ISO        string
-	Params     string
-	ParamsSet  bool
-	TapIfName  string
-	Network    string
-	Disk       string
-	GPU        string
-	VNC        string
-	RDP        string
-	RDPCert    string
-	RDPKey     string
-	RDPH264    bool
-	Audio      string
-	TraceCount int
+	Kernel         string
+	MemSize        int
+	NCPUs          int
+	Dev            string
+	Initrd         string
+	ISO            string
+	Params         string
+	ParamsSet      bool
+	TapIfName      string
+	Network        string
+	Disk           string
+	GPU            string
+	VNC            string
+	RDP            string
+	RDPCert        string
+	RDPKey         string
+	RDPH264        bool
+	RDPH264Threads int
+	RDPStats       bool
+	Audio          string
+	TraceCount     int
 }
 
 func parseBootArgs(args []string) (*BootArgs, error) {
@@ -73,6 +79,9 @@ func parseBootArgs(args []string) (*BootArgs, error) {
 	bootCmd.StringVar(&c.RDPKey, "rdp-key", "", "RDP TLS private key PEM file")
 	bootCmd.BoolVar(&c.RDPH264, "rdp-h264", false,
 		"enable OpenH264 AVC420 graphics for compatible RDP clients (requires an openh264 build)")
+	bootCmd.IntVar(&c.RDPH264Threads, "rdp-h264-threads", 0,
+		"OpenH264 encoding workers per client: 0 selects automatically, 1..16 sets a limit (requires -rdp-h264)")
+	bootCmd.BoolVar(&c.RDPStats, "rdp-stats", false, "log RDP performance statistics every 5 seconds")
 	bootCmd.StringVar(&c.Audio, "audio", "", "audio output: rdp (virtio-snd playback through RDP) or none (default)")
 
 	bootCmd.IntVar(&c.NCPUs, "c", 1, "number of cpus")
@@ -87,11 +96,26 @@ func parseBootArgs(args []string) (*BootArgs, error) {
 	if err = bootCmd.Parse(args); err != nil {
 		return nil, err
 	}
+	var threadsSet bool
+	bootCmd.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "p":
+			c.ParamsSet = true
+		case "rdp-h264-threads":
+			threadsSet = true
+		}
+	})
 	if (c.RDPCert == "") != (c.RDPKey == "") || (c.RDPCert != "" && c.RDP == "") {
 		return nil, ErrRDPOptions
 	}
 	if c.RDPH264 && c.RDP == "" {
 		return nil, ErrRDPH264
+	}
+	if c.RDPH264Threads < 0 || c.RDPH264Threads > 16 || (threadsSet && !c.RDPH264) {
+		return nil, ErrRDPH264Threads
+	}
+	if c.RDPStats && c.RDP == "" {
+		return nil, ErrRDPStats
 	}
 	if (c.Audio != "" && c.Audio != "none" && c.Audio != "rdp") || (c.Audio == "rdp" && c.RDP == "") {
 		return nil, ErrAudio
@@ -100,12 +124,6 @@ func parseBootArgs(args []string) (*BootArgs, error) {
 		(c.Network != "" && c.TapIfName != "") {
 		return nil, ErrNetwork
 	}
-	bootCmd.Visit(func(f *flag.Flag) {
-		if f.Name == "p" {
-			c.ParamsSet = true
-		}
-	})
-
 	if c.MemSize, err = ParseSize(*msize, "g"); err != nil {
 		return nil, err
 	}

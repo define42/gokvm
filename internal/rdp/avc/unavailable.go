@@ -5,6 +5,6 @@ package avc
 // Available reports whether this binary includes the OpenH264 encoder.
 func Available() bool { return false }
 
-func newNativeEncoder(_, _ int) (nativeEncoder, error) {
-	return nil, ErrUnavailable
+func newNativeEncoder(_, _, _ int) (nativeEncoder, int, error) {
+	return nil, 0, ErrUnavailable
 }

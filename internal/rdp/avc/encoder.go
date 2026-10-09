@@ -5,12 +5,16 @@ package avc
 import (
 	"errors"
 	"image"
+	"time"
 
 	"github.com/bobuhiro11/gokvm/internal/rdp/damage"
 )
 
 // FrameRate is the maximum frame rate of the RDP AVC420 encoder.
 const FrameRate = 60
+
+// MaxThreads limits the number of slice workers used by one encoder.
+const MaxThreads = 16
 
 const maxDimension = 4096
 
@@ -19,7 +23,21 @@ var (
 	ErrGeometry    = errors.New("invalid OpenH264 frame geometry")
 	ErrCodec       = errors.New("OpenH264 operation failed")
 	ErrClosed      = errors.New("OpenH264 encoder is closed")
+	ErrThreads     = errors.New("OpenH264 threads must be between 1 and 16")
 )
+
+// Options controls slice parallelism and optional per-frame measurements.
+type Options struct {
+	Threads int
+	Measure bool
+}
+
+// EncodeStats describes the most recent Encode or EncodeDamage call. Encoding
+// includes the native codec and copying its output into the returned Go slice.
+type EncodeStats struct {
+	Conversion time.Duration
+	Encoding   time.Duration
+}
 
 type nativeEncoder interface {
 	encode([]byte, bool, int64) ([]byte, error)
@@ -36,25 +54,46 @@ type Encoder struct {
 	initialized   bool
 	retry         bool
 	frame         int64
+	threads       int
+	measure       bool
+	stats         EncodeStats
 }
 
 // NewEncoder fixes the output size for the lifetime of the encoder. Dimensions
 // must be even and between 16 and 4096 pixels, inclusive.
 func NewEncoder(width, height int) (*Encoder, error) {
+	return NewEncoderWithOptions(width, height, Options{Threads: 1})
+}
+
+// NewEncoderWithOptions fixes the output size and requested slice worker count.
+// Threads must be between 1 and MaxThreads. OpenH264 can reduce the actual count
+// for small pictures; Threads reports the initialized count.
+func NewEncoderWithOptions(width, height int, options Options) (*Encoder, error) {
 	if width < 16 || height < 16 || width > maxDimension || height > maxDimension || width%2 != 0 || height%2 != 0 {
 		return nil, ErrGeometry
 	}
+	if options.Threads < 1 || options.Threads > MaxThreads {
+		return nil, ErrThreads
+	}
 
-	codec, err := newNativeEncoder(width, height)
+	codec, threads, err := newNativeEncoder(width, height, options.Threads)
 	if err != nil {
 		return nil, err
 	}
 
 	return &Encoder{
 		codec: codec, width: width, height: height,
-		i420: make([]byte, width*height*3/2),
+		i420:    make([]byte, width*height*3/2),
+		threads: threads, measure: options.Measure,
 	}, nil
 }
+
+// Threads returns the actual slice worker count selected by OpenH264.
+func (e *Encoder) Threads() int { return e.threads }
+
+// LastStats returns measurements for the most recent encode call. Measurements
+// are zero when Options.Measure is false; that path does not read the clock.
+func (e *Encoder) LastStats() EncodeStats { return e.stats }
 
 // Encode scales img to the session dimensions and encodes it. Force requests an
 // independent IDR frame, for example when a client asks for a complete refresh.
@@ -71,11 +110,16 @@ func (e *Encoder) Encode(img *image.RGBA, force bool) ([]byte, error) {
 // skipped by pacing. A codec failure retains the candidate image and requests an
 // IDR on retry, so subsequent partial updates cannot lose the failed changes.
 func (e *Encoder) EncodeDamage(img *image.RGBA, regions []image.Rectangle, force bool) ([]byte, error) {
+	e.stats = EncodeStats{}
 	if e.codec == nil {
 		return nil, ErrClosed
 	}
 	if !validRGBA(img) {
 		return nil, ErrGeometry
+	}
+	var started time.Time
+	if e.measure {
+		started = time.Now()
 	}
 
 	changed := !e.initialized || e.retry
@@ -89,10 +133,19 @@ func (e *Encoder) EncodeDamage(img *image.RGBA, regions []image.Rectangle, force
 		}
 	}
 	e.source, e.initialized = img.Rect, true
+	if e.measure {
+		e.stats.Conversion = time.Since(started)
+	}
 	if !force && !changed {
 		return nil, nil
 	}
+	if e.measure {
+		started = time.Now()
+	}
 	data, err := e.codec.encode(e.i420, force || e.retry, e.frame*1000/FrameRate)
+	if e.measure {
+		e.stats.Encoding = time.Since(started)
+	}
 	e.frame++
 	e.retry = err != nil
 

@@ -25,7 +25,7 @@ void gokvm_avc_destroy(gokvm_avc_encoder *encoder) {
     free(encoder);
 }
 
-int gokvm_avc_create(int width, int height, gokvm_avc_encoder **out) {
+int gokvm_avc_create(int width, int height, int threads, gokvm_avc_encoder **out, int *actual_threads) {
     OpenH264Version version;
     WelsGetCodecVersionEx(&version);
     // Extended encoder structures can change across OpenH264 releases.
@@ -56,7 +56,7 @@ int gokvm_avc_create(int width, int height, gokvm_avc_encoder **out) {
     params.iSpatialLayerNum = 1;
     params.iTemporalLayerNum = 1;
     params.bSimulcastAVC = false;
-    params.iMultipleThreadIdc = 1;
+    params.iMultipleThreadIdc = threads;
     params.uiIntraPeriod = 150;
     params.bEnableFrameSkip = false;
     params.bEnableDenoise = false;
@@ -72,7 +72,8 @@ int gokvm_avc_create(int width, int height, gokvm_avc_encoder **out) {
     layer->fFrameRate = 60;
     layer->uiProfileIdc = PRO_BASELINE;
     layer->iDLayerQp = 20;
-    layer->sSliceArgument.uiSliceMode = SM_SINGLE_SLICE;
+    layer->sSliceArgument.uiSliceMode = threads > 1 ? SM_FIXEDSLCNUM_SLICE : SM_SINGLE_SLICE;
+    layer->sSliceArgument.uiSliceNum = threads;
     layer->bVideoSignalTypePresent = true;
     layer->uiVideoFormat = VF_UNDEF;
     layer->bFullRange = true;
@@ -85,6 +86,13 @@ int gokvm_avc_create(int width, int height, gokvm_avc_encoder **out) {
         gokvm_avc_destroy(encoder);
         return status;
     }
+    // Initialization can reduce slice/worker counts to fit small pictures.
+    status = (*encoder->codec)->GetOption(encoder->codec, ENCODER_OPTION_SVC_ENCODE_PARAM_EXT, &params);
+    if (status || params.iMultipleThreadIdc < 1 || params.iMultipleThreadIdc > threads) {
+        gokvm_avc_destroy(encoder);
+        return status ? status : -3;
+    }
+    *actual_threads = params.iMultipleThreadIdc;
     *out = encoder;
     return 0;
 }

@@ -19,13 +19,14 @@ type openH264Encoder struct{ handle *C.gokvm_avc_encoder }
 func Available() bool { return true }
 
 //nolint:gocritic,nlreturn // cgo-generated pointer checks trigger these style checks.
-func newNativeEncoder(width, height int) (nativeEncoder, error) {
+func newNativeEncoder(width, height, threads int) (nativeEncoder, int, error) {
 	var handle *C.gokvm_avc_encoder
-	if status := C.gokvm_avc_create(C.int(width), C.int(height), &handle); status != 0 {
-		return nil, fmt.Errorf("%w: initialize (status %d)", ErrCodec, status)
+	var actual C.int
+	if status := C.gokvm_avc_create(C.int(width), C.int(height), C.int(threads), &handle, &actual); status != 0 {
+		return nil, 0, fmt.Errorf("%w: initialize (status %d)", ErrCodec, status)
 	}
 
-	return &openH264Encoder{handle: handle}, nil
+	return &openH264Encoder{handle: handle}, int(actual), nil
 }
 
 //nolint:gocritic,nlreturn // cgo-generated pointer checks trigger these style checks.

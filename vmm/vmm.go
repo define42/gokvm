@@ -29,6 +29,10 @@ var errNetworkConfig = errors.New("network must be 'user' or 'none' and cannot b
 
 var errAudioConfig = errors.New("audio must be 'none' or 'rdp'; 'rdp' requires an RDP listener")
 
+var errRDPH264ThreadsConfig = errors.New("RDP H.264 threads must be 0 (auto) or 1..16; a thread limit requires H.264")
+
+var errRDPStatsConfig = errors.New("RDP statistics require an RDP listener")
+
 // These parameters describe gaps in gokvm's direct Linux boot environment, not
 // ISO-specific policy. The ISO's own boot config still supplies the distro
 // command line; this list only adds the host/VMM plumbing that a real firmware
@@ -40,26 +44,28 @@ const gokvmDirectLinuxBootParams = "console=tty0 console=ttyS0 earlyprintk=seria
 // Config defines the configuration of the
 // virtual machine, as determined by flags.
 type Config struct {
-	Debug      bool
-	Dev        string
-	Kernel     string
-	Initrd     string
-	ISO        string
-	Params     string
-	ParamsSet  bool
-	TapIfName  string
-	Network    string
-	Disk       string
-	GPU        string
-	VNC        string
-	RDP        string
-	RDPCert    string
-	RDPKey     string
-	RDPH264    bool
-	Audio      string
-	NCPUs      int
-	MemSize    int
-	TraceCount int
+	Debug          bool
+	Dev            string
+	Kernel         string
+	Initrd         string
+	ISO            string
+	Params         string
+	ParamsSet      bool
+	TapIfName      string
+	Network        string
+	Disk           string
+	GPU            string
+	VNC            string
+	RDP            string
+	RDPCert        string
+	RDPKey         string
+	RDPH264        bool
+	RDPH264Threads int
+	RDPStats       bool
+	Audio          string
+	NCPUs          int
+	MemSize        int
+	TraceCount     int
 }
 
 type VMM struct {
@@ -81,8 +87,22 @@ func New(c Config) *VMM {
 	}
 }
 
+func (v *VMM) validateRDPPerformanceConfig() error {
+	if v.RDPH264Threads < 0 || v.RDPH264Threads > 16 || (v.RDPH264Threads != 0 && !v.RDPH264) {
+		return errRDPH264ThreadsConfig
+	}
+	if v.RDPStats && v.RDP == "" {
+		return errRDPStatsConfig
+	}
+
+	return nil
+}
+
 // Init instantiates a machine.
 func (v *VMM) Init() (initErr error) {
+	if err := v.validateRDPPerformanceConfig(); err != nil {
+		return err
+	}
 	if (v.Audio != "" && v.Audio != "none" && v.Audio != "rdp") || (v.Audio == "rdp" && v.RDP == "") {
 		return errAudioConfig
 	}
@@ -196,6 +216,7 @@ func (v *VMM) display(input virtio.VNCInput) (result virtio.Display, displayErr 
 		}
 		display, err := virtio.NewRDPDisplayWithConfig(v.RDP, virtio.RDPConfig{
 			TLS: config, H264: v.RDPH264, Audio: v.Audio == "rdp",
+			H264Threads: v.RDPH264Threads, Stats: v.RDPStats, GuestCPUs: v.NCPUs,
 		})
 		if err != nil {
 			return nil, err

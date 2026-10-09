@@ -234,6 +234,34 @@ links to the OpenH264 shared library, which must remain installed at runtime.
 Normal builds need no OpenH264 dependency and report a clear error if
 `-rdp-h264` is requested.
 
+OpenH264 can encode slices of the same frame on multiple CPU cores. The default
+`-rdp-h264-threads 0` selects up to two workers per client, taking the Go CPU
+limit, guest vCPU count, and number of active AVC clients into account. Explicit
+values from 1 to 16 set a per-client worker limit; `-rdp-h264-threads 1` forces
+serial encoding. Clients share an encoding CPU budget that reserves capacity
+for guest vCPUs and one CPU for host work, including audio, with a minimum budget
+of one encoding worker. Frames remain ordered, and slow
+clients continue receiving the latest frame without building a queue.
+
+Use `-rdp-stats` to log performance measurements every five seconds while frames
+are active, plus a summary when the client disconnects. Statistics include frame
+and compressed payload byte counts, actual worker count, average/maximum time
+for framebuffer copying, color conversion, H.264 encoding and network writes,
+and time spent waiting for client acknowledgements
+or available encoding workers. Statistics are disabled by default and also
+work with bitmap RDP. For example:
+
+```bash
+./gokvm boot -iso ./slax.iso -m 2G -net user \
+  -rdp 127.0.0.1:3390 -rdp-h264 -rdp-h264-threads 2 -rdp-stats
+```
+
+Try worker limits of 1, 2, and 4 while scrolling the same page, then compare
+encoding time and responsiveness. More workers help when encoding is the
+bottleneck; guest rendering, color conversion, and client acknowledgement waits
+can also limit frame rate. These options require no changes to the RDP client
+command. `-rdp-h264-threads` requires `-rdp-h264`; `-rdp-stats` requires `-rdp`.
+
 AVC420 uses lossy YUV 4:2:0 compression and software encoding, so small colored
 text can be softer than bitmap output. AVC444 and hardware encoding are not
 implemented. TLS and authentication behavior are the same as for bitmap RDP.
