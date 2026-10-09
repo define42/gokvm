@@ -22,7 +22,10 @@ import (
 	"github.com/bobuhiro11/gokvm/internal/rdp/avc"
 )
 
-const rdpMaxClients = 8
+const (
+	rdpMaxClients  = 8
+	rdpResizeDelay = 150 * time.Millisecond
+)
 
 // RDPConfig selects the server certificate, OpenH264 graphics, and audio playback.
 type RDPConfig struct {
@@ -44,6 +47,9 @@ type RDPDisplay struct {
 	conns    map[net.Conn]struct{}
 	wg       sync.WaitGroup
 	once     sync.Once
+	resizeMu sync.Mutex
+	resize   func(int, int) error
+	viewers  []*rdp.Session
 }
 
 // NewRDPDisplay starts an RDP listener with an ephemeral self-signed certificate.
@@ -103,6 +109,63 @@ func NewRDPDisplayWithConfig(addr string, options RDPConfig) (*RDPDisplay, error
 }
 
 func (d *RDPDisplay) Addr() string { return d.listener.Addr().String() }
+
+// SetResizeHandler attaches the guest GPU. The first connected viewer controls
+// its resolution; other viewers display that shared desktop at their own size.
+func (d *RDPDisplay) SetResizeHandler(resize func(int, int) error) {
+	d.resizeMu.Lock()
+	defer d.resizeMu.Unlock()
+	d.resize = resize
+	if len(d.viewers) != 0 {
+		d.resizeGuestLocked(d.viewers[0])
+	}
+}
+
+func (d *RDPDisplay) addResizeViewer(session *rdp.Session) {
+	d.resizeMu.Lock()
+	defer d.resizeMu.Unlock()
+	d.viewers = append(d.viewers, session)
+	if len(d.viewers) == 1 {
+		d.resizeGuestLocked(session)
+	}
+}
+
+func (d *RDPDisplay) removeResizeViewer(session *rdp.Session) {
+	d.resizeMu.Lock()
+	defer d.resizeMu.Unlock()
+	for i, viewer := range d.viewers {
+		if viewer != session {
+			continue
+		}
+		copy(d.viewers[i:], d.viewers[i+1:])
+		d.viewers[len(d.viewers)-1] = nil
+		d.viewers = d.viewers[:len(d.viewers)-1]
+		if i == 0 && len(d.viewers) != 0 {
+			d.resizeGuestLocked(d.viewers[0])
+		}
+
+		return
+	}
+}
+
+func (d *RDPDisplay) resizeGuest(session *rdp.Session) {
+	d.resizeMu.Lock()
+	defer d.resizeMu.Unlock()
+	if len(d.viewers) != 0 && d.viewers[0] == session {
+		d.resizeGuestLocked(session)
+	}
+}
+
+// resizeMu orders GPU mode requests against controller disconnect/handoff.
+// The callback must not call back into viewer management.
+func (d *RDPDisplay) resizeGuestLocked(session *rdp.Session) {
+	if d.resize != nil {
+		width, height := session.Size()
+		if err := d.resize(width, height); err != nil {
+			log.Printf("rdp: guest display resize to %dx%d: %v", width, height, err)
+		}
+	}
+}
 
 // WritePCM receives borrowed, clocked PCM from the virtual sound card.
 func (d *RDPDisplay) WritePCM(pcm []byte) {
@@ -187,12 +250,17 @@ func (d *RDPDisplay) serveConn(conn net.Conn) (serveErr error) {
 			return err
 		}
 	}
+	if _, err := session.BeginDisplayControl(); err != nil {
+		return err
+	}
 
 	if d.h264 {
 		if _, err := session.BeginGraphics(); err != nil {
 			return err
 		}
 	}
+	d.addResizeViewer(session)
+	defer d.removeResizeViewer(session)
 
 	// The guest draws its own cursor, as it does on the VNC console.
 	if err := session.WriteDataPDU(27, []byte{1, 0, 0, 0, 0, 0, 0, 0}); err != nil {
@@ -305,26 +373,48 @@ func (d *RDPDisplay) writeFrames(
 	conn net.Conn, session *rdp.Session,
 	stop, refresh <-chan struct{}, suppressed *atomic.Bool,
 ) error {
-	bitmap, err := rdp.NewBitmapEncoder(session.Width, session.Height, session.BitsPerPixel)
+	width, height := session.Size()
+	bitmap, err := rdp.NewBitmapEncoder(width, height, session.BitsPerPixel)
 	if err != nil {
 		return err
 	}
-	writer := &rdpFrameWriter{session: session, bitmap: bitmap, force: true}
+	writer := &rdpFrameWriter{session: session, bitmap: bitmap, width: width, height: height, force: true}
 	defer writer.close()
 	timer := time.NewTimer(time.Hour)
 	timer.Stop()
 	defer timer.Stop()
 	graphicsChanged := session.GraphicsChanged()
+	displayChanged := session.DisplayChanged()
+	resizeRequests := session.ResizeRequests()
+	resizeTimer := time.NewTimer(time.Hour)
+	resizeTimer.Stop()
+	defer resizeTimer.Stop()
+	var resizeDue <-chan time.Time
+	var pending rdp.DesktopSize
+	resizeReady := false
 
 	// Coalesce publications while pacing or awaiting acknowledgments. Only arm
 	// the timer for a pending frame; idle clients need no periodic polling.
 	for {
+		if resizeReady && session.DisplayReady() {
+			resized, resizeErr := session.Resize(pending.Width, pending.Height)
+			if resizeErr != nil {
+				return resizeErr
+			}
+			resizeReady = false
+			if resized {
+				d.resizeGuest(session)
+			}
+		}
+		if err := writer.updateSize(); err != nil {
+			return err
+		}
 		if writer.updateGraphics(conn) {
 			writer.force = true
 		}
 		frame, changed, published := d.changedFrame(writer.sequence, writer.force)
 		var paced <-chan time.Time
-		if changed && !suppressed.Load() && (!writer.graphics || session.GraphicsCanSend()) {
+		if changed && session.DisplayReady() && !suppressed.Load() && (!writer.graphics || session.GraphicsCanSend()) {
 			paced, err = writer.writeWhenReady(frame, timer)
 			if err != nil {
 				return err
@@ -340,6 +430,14 @@ func (d *RDPDisplay) writeFrames(
 			writer.force = true
 		case <-published:
 		case <-graphicsChanged:
+		case <-displayChanged:
+		case pending = <-resizeRequests:
+			resizeReady = false
+			resizeTimer.Reset(rdpResizeDelay)
+			resizeDue = resizeTimer.C
+		case <-resizeDue:
+			resizeDue = nil
+			resizeReady = true
 		case <-paced:
 		}
 		timer.Stop()
@@ -350,10 +448,33 @@ type rdpFrameWriter struct {
 	session   *rdp.Session
 	bitmap    *rdp.BitmapEncoder
 	avc       *avc.Encoder
+	width     int
+	height    int
 	graphics  bool
 	sequence  uint64
 	force     bool
 	nextFrame time.Time
+}
+
+// Encoders retain geometry and the previous frame. Discard both after a resize
+// so the new surface starts with a complete bitmap or an AVC keyframe.
+func (w *rdpFrameWriter) updateSize() error {
+	width, height := w.session.Size()
+	if width == w.width && height == w.height {
+		return nil
+	}
+	bitmap, err := rdp.NewBitmapEncoder(width, height, w.session.BitsPerPixel)
+	if err != nil {
+		return err
+	}
+	w.close()
+	w.avc = nil
+	w.bitmap = bitmap
+	w.width, w.height = width, height
+	w.force = true
+	w.nextFrame = time.Time{}
+
+	return nil
 }
 
 func (w *rdpFrameWriter) writeWhenReady(frame vncFrame, timer *time.Timer) (<-chan time.Time, error) {
@@ -415,7 +536,8 @@ func (w *rdpFrameWriter) write(frame vncFrame, force bool) (bool, error) {
 		return err == nil, err
 	}
 	if w.avc == nil {
-		encoder, err := avc.NewEncoder(w.session.Width, w.session.Height)
+		width, height := w.session.Size()
+		encoder, err := avc.NewEncoder(width, height)
 		if err != nil {
 			return false, err
 		}
@@ -438,8 +560,9 @@ func (d *RDPDisplay) dispatchInput(session *rdp.Session, events []rdp.InputEvent
 			d.mu.Lock()
 			width, height := d.width, d.height
 			d.mu.Unlock()
-			x := min(int(event.X), session.Width-1) * width / session.Width
-			y := min(int(event.Y), session.Height-1) * height / session.Height
+			clientWidth, clientHeight := session.Size()
+			x := min(int(event.X), clientWidth-1) * width / clientWidth
+			y := min(int(event.Y), clientHeight-1) * height / clientHeight
 			d.sendPointerEvent(event.Buttons, uint16(x), uint16(y))
 		}
 	}

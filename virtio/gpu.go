@@ -5,6 +5,7 @@ import (
 	"errors"
 	"image"
 	"image/draw"
+	"io"
 	"log"
 	"sync"
 	"time"
@@ -49,6 +50,14 @@ const (
 	gpuDefaultWidth  = 1024
 	gpuDefaultHeight = 768
 	gpuCursorSize    = 64
+	gpuEventDisplay  = 1
+	gpuMaxDimension  = 4096
+	gpuMaxPixels     = 4096 * 2160
+	gpuMaxResources  = 1024
+	// Leave room for old and new triple-buffered scanouts during a 4K resize.
+	gpuResourceLimit = 256 * 1024 * 1024
+	gpuMaxBacking    = gpuMaxPixels * gpuBytesPerPixel / 4096
+	gpuMaxRequest    = gpuCtrlHdrLen + 8 + gpuMaxBacking*16
 
 	// Wire-format struct sizes.
 	gpuCtrlHdrLen    = 24 // struct virtio_gpu_ctrl_hdr
@@ -75,8 +84,10 @@ const (
 	gpuRespOKNoData             = 0x1100
 	gpuRespOKDisplayInfo        = 0x1101
 	gpuRespErrUnspec            = 0x1200
+	gpuRespErrOutOfMemory       = 0x1201
 	gpuRespErrInvalidScanoutID  = 0x1202
 	gpuRespErrInvalidResourceID = 0x1203
+	gpuRespErrInvalidParameter  = 0x1205
 
 	// virtio_gpu_formats. Bytes are listed most-significant-first, e.g.
 	// B8G8R8A8 stores B at byte 0, A at byte 3.
@@ -91,7 +102,10 @@ const (
 )
 
 // ErrNoGPUReq is returned by the queue processors when no request is pending.
-var ErrNoGPUReq = errors.New("no virtio-gpu request")
+var (
+	ErrNoGPUReq       = errors.New("no virtio-gpu request")
+	ErrGPUDisplaySize = errors.New("GPU display size must be even, 200..4096 per dimension, and at most 4096x2160 pixels")
+)
 
 // GPU is a modern PCI device exposing capabilities and a memory BAR.
 var _ pci.CapsAndMMIO = (*GPU)(nil)
@@ -121,10 +135,16 @@ type gpuCursor struct {
 // GPU is a modern (virtio 1.0) 2D display device.
 type GPU struct {
 	*ModernTransport
+	mu          sync.Mutex // Device state, worker, config accesses and external mode changes.
+	transportMu sync.Mutex // Serializes MMIO/reset with external configuration changes.
 
-	width   uint32
-	height  uint32
-	display Display
+	width         uint32
+	height        uint32
+	display       Display
+	events        uint32
+	resourceBytes uint64
+	closed        bool
+	closeErr      error
 
 	resources map[uint32]*gpuResource
 	scanout   [gpuNumScanouts]uint32
@@ -179,11 +199,44 @@ func (g *GPU) NumQueues() int { return gpuNumQueues }
 // DeviceConfigLen covers struct virtio_gpu_config.
 func (g *GPU) DeviceConfigLen() int { return gpuConfigLen }
 
-// ReadDeviceConfig serves struct virtio_gpu_config: events_read (0),
+// MMIO serializes transport reset/configuration with external display changes.
+func (g *GPU) MMIO(offset uint64, data []byte, isWrite bool) {
+	g.transportMu.Lock()
+	defer g.transportMu.Unlock()
+	g.ModernTransport.MMIO(offset, data, isWrite)
+}
+
+// SetDisplaySize changes the preferred guest mode and notifies its DRM driver.
+// The existing scanout remains visible until the guest submits its new frame.
+func (g *GPU) SetDisplaySize(width, height int) error {
+	if width < 200 || height < 200 || width > gpuMaxDimension || height > gpuMaxDimension ||
+		width%2 != 0 || height%2 != 0 || uint64(width)*uint64(height) > gpuMaxPixels {
+		return ErrGPUDisplaySize
+	}
+	g.transportMu.Lock()
+	defer g.transportMu.Unlock()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closed {
+		return io.ErrClosedPipe
+	}
+	if g.width == uint32(width) && g.height == uint32(height) {
+		return nil
+	}
+	g.width, g.height = uint32(width), uint32(height)
+	g.events |= gpuEventDisplay
+
+	return g.ConfigChanged()
+}
+
+// ReadDeviceConfig serves struct virtio_gpu_config: events_read,
 // events_clear (0), num_scanouts and num_capsets (0).
 func (g *GPU) ReadDeviceConfig(offset uint64, data []byte) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	var cfg [gpuConfigLen]byte
 
+	binary.LittleEndian.PutUint32(cfg[:], g.events)
 	binary.LittleEndian.PutUint32(cfg[8:], gpuNumScanouts)
 	zero(data)
 
@@ -199,13 +252,28 @@ func (g *GPU) ReadDeviceConfig(offset uint64, data []byte) {
 	copy(data, cfg[offset:end])
 }
 
-// WriteDeviceConfig handles writes to events_clear, which we have nothing to
-// clear for (no config-change events are ever raised).
-func (g *GPU) WriteDeviceConfig(offset uint64, data []byte) {}
+// WriteDeviceConfig implements the write-one-to-clear events_clear register.
+func (g *GPU) WriteDeviceConfig(offset uint64, data []byte) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	var clearEvents [4]byte
+	for i, value := range data {
+		if offset <= 7 && uint64(i) <= 7-offset {
+			pos := offset + uint64(i)
+			if pos >= 4 {
+				clearEvents[pos-4] = value
+			}
+		}
+	}
+	g.events &^= binary.LittleEndian.Uint32(clearEvents[:])
+}
 
 func (g *GPU) QueueReady(idx int, q *SplitQueue) {
-	if idx >= 0 && idx < gpuNumQueues {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.closed && idx >= 0 && idx < gpuNumQueues {
 		g.VirtQueue[idx] = q
+		g.LastAvailIdx[idx] = 0
 	}
 }
 
@@ -246,7 +314,11 @@ func (g *GPU) drain() {
 	for g.ProcessCursorQueue() == nil {
 	}
 
-	_ = g.ReinjectIfPending()
+	g.mu.Lock()
+	if !g.closed {
+		_ = g.ReinjectIfPending()
+	}
+	g.mu.Unlock()
 }
 
 // ProcessControlQueue services all pending controlq requests, writing a
@@ -259,9 +331,23 @@ func (g *GPU) ProcessControlQueue() error { return g.process(gpuControlQueue, tr
 func (g *GPU) ProcessCursorQueue() error { return g.process(gpuCursorQueue, false) }
 
 func (g *GPU) process(sel int, control bool) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closed {
+		return io.ErrClosedPipe
+	}
 	q := g.VirtQueue[sel]
-	if q == nil {
+	if q == nil || q.Desc == nil || q.Avail == nil || q.Used == nil {
 		return ErrVQNotInit
+	}
+	queueSize := uint16(QueueSize)
+	if q.Size != 0 && q.Size <= QueueSize {
+		queueSize = q.Size
+	}
+	if LoadU16(&q.Avail.Idx)-g.LastAvailIdx[sel] > queueSize {
+		g.LastAvailIdx[sel] = LoadU16(&q.Avail.Idx)
+
+		return ErrNoGPUReq
 	}
 
 	if g.LastAvailIdx[sel] == LoadU16(&q.Avail.Idx) {
@@ -269,8 +355,8 @@ func (g *GPU) process(sel int, control bool) error {
 	}
 
 	cursorChanged := false
-	for g.LastAvailIdx[sel] != LoadU16(&q.Avail.Idx) {
-		head := q.Avail.Ring[g.LastAvailIdx[sel]%QueueSize]
+	for processed := uint16(0); processed < queueSize && g.LastAvailIdx[sel] != LoadU16(&q.Avail.Idx); processed++ {
+		head := q.Avail.Ring[g.LastAvailIdx[sel]%queueSize]
 
 		var used uint32
 
@@ -284,8 +370,8 @@ func (g *GPU) process(sel int, control bool) error {
 		}
 
 		uidx := LoadU16(&q.Used.Idx)
-		q.Used.Ring[uidx%QueueSize].ID = uint32(head)
-		q.Used.Ring[uidx%QueueSize].Len = used
+		q.Used.Ring[uidx%queueSize].ID = uint32(head)
+		q.Used.Ring[uidx%queueSize].Len = used
 
 		StoreAddU16(&q.Used.Idx, 1)
 		g.LastAvailIdx[sel]++
@@ -355,17 +441,31 @@ func (g *GPU) collectChain(q *SplitQueue, head uint16) ([]byte, []writableSeg) {
 	)
 
 	descID := head
+	var visited [QueueSize]bool
+	queueSize := uint16(QueueSize)
+	if q.Size != 0 && q.Size <= QueueSize {
+		queueSize = q.Size
+	}
 
 	for {
+		if descID >= queueSize || visited[descID] {
+			return nil, nil
+		}
+		visited[descID] = true
 		desc := q.Desc[descID]
+		if desc.Flags & ^uint16(descFWrite|descFNext) != 0 || desc.Addr > uint64(len(g.Mem)) ||
+			uint64(desc.Len) > uint64(len(g.Mem))-desc.Addr {
+			return nil, nil
+		}
 
 		if desc.Flags&descFWrite != 0 {
 			wr = append(wr, writableSeg{addr: desc.Addr, length: desc.Len})
 		} else {
-			end := desc.Addr + uint64(desc.Len)
-			if desc.Addr < uint64(len(g.Mem)) && end <= uint64(len(g.Mem)) {
-				req = append(req, g.Mem[desc.Addr:end]...)
+			if len(wr) != 0 || uint64(desc.Len) > uint64(gpuMaxRequest-len(req)) {
+				return nil, nil
 			}
+			end := desc.Addr + uint64(desc.Len)
+			req = append(req, g.Mem[desc.Addr:end]...)
 		}
 
 		if desc.Flags&descFNext == 0 {
@@ -496,16 +596,31 @@ func (g *GPU) cmdResourceCreate2D(req []byte) []byte {
 	width := le.Uint32(req[gpuCtrlHdrLen+8:])
 	height := le.Uint32(req[gpuCtrlHdrLen+12:])
 
-	if id == 0 {
+	if id == 0 || g.resources[id] != nil {
 		return g.respNoData(gpuRespErrInvalidResourceID)
+	}
+	pixels := uint64(width) * uint64(height)
+	if width == 0 || height == 0 || width > gpuMaxDimension || height > gpuMaxDimension || pixels > gpuMaxPixels {
+		return g.respNoData(gpuRespErrInvalidParameter)
+	}
+	switch format {
+	case gpuFormatB8G8R8A8, gpuFormatB8G8R8X8, gpuFormatA8R8G8B8, gpuFormatX8R8G8B8,
+		gpuFormatR8G8B8A8, gpuFormatX8B8G8R8, gpuFormatA8B8G8R8, gpuFormatR8G8B8X8:
+	default:
+		return g.respNoData(gpuRespErrInvalidParameter)
+	}
+	bytes := pixels * gpuBytesPerPixel
+	if bytes > gpuResourceLimit-g.resourceBytes || len(g.resources) >= gpuMaxResources {
+		return g.respNoData(gpuRespErrOutOfMemory)
 	}
 
 	g.resources[id] = &gpuResource{
 		width:  width,
 		height: height,
 		format: format,
-		data:   make([]byte, int(width)*int(height)*gpuBytesPerPixel),
+		data:   make([]byte, int(bytes)),
 	}
+	g.resourceBytes += bytes
 
 	return g.respNoData(gpuRespOKNoData)
 }
@@ -516,7 +631,15 @@ func (g *GPU) cmdResourceUnref(req []byte) []byte {
 		return g.respNoData(gpuRespErrUnspec)
 	}
 
-	delete(g.resources, binary.LittleEndian.Uint32(req[gpuCtrlHdrLen:]))
+	id := binary.LittleEndian.Uint32(req[gpuCtrlHdrLen:])
+	if res := g.resources[id]; res != nil {
+		g.resourceBytes -= uint64(len(res.data))
+		delete(g.resources, id)
+		if g.scanout[0] == id {
+			g.scanout[0] = 0
+			g.frame, g.composite = nil, nil
+		}
+	}
 
 	return g.respNoData(gpuRespOKNoData)
 }
@@ -534,6 +657,17 @@ func (g *GPU) cmdSetScanout(req []byte) []byte {
 
 	if scanoutID >= gpuNumScanouts {
 		return g.respNoData(gpuRespErrInvalidScanoutID)
+	}
+	if resourceID != 0 {
+		res := g.resources[resourceID]
+		if res == nil {
+			return g.respNoData(gpuRespErrInvalidResourceID)
+		}
+		x, y := le.Uint32(req[gpuCtrlHdrLen:]), le.Uint32(req[gpuCtrlHdrLen+4:])
+		w, h := le.Uint32(req[gpuCtrlHdrLen+8:]), le.Uint32(req[gpuCtrlHdrLen+12:])
+		if w == 0 || h == 0 || x > res.width || y > res.height || w > res.width-x || h > res.height-y {
+			return g.respNoData(gpuRespErrInvalidParameter)
+		}
 	}
 
 	g.scanout[scanoutID] = resourceID
@@ -582,6 +716,10 @@ func (g *GPU) cmdTransferToHost2D(req []byte) []byte {
 		return g.respNoData(gpuRespErrInvalidResourceID)
 	}
 
+	if x > res.width || y > res.height || w > res.width-x || h > res.height-y ||
+		offset > uint64(len(res.data)) {
+		return g.respNoData(gpuRespErrInvalidParameter)
+	}
 	g.transferToHost2D(res, x, y, w, h, offset)
 
 	return g.respNoData(gpuRespOKNoData)
@@ -674,6 +812,9 @@ func (g *GPU) cmdResourceAttachBacking(req []byte) []byte {
 	if res == nil {
 		return g.respNoData(gpuRespErrInvalidResourceID)
 	}
+	if nr > gpuMaxBacking || uint64(nr)*16 > uint64(len(req)-(gpuCtrlHdrLen+8)) {
+		return g.respNoData(gpuRespErrInvalidParameter)
+	}
 
 	entries := make([]gpuMemEntry, 0, nr)
 	off := gpuCtrlHdrLen + 8
@@ -683,10 +824,11 @@ func (g *GPU) cmdResourceAttachBacking(req []byte) []byte {
 			break
 		}
 
-		entries = append(entries, gpuMemEntry{
-			addr:   le.Uint64(req[off:]),
-			length: le.Uint32(req[off+8:]),
-		})
+		addr, length := le.Uint64(req[off:]), le.Uint32(req[off+8:])
+		if addr > uint64(len(g.Mem)) || uint64(length) > uint64(len(g.Mem))-addr {
+			return g.respNoData(gpuRespErrInvalidParameter)
+		}
+		entries = append(entries, gpuMemEntry{addr: addr, length: length})
 		off += 16
 	}
 
@@ -843,15 +985,40 @@ func (g *GPU) IOPort() uint64 { return 0 }
 
 func (g *GPU) Size() uint64 { return 0 }
 
+// Reset drops guest-owned queues and resources, preserving the current host
+// display preference so a reprobed guest discovers the latest requested mode.
+func (g *GPU) Reset() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.resetLocked()
+}
+
+func (g *GPU) resetLocked() {
+	g.VirtQueue = [gpuNumQueues]*SplitQueue{}
+	g.LastAvailIdx = [gpuNumQueues]uint16{}
+	g.resources = map[uint32]*gpuResource{}
+	g.resourceBytes = 0
+	g.scanout = [gpuNumScanouts]uint32{}
+	g.frame, g.composite = nil, nil
+	g.cursor = gpuCursor{}
+	g.events = 0
+}
+
 func (g *GPU) Close() error {
-	log.Println("virtio-gpu: Close called")
-	g.closeOnce.Do(func() { close(g.done) })
+	g.closeOnce.Do(func() {
+		g.mu.Lock()
+		g.closed = true
+		g.resetLocked()
+		close(g.done)
+		g.mu.Unlock()
+		// Display shutdown can wait for an RDP writer which is requesting a
+		// mode change. Never hold the GPU mutex while waiting for that writer.
+		if g.display != nil {
+			g.closeErr = g.display.Close()
+		}
+	})
 
-	if g.display != nil {
-		return g.display.Close()
-	}
-
-	return nil
+	return g.closeErr
 }
 
 func NewGPU(irq uint8, irqInjector IRQInjector, mem []byte, display Display) *GPU {
@@ -867,6 +1034,10 @@ func NewGPU(irq uint8, irqInjector IRQInjector, mem []byte, display Display) *GP
 	}
 
 	g.ModernTransport = NewModernTransport(g, mem, func() error {
+		if irqInjector == nil {
+			return nil
+		}
+
 		return irqInjector.InjectVirtioGPUIRQ()
 	})
 

@@ -1,9 +1,82 @@
 package virtio
 
 import (
+	"sync"
+	"sync/atomic"
 	"testing"
 	"unsafe"
 )
+
+func TestModernConfigInterruptAndGeneration(t *testing.T) {
+	t.Parallel()
+	dev := &mockModernDev{numQ: 1}
+	tr := NewModernTransport(dev, make([]byte, 0x10000), func() error { return nil })
+	for _, configFirst := range []bool{false, true} {
+		if configFirst {
+			if err := tr.ConfigChanged(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := tr.Interrupt(); err != nil {
+			t.Fatal(err)
+		}
+		if !configFirst {
+			if err := tr.ConfigChanged(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var isr [1]byte
+		tr.MMIO(isrCfgOffset, isr[:], false)
+		if isr[0] != 3 {
+			t.Fatalf("configFirst=%v: queue/config ISR flags=%x", configFirst, isr[0])
+		}
+	}
+	for range 254 {
+		if err := tr.ConfigChanged(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if gen := readCfg(tr, 21, 1); gen != 0 {
+		t.Fatalf("configuration generation did not wrap at256: %d", gen)
+	}
+}
+
+func TestModernConfigInterruptConcurrent(t *testing.T) {
+	t.Parallel()
+	dev := &mockModernDev{numQ: 1}
+	var injected atomic.Uint32
+	tr := NewModernTransport(dev, make([]byte, 0x10000), func() error {
+		injected.Add(1)
+
+		return nil
+	})
+	var workers sync.WaitGroup
+	workers.Go(func() {
+		for range 1000 {
+			if err := tr.ConfigChanged(); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	workers.Go(func() {
+		for range 1000 {
+			if err := tr.Interrupt(); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	workers.Go(func() {
+		for range 1000 {
+			_ = readCfg(tr, 21, 1)
+		}
+	})
+	workers.Wait()
+	var isr [1]byte
+	tr.MMIO(isrCfgOffset, isr[:], false)
+	if isr[0] != 3 || readCfg(tr, 21, 1) != 1000%256 || injected.Load() != 2000 {
+		t.Fatal("concurrent interrupts lost status bits or configuration changes")
+	}
+}
 
 // mockModernDev is a minimal ModernDevice for exercising the transport.
 type mockModernDev struct {

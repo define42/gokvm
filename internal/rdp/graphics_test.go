@@ -33,7 +33,8 @@ func TestGraphicsChannelNegotiationAndAcknowledgments(t *testing.T) {
 	session := &Session{
 		Width: 1024, Height: 768, conn: conn,
 		joined:   map[uint16]bool{1004: true},
-		graphics: &graphicsState{supported: true, channel: 1004},
+		graphics: &graphicsState{supported: true},
+		dynamic:  &dynamicState{channel: 1004},
 	}
 	started, err := session.BeginGraphics()
 	if err != nil || !started {
@@ -91,7 +92,7 @@ func TestGraphicsChangesWakeWriter(t *testing.T) {
 	}
 	s := &Session{
 		Width: 1024, Height: 768, conn: &graphicsTestConn{},
-		graphics: &graphicsState{channel: 1004, phase: 3},
+		graphics: &graphicsState{}, dynamic: graphicsDynamicFixture(3),
 	}
 	changed := s.GraphicsChanged()
 	if changed != s.GraphicsChanged() {
@@ -288,7 +289,7 @@ func TestGraphicsCapabilitiesAndFallback(t *testing.T) {
 		t.Fatal("client without GFX failed bitmap fallback")
 	}
 	conn := &graphicsTestConn{}
-	s = &Session{conn: conn, graphics: &graphicsState{channel: 1004, phase: 3}}
+	s = &Session{conn: conn, graphics: &graphicsState{}, dynamic: graphicsDynamicFixture(3)}
 	if err := s.readGraphics(graphicsCapsFixture(graphicsVersion81, 0)); err != nil || s.GraphicsReady() {
 		t.Fatalf("client without AVC420 failed bitmap fallback: %v", err)
 	}
@@ -306,7 +307,7 @@ func TestGraphicsFragmentsAndZGFX(t *testing.T) {
 			data[i] = byte(i)
 		}
 		conn := &graphicsTestConn{}
-		s := &Session{conn: conn, graphics: &graphicsState{channel: 1004}}
+		s := &Session{conn: conn, graphics: &graphicsState{}, dynamic: graphicsDynamicFixture(0)}
 		if err := s.writeGraphics(data); err != nil {
 			t.Fatal(err)
 		}
@@ -398,7 +399,9 @@ func FuzzGraphicsChannel(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		conn := &graphicsTestConn{}
 		for phase := byte(1); phase <= 3; phase++ {
-			s := &Session{Width: 1024, Height: 768, conn: conn, graphics: &graphicsState{channel: 1004, phase: phase}}
+			s := &Session{
+				Width: 1024, Height: 768, conn: conn, graphics: &graphicsState{}, dynamic: graphicsDynamicFixture(phase),
+			}
 			_ = s.readDynamic(data)
 			_ = s.readGraphics(data)
 		}
@@ -518,4 +521,13 @@ func decodeZGFXFixture(t *testing.T, data []byte) []byte {
 	}
 
 	return result
+}
+
+func graphicsDynamicFixture(phase byte) *dynamicState {
+	managerPhase := byte(2)
+	if phase == 1 {
+		managerPhase = 1
+	}
+
+	return &dynamicState{channel: 1004, phase: managerPhase, graphics: dynamicEndpoint{phase: phase}}
 }

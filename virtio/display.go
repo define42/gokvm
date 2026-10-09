@@ -78,6 +78,15 @@ func (d *MultiDisplay) Flush(width, height int, img *image.RGBA) error {
 	return nil
 }
 
+// SetResizeHandler connects remote display requests to the shared guest GPU.
+func (d *MultiDisplay) SetResizeHandler(resize func(width, height int) error) {
+	for _, display := range d.displays {
+		if resizable, ok := display.(interface{ SetResizeHandler(func(int, int) error) }); ok {
+			resizable.SetResizeHandler(resize)
+		}
+	}
+}
+
 func (d *MultiDisplay) Close() error {
 	var firstErr error
 

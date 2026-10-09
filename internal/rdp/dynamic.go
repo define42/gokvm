@@ -4,7 +4,192 @@ package rdp
 import (
 	"encoding/binary"
 	"errors"
+	"sync"
 )
+
+type dynamicEndpoint struct {
+	phase byte // 0 disabled, 1 requested, 2 opening, 3 open, 4 closed
+	data  fragmentBuffer
+}
+
+// dynamicState owns the single drdynvc transport and its two independent
+// logical channels. The write lock prevents fragmented messages interleaving.
+type dynamicState struct {
+	mu       sync.Mutex
+	writeMu  sync.Mutex
+	channel  uint16
+	phase    byte // 0 idle, 1 capability exchange, 2 ready
+	static   fragmentBuffer
+	graphics dynamicEndpoint
+	display  dynamicEndpoint
+}
+
+func (d *dynamicState) endpoint(id uint32) *dynamicEndpoint {
+	switch id {
+	case graphicsChannelID:
+		return &d.graphics
+	case displayChannelID:
+		return &d.display
+	default:
+		return nil
+	}
+}
+
+func (s *Session) beginDynamic(id uint32) (bool, error) {
+	d := s.dynamic
+	if d == nil || d.channel == 0 || !s.joined[d.channel] {
+		return false, nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	endpoint := d.endpoint(id)
+	if endpoint.phase != 0 {
+		return endpoint.phase != 4, nil
+	}
+	endpoint.phase = 1
+	if d.phase == 0 {
+		d.phase = 1
+
+		return true, s.writeStatic(d.channel, []byte{0x50, 0, 1, 0})
+	}
+	if d.phase == 2 {
+		return true, s.openDynamic(id)
+	}
+
+	return true, nil
+}
+
+func (s *Session) openDynamic(id uint32) error {
+	d := s.dynamic
+	name := graphicsChannelName
+	if id == displayChannelID {
+		name = displayChannelName
+	}
+	d.endpoint(id).phase = 2
+
+	return s.writeStatic(d.channel, append([]byte{0x10, byte(id)}, name...))
+}
+
+func (s *Session) readDynamicChannel(channel uint16, data []byte) error {
+	d := s.dynamic
+	if d == nil || channel != d.channel {
+		return nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.phase == 0 {
+		return nil
+	}
+	message, err := d.static.static(data)
+	if err != nil || message == nil {
+		return err
+	}
+
+	return s.readDynamic(message)
+}
+
+// readDynamic is called by the sole network reader with dynamic.mu held.
+func (s *Session) readDynamic(data []byte) error {
+	if len(data) == 0 {
+		return errors.New("rdp: empty dynamic channel PDU")
+	}
+	d := s.dynamic
+	header := data[0]
+	command := header >> 4
+	if command == 5 {
+		if d.phase != 1 || len(data) != 4 || header != 0x50 || binary.LittleEndian.Uint16(data[2:]) != 1 {
+			return errors.New("rdp: invalid dynamic channel capability response")
+		}
+		d.phase = 2
+		for _, id := range []uint32{graphicsChannelID, displayChannelID} {
+			if d.endpoint(id).phase == 1 {
+				if err := s.openDynamic(id); err != nil {
+					return err
+				}
+			}
+		}
+
+		return nil
+	}
+	id, payload, err := readDynamicInteger(data[1:], header&3)
+	if err != nil {
+		return err
+	}
+	endpoint := d.endpoint(id)
+	if endpoint == nil || endpoint.phase == 0 {
+		return errors.New("rdp: unknown dynamic channel")
+	}
+	if endpoint.phase == 4 {
+		return nil
+	}
+	switch command {
+	case 1: // DYNVC_CREATE_RSP
+		if endpoint.phase != 2 || len(payload) != 4 {
+			return errors.New("rdp: invalid dynamic channel create response")
+		}
+		if binary.LittleEndian.Uint32(payload) != 0 {
+			endpoint.phase = 4
+
+			return nil
+		}
+		endpoint.phase = 3
+		if id == displayChannelID {
+			return s.writeDynamic(id, displayCapabilities())
+		}
+	case 2, 3: // DYNVC_DATA_FIRST / DYNVC_DATA
+		if endpoint.phase != 3 {
+			return errors.New("rdp: data before dynamic channel creation")
+		}
+		message, err := readDynamicFragment(endpoint, header, payload)
+		if err != nil || message == nil {
+			return err
+		}
+		if id == displayChannelID {
+			s.readDisplayControl(message)
+
+			return nil
+		}
+		g := s.graphics
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		if !g.closed {
+			return s.readGraphics(message)
+		}
+	case 4: // DYNVC_CLOSE
+		if len(payload) != 0 {
+			return errors.New("rdp: invalid dynamic channel close")
+		}
+		endpoint.phase = 4
+		endpoint.data = fragmentBuffer{}
+		if id == graphicsChannelID {
+			g := s.graphics
+			g.mu.Lock()
+			g.ready, g.closed = false, true
+			g.inFlight = nil
+			g.notifyChanged()
+			g.mu.Unlock()
+		}
+
+		return s.writeStatic(d.channel, []byte{0x40, byte(id)})
+	default:
+		return errors.New("rdp: unsupported dynamic channel command")
+	}
+
+	return nil
+}
+
+func readDynamicFragment(endpoint *dynamicEndpoint, header byte, payload []byte) ([]byte, error) {
+	if header>>4 == 2 {
+		total, fragment, err := readDynamicInteger(payload, (header>>2)&3)
+		if err != nil {
+			return nil, err
+		}
+
+		return endpoint.data.first(total, fragment)
+	}
+
+	return endpoint.data.next(payload)
+}
 
 // fragmentBuffer bounds both static-channel and dynamic-channel reassembly.
 // The buffer is only allocated after its declared length has been validated.
@@ -105,17 +290,23 @@ func (s *Session) writeStatic(channel uint16, data []byte) error {
 }
 
 func (s *Session) writeGraphics(data []byte) error {
-	data = segmentGraphics(data)
+	return s.writeDynamic(graphicsChannelID, segmentGraphics(data))
+}
+
+func (s *Session) writeDynamic(id uint32, data []byte) error {
+	d := s.dynamic
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
 	total := len(data)
 	first := true
 	for len(data) > 0 {
-		header := []byte{0x30, graphicsChannelID}
+		header := []byte{0x30, byte(id)}
 		if first && len(data) > 1598 {
-			header = []byte{0x28, graphicsChannelID, 0, 0, 0, 0}
+			header = []byte{0x28, byte(id), 0, 0, 0, 0}
 			binary.LittleEndian.PutUint32(header[2:], uint32(total))
 		}
 		size := min(1600-len(header), len(data))
-		if err := s.writeStatic(s.graphics.channel, append(header, data[:size]...)); err != nil {
+		if err := s.writeStatic(d.channel, append(header, data[:size]...)); err != nil {
 			return err
 		}
 		data = data[size:]

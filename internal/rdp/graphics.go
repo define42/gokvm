@@ -21,38 +21,25 @@ const (
 // mu serializes negotiation, frame acknowledgments, and complete DVC messages.
 // A single reader owns both inbound reassembly buffers.
 type graphicsState struct {
-	mu          sync.Mutex
-	channel     uint16
-	supported   bool
-	phase       byte
-	ready       bool
-	ackOff      bool
-	frameID     uint32
-	inFlight    []uint32
-	changed     chan struct{}
-	staticData  fragmentBuffer
-	dynamicData fragmentBuffer
+	mu        sync.Mutex
+	supported bool
+	ready     bool
+	closed    bool
+	ackOff    bool
+	frameID   uint32
+	inFlight  []uint32
+	changed   chan struct{}
 }
 
 // BeginGraphics starts optional AVC420 negotiation. A false result means the
 // client did not offer the graphics channel; the bitmap path remains available.
 // ReadPacket must continue running to process the client's negotiation replies.
 func (s *Session) BeginGraphics() (bool, error) {
-	g := s.graphics
-	if g == nil {
+	if s.graphics == nil || !s.graphics.supported {
 		return false, nil
 	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if !g.supported || g.channel == 0 || !s.joined[g.channel] {
-		return false, nil
-	}
-	if g.phase != 0 {
-		return g.phase != 4, nil
-	}
-	g.phase = 1
 
-	return true, s.writeStatic(g.channel, []byte{0x50, 0, 1, 0})
+	return s.beginDynamic(graphicsChannelID)
 }
 
 // GraphicsReady reports whether AVC420 capabilities and the output surface
@@ -77,7 +64,7 @@ func (s *Session) GraphicsCanSend() bool {
 	s.graphics.mu.Lock()
 	defer s.graphics.mu.Unlock()
 
-	return s.graphics.canSend()
+	return s.graphics.canSend() && s.DisplayReady()
 }
 
 // GraphicsChanged wakes the single video writer when negotiation or frame
@@ -126,7 +113,8 @@ func (s *Session) WriteAVC420(annexB []byte) (bool, error) {
 		return false, nil
 	}
 	g.frameID++
-	frame := avc420Frame(s.Width, s.Height, g.frameID, graphicsTimestamp(time.Now()), annexB)
+	width, height := s.Size()
+	frame := avc420Frame(width, height, g.frameID, graphicsTimestamp(time.Now()), annexB)
 	if err := s.writeGraphics(frame); err != nil {
 		return false, err
 	}
@@ -143,96 +131,6 @@ func graphicsTimestamp(now time.Time) uint32 {
 
 	return uint32(now.Hour())<<22 | uint32(now.Minute())<<16 | uint32(now.Second())<<10 |
 		uint32(now.Nanosecond()/int(time.Millisecond))
-}
-
-func (s *Session) readGraphicsChannel(channel uint16, data []byte) error {
-	g := s.graphics
-	if g == nil || channel != g.channel {
-		return nil
-	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.phase == 0 || g.phase == 4 {
-		return nil
-	}
-	message, err := g.staticData.static(data)
-	if err != nil || message == nil {
-		return err
-	}
-
-	return s.readDynamic(message)
-}
-
-func (s *Session) readDynamic(data []byte) error {
-	if len(data) == 0 {
-		return errors.New("rdp: empty dynamic channel PDU")
-	}
-	g := s.graphics
-	command := data[0] >> 4
-	if command == 5 {
-		if g.phase != 1 || len(data) != 4 || data[0] != 0x50 || binary.LittleEndian.Uint16(data[2:]) != 1 {
-			return errors.New("rdp: invalid dynamic channel capability response")
-		}
-		g.phase = 2
-
-		return s.writeStatic(g.channel, append([]byte{0x10, graphicsChannelID}, graphicsChannelName...))
-	}
-	header := data[0]
-	channel, payload, err := readDynamicInteger(data[1:], header&3)
-	if err != nil {
-		return err
-	}
-	if channel != graphicsChannelID {
-		return errors.New("rdp: unknown dynamic channel")
-	}
-	switch command {
-	case 1: // DYNVC_CREATE_RSP
-		if g.phase != 2 || len(payload) != 4 {
-			return errors.New("rdp: invalid dynamic channel create response")
-		}
-		if binary.LittleEndian.Uint32(payload) != 0 {
-			g.phase = 4
-		} else {
-			g.phase = 3
-		}
-	case 2, 3: // DYNVC_DATA_FIRST / DYNVC_DATA
-		if g.phase != 3 {
-			return errors.New("rdp: graphics data before channel creation")
-		}
-		var message []byte
-		if command == 2 {
-			total, fragment, err := readDynamicInteger(payload, (header>>2)&3)
-			if err != nil {
-				return err
-			}
-			message, err = g.dynamicData.first(total, fragment)
-			if err != nil {
-				return err
-			}
-		} else {
-			message, err = g.dynamicData.next(payload)
-			if err != nil {
-				return err
-			}
-		}
-		if message != nil {
-			return s.readGraphics(message)
-		}
-	case 4: // DYNVC_CLOSE
-		if len(payload) != 0 {
-			return errors.New("rdp: invalid dynamic channel close")
-		}
-		g.ready = false
-		g.phase = 4
-		g.inFlight = nil
-		g.notifyChanged()
-
-		return s.writeStatic(g.channel, []byte{0x40, graphicsChannelID})
-	default:
-		return errors.New("rdp: unsupported dynamic channel command")
-	}
-
-	return nil
 }
 
 func (s *Session) readGraphics(data []byte) error {
@@ -265,11 +163,12 @@ func (s *Session) readGraphicsPDU(command uint16, data []byte) error {
 			return err
 		}
 		if version == 0 {
-			g.phase = 4
+			g.closed = true
 
-			return s.writeStatic(g.channel, []byte{0x40, graphicsChannelID})
+			return s.writeStatic(s.dynamic.channel, []byte{0x40, graphicsChannelID})
 		}
-		if err := s.writeGraphics(graphicsInitialization(s.Width, s.Height, version, flags)); err != nil {
+		width, height := s.Size()
+		if err := s.writeGraphics(graphicsInitialization(width, height, version, flags)); err != nil {
 			return err
 		}
 		g.ready = true
@@ -371,6 +270,12 @@ func graphicsInitialization(width, height int, version, flags uint32) []byte {
 	binary.LittleEndian.PutUint32(caps[4:], 4)
 	binary.LittleEndian.PutUint32(caps[8:], flags)
 	data := graphicsPDU(0x13, caps)
+
+	return append(data, graphicsSurface(width, height)...)
+}
+
+func graphicsSurface(width, height int) []byte {
+	var data []byte
 	reset := make([]byte, 332)
 	binary.LittleEndian.PutUint32(reset, uint32(width))
 	binary.LittleEndian.PutUint32(reset[4:], uint32(height))

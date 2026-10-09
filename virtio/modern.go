@@ -141,7 +141,7 @@ type ModernTransport struct {
 	driverFeatureSel uint32
 	driverFeature    [2]uint32
 	deviceStatus     uint8
-	configGen        uint8
+	configGen        uint32 // Atomic; device configuration can change outside the vCPU thread.
 	msixConfig       uint16
 	queueSel         uint16
 	queues           []queueState
@@ -179,7 +179,16 @@ func (t *ModernTransport) MMIOSize() uint64 { return modernBARSize }
 // Interrupt raises the device's interrupt: it sets the queue-interrupt bit in
 // ISR and asserts the (level) INTx line.
 func (t *ModernTransport) Interrupt() error {
-	atomic.StoreUint32(&t.isr, 0x1)
+	atomic.OrUint32(&t.isr, 0x1)
+
+	return t.inject()
+}
+
+// ConfigChanged publishes a device configuration update and raises its INTx
+// configuration interrupt without discarding an outstanding queue interrupt.
+func (t *ModernTransport) ConfigChanged() error {
+	atomic.AddUint32(&t.configGen, 1)
+	atomic.OrUint32(&t.isr, 0x2)
 
 	return t.inject()
 }
@@ -284,7 +293,7 @@ func (t *ModernTransport) commonImage() [commonCfgLen]byte {
 	le.PutUint16(b[16:], t.msixConfig)
 	le.PutUint16(b[18:], uint16(t.dev.NumQueues()))
 	b[20] = t.deviceStatus
-	b[21] = t.configGen
+	b[21] = byte(atomic.LoadUint32(&t.configGen))
 	le.PutUint16(b[22:], t.queueSel)
 
 	if q := t.curQueue(); q != nil {

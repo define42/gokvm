@@ -1,0 +1,74 @@
+#!/bin/sh
+# Run inside the guest's X11 session when its desktop does not automatically
+# select new preferred modes after a virtio-gpu display hotplug event.
+set -eu
+
+once=0
+case "${1:-}" in
+    '') ;;
+    --once) once=1 ;;
+    -h|--help)
+        printf '%s\n' 'Usage: gokvm-resize [--once]' \
+            'Apply the preferred mode of a single connected Virtual-* X11 output.' \
+            'Without --once, check for changes once per second.'
+        exit 0
+        ;;
+    *) printf '%s\n' 'Usage: gokvm-resize [--once]' >&2; exit 2 ;;
+esac
+if [ "$#" -gt 1 ]; then
+    printf '%s\n' 'Usage: gokvm-resize [--once]' >&2
+    exit 2
+fi
+if [ -z "${DISPLAY:-}" ]; then
+    printf '%s\n' 'gokvm-resize: run this inside the guest X11 session (DISPLAY is unset).' >&2
+    exit 1
+fi
+if ! command -v xrandr >/dev/null 2>&1; then
+    printf '%s\n' 'gokvm-resize: xrandr is required.' >&2
+    exit 1
+fi
+
+while :; do
+    # --query refreshes the connector's modes after a hotplug notification.
+    # --current can keep returning the old cached preferred mode.
+    state=$(LC_ALL=C xrandr --query) || exit 1
+    selection=$(printf '%s\n' "$state" | awk '
+        /^[^[:space:]]/ {
+            active = 0
+            if ($2 == "connected") {
+                connected++
+                if ($1 ~ /^Virtual-[[:alnum:]_.-]+$/) {
+                    virtual++
+                    output = $1
+                    active = 1
+                }
+            }
+            next
+        }
+        active && /^[[:space:]]/ {
+            if (index($0, "*")) current = $1
+            if (!preferred && index($0, "+")) preferred = $1
+        }
+        END {
+            if (connected == 1 && virtual == 1 && preferred != "" &&
+                preferred != current && preferred ~ /^[[:alnum:]][[:alnum:]_.-]*$/)
+                print output, preferred
+        }
+    ')
+    if [ -n "$selection" ]; then
+        IFS=' ' read -r output mode <<EOF_SELECTION
+$selection
+EOF_SELECTION
+        if ! xrandr --output "$output" --mode "$mode"; then
+            # A newer hotplug can replace a mode between query and apply.
+            # A watcher retries from a fresh query on the next iteration.
+            if [ "$once" -eq 1 ]; then
+                exit 1
+            fi
+        fi
+    fi
+    if [ "$once" -eq 1 ]; then
+        exit 0
+    fi
+    sleep 1
+done

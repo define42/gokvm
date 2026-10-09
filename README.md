@@ -19,6 +19,7 @@ The latest version supports the following features:
 - [x] VNC server for virtio-gpu with keyboard and mouse input (`-vnc`)
 - [x] Built-in TLS RDP console with keyboard and mouse input (`-rdp`)
 - [x] Optional OpenH264 AVC420 compression for RDP (`-rdp-h264`)
+- [x] RDP initial resolution and live single-monitor resizing with virtio-gpu hotplug
 - [x] Virtio-snd playback through the built-in RDP server (`-audio rdp`)
 - [x] Built-in user-mode networking with DHCP, DNS, and outbound TCP/UDP (`-net user`)
 - [x] PVH Boot Protocol
@@ -135,19 +136,59 @@ values and are not checked. TLS encrypts the connection; it does not restrict wh
 can control the VM. Keep the listener on loopback and use an authenticated SSH
 tunnel for access from another machine.
 
-The RDP session uses a fixed 1024×768 desktop, scaling other guest framebuffer
-sizes to fit. By default it sends uncompressed bitmap updates with 16-, 24-, or
-32-bit color. The optional OpenH264 build adds compressed AVC420 graphics.
+The RDP session uses the client's requested desktop size and supports live
+single-monitor resizing. By default it sends uncompressed bitmap updates with
+16-, 24-, or 32-bit color. The optional OpenH264 build adds compressed AVC420 graphics.
 It includes the same serial/VGA/VESA fallbacks as VNC. Both `-rdp` and `-vnc` can
 be supplied to view the same guest at once; connected viewers share its keyboard
 and mouse. Optional audio playback uses `-audio rdp`. Clipboard, microphone input,
-drive redirection, dynamic resolution changes, and
-multiple monitors are not implemented. FreeRDP 3.32.1 has been tested with TinyCore
-and Slax desktop rendering, pointer positioning, menu interaction, and application launch;
-Microsoft Remote Desktop has not yet been validated.
+drive redirection, and multiple monitors are not implemented. FreeRDP 3.32.1 has
+been tested with TinyCore and Slax desktop rendering, pointer positioning, menu
+interaction, and application launch; Microsoft Remote Desktop has not yet been validated.
 
 In TinyCore, right-click the desktop to open its menu. The application dock
 appears along the bottom of the screen.
+
+#### Screen resolution
+
+Set an initial size with `/size` and enable window-driven resizing with
+`/dynamic-resolution` in FreeRDP:
+
+```bash
+xfreerdp /v:127.0.0.1:3390 /sec:tls /u:console /p \
+  /cert:ignore /size:1280x720 /dynamic-resolution /gfx:AVC420
+```
+
+Omit `/gfx:AVC420` for bitmap clients. Both paths resize without reconnecting;
+audio and input remain on the same connection. Rapid window changes are combined
+over 150 ms. Each dimension must be 200–4096 pixels, with at most 4096×2160 total
+pixels; odd dimensions round down to even pixels for AVC420. Unsupported layouts
+leave the current size active. Only one monitor is supported.
+
+The first connected RDP viewer controls the shared GPU's preferred mode. Other
+viewers scale that desktop to their own requested sizes. When the controlling
+viewer disconnects, the next connected viewer takes over. Mouse coordinates
+follow the current framebuffer size throughout a mode change.
+
+The guest must use `virtio_gpu` and apply its DRM/RandR hotplug notification to
+change the actual desktop resolution. A desktop that does not apply the mode
+continues rendering at its previous size, scaled into the RDP window. The fixed
+1024×768 VESA fallback used by older guests also scales; it cannot change modes.
+Linux may round a preferred mode's width to an 8-pixel boundary.
+
+For X11 desktops without automatic RandR mode handling, such as Fluxbox, copy
+[`scripts/gokvm-resize`](scripts/gokvm-resize) into the guest and run it from a
+terminal in the graphical session:
+
+```bash
+sh ./gokvm-resize --once  # Apply the current preferred mode once.
+sh ./gokvm-resize &       # Follow future changes (checks once per second).
+```
+
+The helper requires `xrandr` and handles one connected `Virtual-*` output. To
+start it with Slax's desktop, put the script at `~/.local/bin/gokvm-resize` and
+add `sh "$HOME/.local/bin/gokvm-resize" &` before the line that starts Fluxbox in
+`~/.fluxbox/startup`. Desktops that already apply preferred modes need no helper.
 
 #### OpenH264 graphics
 
@@ -237,7 +278,7 @@ Run the protocol, input, framebuffer, and listener tests without booting a VM:
 
 ```bash
 go test ./internal/rdp ./virtio ./flag ./vmm -short
-go test -race ./internal/rdp ./virtio ./vmm -run 'Test(RDP|Framebuffer|SerialMirror)'
+go test -race ./internal/rdp ./virtio ./vmm -run 'Test(RDP|GPU|Modern|Framebuffer|SerialMirror)'
 ```
 
 With the OpenH264 development library installed, also run the native encoder

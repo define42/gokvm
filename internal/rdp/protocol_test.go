@@ -34,7 +34,8 @@ func TestAcceptCompleteSession(t *testing.T) {
 	}
 	accepted := make(chan result, 1)
 	go func() {
-		session, err := Accept(server, serverTLS, 800, 600)
+		// The client requests 800x600 in GCC; the default must not override it.
+		session, err := Accept(server, serverTLS, 1024, 768)
 		if err != nil {
 			_ = server.Close()
 		}

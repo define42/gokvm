@@ -14,6 +14,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -28,6 +29,7 @@ const (
 // Session is an activated RDP display connection. One goroutine may read while
 // other goroutines write. Writes are serialized; reads must have one owner.
 type Session struct {
+	// Width and Height retain the initial negotiated size. Use Size for live geometry.
 	Width, Height int
 	BitsPerPixel  int
 	conn          net.Conn
@@ -35,6 +37,9 @@ type Session struct {
 	writeTimeout  time.Duration
 	pending       []queuedPacket
 	joined        map[uint16]bool
+	geometry      atomic.Uint64
+	display       displayState
+	dynamic       *dynamicState
 	graphics      *graphicsState
 	audio         *audioState
 }
@@ -100,7 +105,12 @@ func Accept(conn net.Conn, config *tls.Config, width, height int) (*Session, err
 	if err := s.writeMCS(connectResponse(requested, client.channels)); err != nil {
 		return nil, err
 	}
-	s.graphics = &graphicsState{channel: client.dynamicChannel, supported: client.graphics}
+	s.dynamic = &dynamicState{channel: client.dynamicChannel}
+	s.graphics = &graphicsState{supported: client.graphics}
+	if size, valid := normalizeDesktopSize(client.width, client.height); valid {
+		s.Width, s.Height = size.Width, size.Height
+	}
+	s.storeSize(s.Width, s.Height)
 	s.audio = &audioState{channel: client.audioChannel}
 	if err := s.activate(client.channels); err != nil {
 		return nil, fmt.Errorf("rdp activation: %w", err)
@@ -118,6 +128,7 @@ type activation struct {
 	session                                        *Session
 	channels                                       int
 	erected, attached, info, confirmed, controlled bool
+	reactivation                                   bool
 }
 
 func (s *Session) activate(channels int) error {
@@ -234,7 +245,7 @@ func (a *activation) globalData(data []byte) (bool, error) {
 		if a.confirmed {
 			return false, errors.New("duplicate Confirm Active")
 		}
-		if err := s.confirmActive(data); err != nil {
+		if err := s.confirmActiveDepth(data, !a.reactivation); err != nil {
 			return false, err
 		}
 		a.confirmed = true
@@ -302,16 +313,26 @@ func (s *Session) queueInput(data []byte, fast bool) error {
 // the original first header byte followed by the event payload (without the
 // transport length bytes). Negotiated graphics and audio traffic is handled internally.
 func (s *Session) ReadPacket() ([]byte, bool, error) {
-	if len(s.pending) > 0 {
-		p := s.pending[0]
-		s.pending = s.pending[1:]
-
-		return p.data, p.fast, nil
-	}
 	for {
+		if len(s.pending) > 0 && s.DisplayReady() {
+			p := s.pending[0]
+			s.pending = s.pending[1:]
+
+			return p.data, p.fast, nil
+		}
 		packet, fast, err := readTransport(s.conn)
-		if err != nil || fast {
+		if err != nil {
 			return packet, fast, err
+		}
+		if fast {
+			if s.DisplayReady() {
+				return packet, true, nil
+			}
+			if err := s.queueInput(packet, true); err != nil {
+				return nil, false, err
+			}
+
+			continue
 		}
 		mcs, err := unwrapX224(packet)
 		if err != nil {
@@ -332,7 +353,14 @@ func (s *Session) ReadPacket() ([]byte, bool, error) {
 			if err := s.readAudioChannel(channel, data); err != nil {
 				return nil, false, err
 			}
-			if err := s.readGraphicsChannel(channel, data); err != nil {
+			if err := s.readDynamicChannel(channel, data); err != nil {
+				return nil, false, err
+			}
+
+			continue
+		}
+		if handled, err := s.readReactivation(data); handled || err != nil {
+			if err != nil {
 				return nil, false, err
 			}
 
@@ -551,6 +579,7 @@ func takeBER(p []byte, tag byte) (value, rest []byte, err error) {
 }
 
 type clientSettings struct {
+	width, height  int
 	channels       int
 	dynamicChannel uint16
 	audioChannel   uint16
@@ -632,6 +661,8 @@ func parseConnectInitialDetails(p []byte) (clientSettings, error) {
 			if len(payload) >= 142 {
 				settings.graphics = binary.LittleEndian.Uint16(payload[140:142])&0x100 != 0
 			}
+			settings.width = int(binary.LittleEndian.Uint16(payload[4:6]))
+			settings.height = int(binary.LittleEndian.Uint16(payload[6:8]))
 			core = true
 		case 0xc003:
 			if network || len(payload) < 4 {
@@ -752,8 +783,9 @@ func (s *Session) demandActive() []byte {
 	put16(bitmap, 2, 1)
 	put16(bitmap, 4, 1)
 	put16(bitmap, 6, 1)
-	put16(bitmap, 8, s.Width)
-	put16(bitmap, 10, s.Height)
+	width, height := s.Size()
+	put16(bitmap, 8, width)
+	put16(bitmap, 10, height)
 	put16(bitmap, 14, 1)
 	put16(bitmap, 16, 1)
 	input := make([]byte, 84)
@@ -794,6 +826,10 @@ func (s *Session) demandActive() []byte {
 }
 
 func (s *Session) confirmActive(p []byte) error {
+	return s.confirmActiveDepth(p, true)
+}
+
+func (s *Session) confirmActiveDepth(p []byte, update bool) error {
 	if len(p) < 20 || binary.LittleEndian.Uint32(p[6:10]) != shareID {
 		return errors.New("rdp: invalid Confirm Active")
 	}
@@ -822,7 +858,11 @@ func (s *Session) confirmActive(p []byte) error {
 			if bpp != 16 && bpp != 24 && bpp != 32 {
 				return fmt.Errorf("rdp: unsupported client color depth %d", bpp)
 			}
-			s.BitsPerPixel = bpp
+			if update {
+				s.BitsPerPixel = bpp
+			} else if s.BitsPerPixel != bpp {
+				return errors.New("rdp: color depth changed during reactivation")
+			}
 		}
 		off += n
 	}
