@@ -27,6 +27,8 @@ var errDownloadISO = errors.New("download ISO failed")
 
 var errNetworkConfig = errors.New("network must be 'user' or 'none' and cannot be combined with a TAP interface")
 
+var errAudioConfig = errors.New("audio must be 'none' or 'rdp'; 'rdp' requires an RDP listener")
+
 // These parameters describe gaps in gokvm's direct Linux boot environment, not
 // ISO-specific policy. The ISO's own boot config still supplies the distro
 // command line; this list only adds the host/VMM plumbing that a real firmware
@@ -54,6 +56,7 @@ type Config struct {
 	RDPCert    string
 	RDPKey     string
 	RDPH264    bool
+	Audio      string
 	NCPUs      int
 	MemSize    int
 	TraceCount int
@@ -80,6 +83,9 @@ func New(c Config) *VMM {
 
 // Init instantiates a machine.
 func (v *VMM) Init() (initErr error) {
+	if (v.Audio != "" && v.Audio != "none" && v.Audio != "rdp") || (v.Audio == "rdp" && v.RDP == "") {
+		return errAudioConfig
+	}
 	if (v.Network != "" && v.Network != "none" && v.Network != "user") ||
 		(v.Network != "" && v.TapIfName != "") {
 		return errNetworkConfig
@@ -138,6 +144,10 @@ func (v *VMM) Init() (initErr error) {
 			}
 		}
 	}
+	if v.Audio == "rdp" {
+		m.AddSound(v.rdpDisplay)
+		log.Print("Audio: virtio-snd playback through RDP (48 kHz, stereo PCM16)")
+	}
 
 	v.Machine = m
 
@@ -184,7 +194,9 @@ func (v *VMM) display(input virtio.VNCInput) (result virtio.Display, displayErr 
 			}
 			config = &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12}
 		}
-		display, err := virtio.NewRDPDisplayWithConfig(v.RDP, virtio.RDPConfig{TLS: config, H264: v.RDPH264})
+		display, err := virtio.NewRDPDisplayWithConfig(v.RDP, virtio.RDPConfig{
+			TLS: config, H264: v.RDPH264, Audio: v.Audio == "rdp",
+		})
 		if err != nil {
 			return nil, err
 		}

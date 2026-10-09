@@ -32,9 +32,11 @@ type Session struct {
 	BitsPerPixel  int
 	conn          net.Conn
 	writeMu       sync.Mutex
+	writeTimeout  time.Duration
 	pending       []queuedPacket
 	joined        map[uint16]bool
 	graphics      *graphicsState
+	audio         *audioState
 }
 
 type queuedPacket struct {
@@ -99,12 +101,15 @@ func Accept(conn net.Conn, config *tls.Config, width, height int) (*Session, err
 		return nil, err
 	}
 	s.graphics = &graphicsState{channel: client.dynamicChannel, supported: client.graphics}
+	s.audio = &audioState{channel: client.audioChannel}
 	if err := s.activate(client.channels); err != nil {
 		return nil, fmt.Errorf("rdp activation: %w", err)
 	}
 	if err := conn.SetDeadline(time.Time{}); err != nil {
 		return nil, err
 	}
+
+	s.writeTimeout = 10 * time.Second
 
 	return s, nil
 }
@@ -208,6 +213,11 @@ func (a *activation) globalData(data []byte) (bool, error) {
 		if err := validateClientInfo(data); err != nil {
 			return false, err
 		}
+		if s.audio != nil {
+			// Remote-console audio requests playback on the host, which this
+			// redirected playback device intentionally does not provide.
+			s.audio.disabled = binary.LittleEndian.Uint32(data[8:12])&(0x80000|0x2000) != 0
+		}
 		a.info = true
 		license := []byte{0x80, 0, 0, 0, 0xff, 3, 16, 0, 7, 0, 0, 0, 2, 0, 0, 0, 4, 0, 0, 0}
 		if err := s.writeGlobal(license); err != nil {
@@ -290,7 +300,7 @@ func (s *Session) queueInput(data []byte, fast bool) error {
 
 // ReadPacket returns global-channel Share Control data, or fast-path input as
 // the original first header byte followed by the event payload (without the
-// transport length bytes). Negotiated graphics-channel traffic is handled internally.
+// transport length bytes). Negotiated graphics and audio traffic is handled internally.
 func (s *Session) ReadPacket() ([]byte, bool, error) {
 	if len(s.pending) > 0 {
 		p := s.pending[0]
@@ -319,6 +329,9 @@ func (s *Session) ReadPacket() ([]byte, bool, error) {
 				return nil, false, errors.New("rdp: data on unknown static channel")
 			}
 
+			if err := s.readAudioChannel(channel, data); err != nil {
+				return nil, false, err
+			}
 			if err := s.readGraphicsChannel(channel, data); err != nil {
 				return nil, false, err
 			}
@@ -376,7 +389,19 @@ func (s *Session) writeMCS(data []byte) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	return writeTPKT(s.conn, append([]byte{2, 0xf0, 0x80}, data...))
+	if s.writeTimeout != 0 {
+		if err := s.conn.SetWriteDeadline(time.Now().Add(s.writeTimeout)); err != nil {
+			return err
+		}
+	}
+	err := writeTPKT(s.conn, append([]byte{2, 0xf0, 0x80}, data...))
+	if s.writeTimeout != 0 {
+		if clearErr := s.conn.SetWriteDeadline(time.Time{}); err == nil {
+			err = clearErr
+		}
+	}
+
+	return err
 }
 
 func readTransport(r io.Reader) ([]byte, bool, error) {
@@ -528,7 +553,26 @@ func takeBER(p []byte, tag byte) (value, rest []byte, err error) {
 type clientSettings struct {
 	channels       int
 	dynamicChannel uint16
+	audioChannel   uint16
 	graphics       bool
+}
+
+func (c *clientSettings) staticChannel(name string, channel uint16) error {
+	var dest *uint16
+	switch name {
+	case "rdpsnd":
+		dest = &c.audioChannel
+	case "drdynvc":
+		dest = &c.dynamicChannel
+	default:
+		return nil
+	}
+	if *dest != 0 {
+		return fmt.Errorf("rdp: duplicate %s channel", name)
+	}
+	*dest = channel
+
+	return nil
 }
 
 func parseConnectInitial(p []byte) (int, error) {
@@ -601,11 +645,8 @@ func parseConnectInitialDetails(p []byte) (clientSettings, error) {
 			channels = int(count)
 			for index := 0; index < channels; index++ {
 				name := bytes.TrimRight(payload[4+12*index:12+12*index], "\x00")
-				if string(name) == "drdynvc" {
-					if settings.dynamicChannel != 0 {
-						return settings, errors.New("rdp: duplicate drdynvc channel")
-					}
-					settings.dynamicChannel = uint16(1004 + index)
+				if err := settings.staticChannel(string(name), uint16(1004+index)); err != nil {
+					return settings, err
 				}
 			}
 		}

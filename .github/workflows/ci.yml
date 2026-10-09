@@ -111,8 +111,9 @@ jobs:
       run: go test -tags openh264 -short ./internal/rdp/... ./virtio ./vmm ./flag
     - name: Check codec and RDP concurrency
       run: |
+        go test -race ./internal/audio
         go test -tags openh264 -race ./internal/rdp/...
-        go test -tags openh264 -race ./virtio ./vmm -run 'Test(RDP|Framebuffer|SerialMirror)'
+        go test -tags openh264 -race ./virtio ./vmm -run 'Test(RDP|Audio|Sound|Modern|Framebuffer|SerialMirror)'
     - name: Check build without cgo
       env:
         CGO_ENABLED: '0'

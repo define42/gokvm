@@ -91,6 +91,9 @@ type SplitQueue struct {
 	Desc  *[QueueSize]SplitDesc
 	Avail *SplitAvail
 	Used  *SplitUsed
+	// Size is the negotiated ring size. Zero preserves the maximum-size
+	// convention used by devices and tests predating this field.
+	Size uint16
 }
 
 // ModernDevice is the device-specific behaviour the modern transport drives.
@@ -329,6 +332,22 @@ func (t *ModernTransport) mmioCommonCfg(off uint64, data []byte, isWrite bool) {
 	case 16:
 		t.msixConfig = le.Uint16(data)
 	case 20:
+		if data[0] == 0 {
+			// Stop device workers before forgetting their guest-memory mappings.
+			if dev, ok := t.dev.(interface{ Reset() }); ok {
+				dev.Reset()
+			}
+
+			t.deviceFeatureSel = 0
+			t.driverFeatureSel = 0
+			t.driverFeature = [2]uint32{}
+			t.queueSel = 0
+			t.msixConfig = 0
+			atomic.StoreUint32(&t.isr, 0)
+			for i := range t.queues {
+				t.queues[i] = queueState{size: QueueSize}
+			}
+		}
 		t.deviceStatus = data[0]
 	case 22:
 		t.queueSel = le.Uint16(data)
@@ -385,10 +404,25 @@ func writeQueueAddr(q *queueState, which, half int, v uint32) {
 // the device.
 func (t *ModernTransport) activateQueue(idx int) {
 	q := &t.queues[idx]
+	// SplitQueue uses fixed-size views. Validate each entire view before
+	// taking an unsafe pointer, even when the driver selects a smaller ring.
+	valid := func(addr, size, align uint64) bool {
+		return addr%align == 0 && addr <= uint64(len(t.Mem)) && size <= uint64(len(t.Mem))-addr
+	}
+	if q.size == 0 || q.size > QueueSize || q.size&(q.size-1) != 0 ||
+		!valid(q.desc, uint64(unsafe.Sizeof([QueueSize]SplitDesc{})), 16) ||
+		!valid(q.driver, uint64(unsafe.Sizeof(SplitAvail{})), 2) ||
+		!valid(q.device, uint64(unsafe.Sizeof(SplitUsed{})), 4) {
+		q.enable = 0
+
+		return
+	}
+
 	sq := &SplitQueue{
 		Desc:  (*[QueueSize]SplitDesc)(unsafe.Pointer(&t.Mem[q.desc])),
 		Avail: (*SplitAvail)(unsafe.Pointer(&t.Mem[q.driver])),
 		Used:  (*SplitUsed)(unsafe.Pointer(&t.Mem[q.device])),
+		Size:  q.size,
 	}
 
 	t.dev.QueueReady(idx, sq)

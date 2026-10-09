@@ -17,16 +17,18 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/bobuhiro11/gokvm/internal/audio"
 	"github.com/bobuhiro11/gokvm/internal/rdp"
 	"github.com/bobuhiro11/gokvm/internal/rdp/avc"
 )
 
 const rdpMaxClients = 8
 
-// RDPConfig selects the server certificate and optional OpenH264 graphics.
+// RDPConfig selects the server certificate, OpenH264 graphics, and audio playback.
 type RDPConfig struct {
-	TLS  *tls.Config
-	H264 bool
+	TLS   *tls.Config
+	H264  bool
+	Audio bool
 }
 
 // RDPDisplay exports the guest console using TLS-secured RDP bitmap updates.
@@ -37,6 +39,7 @@ type RDPDisplay struct {
 	listener net.Listener
 	tls      *tls.Config
 	h264     bool
+	audio    *audio.Hub
 	connMu   sync.Mutex
 	conns    map[net.Conn]struct{}
 	wg       sync.WaitGroup
@@ -87,6 +90,9 @@ func NewRDPDisplayWithConfig(addr string, options RDPConfig) (*RDPDisplay, error
 		framebuffer: newFramebuffer(), listener: listener, tls: config,
 		conns: make(map[net.Conn]struct{}), h264: options.H264,
 	}
+	if options.Audio {
+		display.audio = audio.NewHub()
+	}
 	if options.H264 {
 		display.linearInterval = time.Second / avc.FrameRate
 	}
@@ -98,10 +104,20 @@ func NewRDPDisplayWithConfig(addr string, options RDPConfig) (*RDPDisplay, error
 
 func (d *RDPDisplay) Addr() string { return d.listener.Addr().String() }
 
+// WritePCM receives borrowed, clocked PCM from the virtual sound card.
+func (d *RDPDisplay) WritePCM(pcm []byte) {
+	if d.audio != nil {
+		d.audio.WritePCM(pcm)
+	}
+}
+
 func (d *RDPDisplay) Close() error {
 	var err error
 	d.once.Do(func() {
 		d.shutdown()
+		if d.audio != nil {
+			d.audio.Close()
+		}
 		err = d.listener.Close()
 		d.connMu.Lock()
 		for conn := range d.conns {
@@ -164,6 +180,13 @@ func (d *RDPDisplay) serveConn(conn net.Conn) (serveErr error) {
 		return err
 	}
 	defer session.Close()
+	withAudio := false
+	if d.audio != nil {
+		withAudio, err = session.EnableAudio()
+		if err != nil {
+			return err
+		}
+	}
 
 	if d.h264 {
 		if _, err := session.BeginGraphics(); err != nil {
@@ -180,18 +203,28 @@ func (d *RDPDisplay) serveConn(conn net.Conn) (serveErr error) {
 	defer func() { d.dispatchInput(session, decoder.ReleaseAll()) }()
 	refresh := make(chan struct{}, 1)
 	stop := make(chan struct{})
-	writerDone := make(chan error, 1)
+	writerDone := make(chan error, 2)
+	writers := 1
 	var suppressed atomic.Bool
 	go func() {
 		writerDone <- d.writeFrames(conn, session, stop, refresh, &suppressed)
 		_ = session.Close()
 	}()
+	if withAudio {
+		writers++
+		go func() {
+			writerDone <- d.writeAudio(session, stop)
+			_ = session.Close()
+		}()
+	}
 	defer func() {
 		close(stop)
 		_ = session.Close()
-		writerErr := <-writerDone
-		if writerErr != nil && (serveErr == nil || errors.Is(serveErr, io.EOF) || errors.Is(serveErr, net.ErrClosed)) {
-			serveErr = writerErr
+		for range writers {
+			writerErr := <-writerDone
+			if writerErr != nil && (serveErr == nil || errors.Is(serveErr, io.EOF) || errors.Is(serveErr, net.ErrClosed)) {
+				serveErr = writerErr
+			}
 		}
 	}()
 
@@ -222,6 +255,42 @@ func (d *RDPDisplay) serveConn(conn net.Conn) (serveErr error) {
 			return err
 		}
 		d.dispatchInput(session, events)
+	}
+}
+
+func (d *RDPDisplay) writeAudio(session *rdp.Session, stop <-chan struct{}) error {
+	sub := d.audio.Subscribe()
+	defer sub.Close()
+	changed := session.AudioChanged()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	announced := false
+	for {
+		if !announced && session.AudioReady() {
+			log.Print("rdp: client using PCM audio (48 kHz, stereo, 16-bit)")
+			announced = true
+		}
+		select {
+		case <-stop:
+			return nil
+		case <-d.done:
+			return nil
+		case <-changed:
+		case <-ticker.C:
+			if err := session.CheckAudioTimeout(); err != nil {
+				return err
+			}
+		case packet, ok := <-sub.Packets:
+			if !ok {
+				return nil
+			}
+			if !session.AudioCanSend() {
+				continue
+			}
+			if _, err := session.WriteAudio(packet.PCM, packet.Timestamp); err != nil {
+				return err
+			}
+		}
 	}
 }
 
@@ -256,7 +325,7 @@ func (d *RDPDisplay) writeFrames(
 		frame, changed, published := d.changedFrame(writer.sequence, writer.force)
 		var paced <-chan time.Time
 		if changed && !suppressed.Load() && (!writer.graphics || session.GraphicsCanSend()) {
-			paced, err = writer.writeWhenReady(conn, frame, timer)
+			paced, err = writer.writeWhenReady(frame, timer)
 			if err != nil {
 				return err
 			}
@@ -287,14 +356,14 @@ type rdpFrameWriter struct {
 	nextFrame time.Time
 }
 
-func (w *rdpFrameWriter) writeWhenReady(conn net.Conn, frame vncFrame, timer *time.Timer) (<-chan time.Time, error) {
+func (w *rdpFrameWriter) writeWhenReady(frame vncFrame, timer *time.Timer) (<-chan time.Time, error) {
 	if delay := time.Until(w.nextFrame); delay > 0 {
 		timer.Reset(delay)
 
 		return timer.C, nil
 	}
 	w.nextFrame = time.Now().Add(w.frameInterval())
-	sent, err := w.write(conn, frame, w.force)
+	sent, err := w.write(frame, w.force)
 	if err != nil {
 		return nil, err
 	}
@@ -333,14 +402,11 @@ func (w *rdpFrameWriter) close() {
 	}
 }
 
-func (w *rdpFrameWriter) write(conn net.Conn, frame vncFrame, force bool) (bool, error) {
+func (w *rdpFrameWriter) write(frame vncFrame, force bool) (bool, error) {
 	img := &image.RGBA{Pix: frame.pix, Stride: frame.width * 4, Rect: image.Rect(0, 0, frame.width, frame.height)}
 	if len(frame.pix) == 0 {
 		img = image.NewRGBA(img.Rect)
 	}
-	_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	defer func() { _ = conn.SetWriteDeadline(time.Time{}) }()
-
 	if !w.graphics {
 		err := w.bitmap.WriteFrame(img, force, func(data []byte) error {
 			return w.session.WriteDataPDU(2, data)

@@ -46,6 +46,7 @@ const (
 	virtioGPUIRQ           = 11
 	virtioInputKeyboardIRQ = 5
 	virtioInputPointerIRQ  = 6
+	virtioSoundIRQ         = 7
 
 	pageTableBase = 0x30_000
 
@@ -310,6 +311,13 @@ func (m *Machine) AddGPUDisplay(display virtio.Display) error {
 	m.pci.Devices = append(m.pci.Devices, v)
 
 	return nil
+}
+
+// AddSound attaches a clocked virtio-snd playback device to the audio sink.
+func (m *Machine) AddSound(sink virtio.SoundSink) {
+	v := virtio.NewSound(virtioSoundIRQ, m.InjectVirtioSoundIRQ, m.mem, sink)
+	m.pci.Devices = append(m.pci.Devices, v)
+	go v.IOThreadEntry()
 }
 
 func (m *Machine) AddPS2Input() virtio.VNCInput {
@@ -1277,6 +1285,15 @@ func (m *Machine) InjectVirtioGPUIRQ() error {
 	}
 
 	return nil
+}
+
+// InjectVirtioSoundIRQ injects a virtio-snd interrupt.
+func (m *Machine) InjectVirtioSoundIRQ() error {
+	if err := kvm.IRQLineStatus(m.vmFd, virtioSoundIRQ, 0); err != nil {
+		return err
+	}
+
+	return kvm.IRQLineStatus(m.vmFd, virtioSoundIRQ, 1)
 }
 
 // InjectVirtioInputKeyboardIRQ injects a virtio-input keyboard interrupt.

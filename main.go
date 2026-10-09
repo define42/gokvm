@@ -32,6 +32,7 @@ func main() {
 			RDPCert:    bootArgs.RDPCert,
 			RDPKey:     bootArgs.RDPKey,
 			RDPH264:    bootArgs.RDPH264,
+			Audio:      bootArgs.Audio,
 			NCPUs:      bootArgs.NCPUs,
 			MemSize:    bootArgs.MemSize,
 			TraceCount: bootArgs.TraceCount,

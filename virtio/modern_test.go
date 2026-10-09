@@ -215,3 +215,70 @@ func TestModernCapabilitiesChain(t *testing.T) {
 		}
 	}
 }
+
+type resettingModernDev struct {
+	mockModernDev
+	resets int
+}
+
+func (d *resettingModernDev) Reset() { d.resets++ }
+
+func TestModernDeviceReset(t *testing.T) {
+	t.Parallel()
+	dev := &resettingModernDev{mockModernDev: mockModernDev{numQ: 2}}
+	injected := 0
+	tr := newTestTransport(dev, make([]byte, 0x10000), &injected)
+	writeCfg(tr, 0, 1, 4)
+	writeCfg(tr, 8, 1, 4)
+	writeCfg(tr, 12, 1, 4)
+	writeCfg(tr, 22, 1, 2)
+	writeCfg(tr, 32, 0x1000, 4)
+	writeCfg(tr, 40, 0x2000, 4)
+	writeCfg(tr, 48, 0x3000, 4)
+	writeCfg(tr, 28, 1, 2)
+	if err := tr.Interrupt(); err != nil {
+		t.Fatal(err)
+	}
+	writeCfg(tr, 20, 0, 1)
+	if dev.resets != 1 || tr.deviceFeatureSel != 0 || tr.driverFeatureSel != 0 ||
+		tr.driverFeature != [2]uint32{} || tr.queueSel != 0 || tr.isr != 0 {
+		t.Fatalf("transport did not reset: %+v", tr)
+	}
+	for _, queue := range tr.queues {
+		if queue != (queueState{size: QueueSize}) {
+			t.Fatalf("reset retained queue mapping: %+v", queue)
+		}
+	}
+}
+
+func TestModernRejectsInvalidQueueMappings(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name                 string
+		desc, driver, device uint64
+		size                 uint16
+	}{
+		{"descriptor_bounds", 0x10000, 0x2000, 0x3000, QueueSize},
+		{"descriptor_tail", 0xfff0, 0x2000, 0x3000, QueueSize},
+		{"available_bounds", 0x1000, ^uint64(1), 0x3000, QueueSize},
+		{"used_bounds", 0x1000, 0x2000, 0xfffc, QueueSize},
+		{"descriptor_alignment", 0x1001, 0x2000, 0x3000, QueueSize},
+		{"available_alignment", 0x1000, 0x2001, 0x3000, QueueSize},
+		{"used_alignment", 0x1000, 0x2000, 0x3001, QueueSize},
+		{"zero_size", 0x1000, 0x2000, 0x3000, 0},
+		{"large_size", 0x1000, 0x2000, 0x3000, QueueSize * 2},
+		{"non_power_of_two", 0x1000, 0x2000, 0x3000, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dev := &mockModernDev{numQ: 1}
+			injected := 0
+			tr := newTestTransport(dev, make([]byte, 0x10000), &injected)
+			tr.queues[0] = queueState{desc: tc.desc, driver: tc.driver, device: tc.device, size: tc.size, enable: 1}
+			tr.activateQueue(0)
+			if len(dev.ready) != 0 || tr.queues[0].enable != 0 {
+				t.Fatal("invalid queue mapping activated")
+			}
+		})
+	}
+}

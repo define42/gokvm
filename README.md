@@ -19,6 +19,7 @@ The latest version supports the following features:
 - [x] VNC server for virtio-gpu with keyboard and mouse input (`-vnc`)
 - [x] Built-in TLS RDP console with keyboard and mouse input (`-rdp`)
 - [x] Optional OpenH264 AVC420 compression for RDP (`-rdp-h264`)
+- [x] Virtio-snd playback through the built-in RDP server (`-audio rdp`)
 - [x] Built-in user-mode networking with DHCP, DNS, and outbound TCP/UDP (`-net user`)
 - [x] PVH Boot Protocol
 - [x] ISO boot via the El Torito boot catalog (no SeaBIOS/UEFI firmware required)
@@ -139,7 +140,8 @@ sizes to fit. By default it sends uncompressed bitmap updates with 16-, 24-, or
 32-bit color. The optional OpenH264 build adds compressed AVC420 graphics.
 It includes the same serial/VGA/VESA fallbacks as VNC. Both `-rdp` and `-vnc` can
 be supplied to view the same guest at once; connected viewers share its keyboard
-and mouse. Clipboard, audio, drive redirection, dynamic resolution changes, and
+and mouse. Optional audio playback uses `-audio rdp`. Clipboard, microphone input,
+drive redirection, dynamic resolution changes, and
 multiple monitors are not implemented. FreeRDP 3.32.1 has been tested with TinyCore
 and Slax desktop rendering, pointer positioning, menu interaction, and application launch;
 Microsoft Remote Desktop has not yet been validated.
@@ -199,6 +201,37 @@ Complex browser pages can therefore be limited by software rendering inside
 the guest even when AVC420 is active. For choppy scrolling, first check the
 server's `using OpenH264 AVC420 graphics` message to confirm the session is
 using the faster graphics path.
+
+#### Audio playback
+
+Add `-audio rdp` to expose a virtio-snd card and play guest audio through the
+connected RDP client. The tested Slax ISO already includes the Linux
+`virtio_snd` driver. Audio itself needs no native library or special build tag
+in gokvm; `-rdp-h264` still requires the OpenH264 build described above.
+
+```bash
+./gokvm boot -iso ./slax.iso -m 2G -net user \
+  -rdp 127.0.0.1:3390 -rdp-h264 -audio rdp
+
+xfreerdp /v:127.0.0.1:3390 /sec:tls /u:console /p \
+  /cert:ignore /gfx:AVC420 /sound:sys:pulse,latency:40
+```
+
+The client must be built with a working audio output backend. Check
+`xfreerdp /buildconfig` for `WITH_PULSE=ON` when using `sys:pulse`, or
+`WITH_ALSA=ON` for `sys:alsa`. A client that logs `Loaded fake backend for rdpsnd`
+cannot produce sound. PulseAudio-compatible PipeWire servers work with the
+Pulse backend. Audio negotiation logs `client using PCM audio` on the server.
+The 40 ms client buffer helps absorb scheduling jitter during playback.
+The tested Pulse backend can briefly rebuffer when playback resumes after a
+long silence.
+
+Playback is stereo, signed 16-bit PCM at 48 kHz; guest ALSA/PulseAudio can convert
+application formats. Use `aplay -l` in the guest to check that the card is present,
+and `aplay -D plughw:0,0 example.wav` to test it directly. Microphone capture is
+not implemented. Audio is off by default, and `-audio rdp` requires `-rdp`.
+Disconnected or slow clients cannot stop the guest audio clock; old queued
+samples are discarded to keep buffering bounded. VNC carries no audio.
 
 Run the protocol, input, framebuffer, and listener tests without booting a VM:
 
