@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"image"
-	"image/draw"
 	"io"
 	"log"
 	"sync"
@@ -128,8 +127,9 @@ type gpuResource struct {
 }
 
 type gpuCursor struct {
-	image *image.RGBA
-	x, y  int
+	image      *image.RGBA
+	x, y       int
+	hotX, hotY int
 }
 
 // GPU is a modern (virtio 1.0) 2D display device.
@@ -146,11 +146,12 @@ type GPU struct {
 	closed        bool
 	closeErr      error
 
-	resources map[uint32]*gpuResource
-	scanout   [gpuNumScanouts]uint32
-	frame     *image.RGBA // Last presented scanout, without the hardware cursor.
-	composite *image.RGBA // Reusable cursor composition, borrowed only during Flush.
-	cursor    gpuCursor
+	resources   map[uint32]*gpuResource
+	scanout     [gpuNumScanouts]uint32
+	scanoutRect image.Rectangle
+	frame       *image.RGBA // Last presented scanout, without the hardware cursor.
+	composite   *image.RGBA // Reusable cursor composition, borrowed only during Flush.
+	cursor      gpuCursor
 
 	VirtQueue    [gpuNumQueues]*SplitQueue
 	LastAvailIdx [gpuNumQueues]uint16
@@ -412,6 +413,7 @@ func (g *GPU) handleCursor(req []byte) bool {
 			// Snapshot the transferred resource: later transfers or unrefs do
 			// not alter the cursor until another UPDATE command arrives.
 			g.cursor.image = resourceImage(res, true)
+			g.cursor.hotX, g.cursor.hotY = int(hotX), int(hotY)
 		}
 	case gpuCmdMoveCursor:
 	default:
@@ -637,6 +639,7 @@ func (g *GPU) cmdResourceUnref(req []byte) []byte {
 		delete(g.resources, id)
 		if g.scanout[0] == id {
 			g.scanout[0] = 0
+			g.scanoutRect = image.Rectangle{}
 			g.frame, g.composite = nil, nil
 		}
 	}
@@ -658,6 +661,7 @@ func (g *GPU) cmdSetScanout(req []byte) []byte {
 	if scanoutID >= gpuNumScanouts {
 		return g.respNoData(gpuRespErrInvalidScanoutID)
 	}
+	var rect image.Rectangle
 	if resourceID != 0 {
 		res := g.resources[resourceID]
 		if res == nil {
@@ -668,9 +672,16 @@ func (g *GPU) cmdSetScanout(req []byte) []byte {
 		if w == 0 || h == 0 || x > res.width || y > res.height || w > res.width-x || h > res.height-y {
 			return g.respNoData(gpuRespErrInvalidParameter)
 		}
+		rect = image.Rect(int(x), int(y), int(x+w), int(y+h))
 	}
 
+	if g.scanout[scanoutID] != resourceID || g.scanoutRect != rect {
+		// A different source cannot inherit unchanged pixels from the previous
+		// scanout. Its first visible flush publishes the entire new viewport.
+		g.frame, g.composite = nil, nil
+	}
 	g.scanout[scanoutID] = resourceID
+	g.scanoutRect = rect
 
 	return g.respNoData(gpuRespOKNoData)
 }
@@ -682,15 +693,21 @@ func (g *GPU) cmdResourceFlush(req []byte) []byte {
 		return g.respNoData(gpuRespErrUnspec)
 	}
 
-	resourceID := binary.LittleEndian.Uint32(req[gpuCtrlHdrLen+gpuRectLen:])
+	le := binary.LittleEndian
+	resourceID := le.Uint32(req[gpuCtrlHdrLen+gpuRectLen:])
 
 	res := g.resources[resourceID]
 	if res == nil {
 		return g.respNoData(gpuRespErrInvalidResourceID)
 	}
+	x, y := le.Uint32(req[gpuCtrlHdrLen:]), le.Uint32(req[gpuCtrlHdrLen+4:])
+	w, h := le.Uint32(req[gpuCtrlHdrLen+8:]), le.Uint32(req[gpuCtrlHdrLen+12:])
+	if x > res.width || y > res.height || w > res.width-x || h > res.height-y {
+		return g.respNoData(gpuRespErrInvalidParameter)
+	}
 
 	if g.scanout[0] == resourceID {
-		g.flush(res)
+		g.flushDamage(res, image.Rect(int(x), int(y), int(x+w), int(y+h)))
 	}
 
 	return g.respNoData(gpuRespOKNoData)
@@ -851,40 +868,65 @@ func (g *GPU) cmdResourceDetachBacking(req []byte) []byte {
 	return g.respNoData(gpuRespOKNoData)
 }
 
-// flush converts a resource's pixels to RGBA and hands them to the display.
+// flush presents all pixels, retaining the same path as a full RESOURCE_FLUSH.
 func (g *GPU) flush(res *gpuResource) {
+	g.flushDamage(res, image.Rect(0, 0, int(res.width), int(res.height)))
+}
+
+// flushDamage updates only flushed pixels in the private, persistent RGBA
+// desktop. Later transfers outside this region must not become visible yet.
+func (g *GPU) flushDamage(res *gpuResource, damage image.Rectangle) {
 	if g.display == nil || res.width == 0 || res.height == 0 {
 		return
 	}
+	source := g.scanoutRect
+	if source.Empty() {
+		source = image.Rect(0, 0, int(res.width), int(res.height))
+	}
+	damage = damage.Intersect(source)
+	if damage.Empty() {
+		return
+	}
+	bounds := image.Rect(0, 0, source.Dx(), source.Dy())
+	if g.frame == nil || g.frame.Bounds() != bounds {
+		g.frame = image.NewRGBA(bounds)
+		damage = source
+	}
+	resourceImageRectInto(res, false, g.frame, damage, source.Min)
+	if _, separate := g.display.(CursorDisplay); separate {
+		var err error
+		if partial, ok := g.display.(DamageDisplay); ok {
+			err = partial.FlushDamage(bounds.Dx(), bounds.Dy(), g.frame, []image.Rectangle{damage.Sub(source.Min)})
+		} else {
+			err = g.display.Flush(bounds.Dx(), bounds.Dy(), g.frame)
+		}
+		if err != nil {
+			log.Printf("virtio-gpu: display flush: %v", err)
+		}
 
-	g.frame = resourceImageInto(res, false, g.frame)
+		return
+	}
 	g.present()
 }
 
-// present uses the last flushed scanout, so cursor movement never publishes
-// unflushed transfers or leaves pixels behind at the cursor's old position.
+// present publishes only cursor state to capable displays. Legacy displays
+// receive the last flushed desktop with the cursor composited on top.
 func (g *GPU) present() {
-	if g.display == nil || g.frame == nil || g.scanout[0] == 0 {
+	if g.display == nil {
 		return
 	}
-
-	img := g.frame
-	if cursor := g.cursor.image; cursor != nil {
-		// The guest supplies the cursor image's top-left CRTC position;
-		// Xorg has already subtracted the hotspot from the pointer position.
-		position := image.Pt(g.cursor.x, g.cursor.y)
-		rect := cursor.Bounds().Add(position)
-		if rect.Overlaps(img.Bounds()) {
-			if g.composite == nil || g.composite.Bounds() != g.frame.Bounds() {
-				g.composite = image.NewRGBA(g.frame.Bounds())
-			}
-			img = g.composite
-			copy(img.Pix, g.frame.Pix)
-			// DRM cursor pixels use premultiplied alpha, matching image.RGBA.
-			draw.Draw(img, rect, cursor, image.Point{}, draw.Over)
+	cursor := DisplayCursor{Image: g.cursor.image, X: g.cursor.x, Y: g.cursor.y, HotX: g.cursor.hotX, HotY: g.cursor.hotY}
+	if separate, ok := g.display.(CursorDisplay); ok {
+		if err := separate.SetCursor(cursor); err != nil {
+			log.Printf("virtio-gpu: cursor update: %v", err)
 		}
-	}
 
+		return
+	}
+	if g.frame == nil || g.scanout[0] == 0 {
+		return
+	}
+	img := compositeCursor(g.frame, &g.composite, cursor)
 	if err := g.display.Flush(img.Bounds().Dx(), img.Bounds().Dy(), img); err != nil {
 		log.Printf("virtio-gpu: display flush: %v", err)
 	}
@@ -894,60 +936,60 @@ func resourceImage(res *gpuResource, cursor bool) *image.RGBA {
 	return resourceImageInto(res, cursor, nil)
 }
 
-// resourceImageInto reuses the GPU's private scanout storage. Display.Flush
-// borrows this storage only until it returns; remote displays publish their
-// own immutable copies. Cursor UPDATE still takes a separate shape snapshot.
+// resourceImageInto reuses private image storage. Display implementations must
+// finish reading this storage before returning. Cursor shapes own a snapshot.
 func resourceImageInto(res *gpuResource, cursor bool, img *image.RGBA) *image.RGBA {
-	rOff, gOff, bOff, aOff, hasAlpha := formatOffsets(res.format)
-	if cursor && !hasAlpha {
-		// Linux creates dumb buffers as XRGB even when they hold an ARGB
-		// cursor. Preserve the unused channel as alpha for cursor images,
-		// matching QEMU's raw cursor-resource copy.
-		aOff = 6 - rOff - gOff - bOff
-		hasAlpha = true
-	}
 	bounds := image.Rect(0, 0, int(res.width), int(res.height))
 	if img == nil || img.Bounds() != bounds {
 		img = image.NewRGBA(bounds)
 	}
-
-	// Linux scanouts normally use BGRX. Converting complete words avoids
-	// four dynamically indexed channel reads and per-channel bounds checks.
-	if rOff == 2 && gOff == 1 && bOff == 0 {
-		alpha := uint32(0)
-		if !hasAlpha {
-			alpha = 0xff000000
-		}
-		pixels := min(len(img.Pix), len(res.data)) &^ 3
-		for i := 0; i < pixels; i += 4 {
-			pixel := binary.LittleEndian.Uint32(res.data[i:])
-			rgba := pixel&0xff00ff00 | (pixel>>16)&0xff | (pixel&0xff)<<16 | alpha
-			binary.LittleEndian.PutUint32(img.Pix[i:], rgba)
-		}
-
-		return img
-	}
-
-	pixels := int(res.width) * int(res.height)
-	for i := 0; i < pixels; i++ {
-		si := i * gpuBytesPerPixel
-		if si+gpuBytesPerPixel > len(res.data) {
-			break
-		}
-
-		di := i * 4
-		img.Pix[di+0] = res.data[si+rOff]
-		img.Pix[di+1] = res.data[si+gOff]
-		img.Pix[di+2] = res.data[si+bOff]
-
-		if hasAlpha {
-			img.Pix[di+3] = res.data[si+aOff]
-		} else {
-			img.Pix[di+3] = 0xff
-		}
-	}
+	resourceImageRectInto(res, cursor, img, bounds, image.Point{})
 
 	return img
+}
+
+// resourceImageRectInto converts a resource rectangle into the destination at
+// rect.Min-origin, respecting both the source stride and scanout viewport.
+func resourceImageRectInto(res *gpuResource, cursor bool, img *image.RGBA, rect image.Rectangle, origin image.Point) {
+	rOff, gOff, bOff, aOff, hasAlpha := formatOffsets(res.format)
+	if cursor && !hasAlpha {
+		// Linux uses dumb XRGB buffers even for ARGB cursor images.
+		aOff = 6 - rOff - gOff - bOff
+		hasAlpha = true
+	}
+	rect = rect.Intersect(image.Rect(0, 0, int(res.width), int(res.height))).Intersect(img.Bounds().Add(origin))
+	for y := rect.Min.Y; y < rect.Max.Y; y++ {
+		si := (y*int(res.width) + rect.Min.X) * gpuBytesPerPixel
+		di := img.PixOffset(rect.Min.X-origin.X, y-origin.Y)
+		pixels := min(rect.Dx()*gpuBytesPerPixel, len(res.data)-si) &^ 3
+		if pixels <= 0 {
+			return
+		}
+		src, dst := res.data[si:si+pixels], img.Pix[di:di+pixels]
+		// Linux scanouts normally use BGRX. Whole-word conversion avoids
+		// four dynamically indexed channel reads for every pixel.
+		if rOff == 2 && gOff == 1 && bOff == 0 {
+			alpha := uint32(0)
+			if !hasAlpha {
+				alpha = 0xff000000
+			}
+			for i := 0; i < pixels; i += 4 {
+				pixel := binary.LittleEndian.Uint32(src[i:])
+				rgba := pixel&0xff00ff00 | (pixel>>16)&0xff | (pixel&0xff)<<16 | alpha
+				binary.LittleEndian.PutUint32(dst[i:], rgba)
+			}
+
+			continue
+		}
+		for i := 0; i < pixels; i += 4 {
+			dst[i], dst[i+1], dst[i+2] = src[i+rOff], src[i+gOff], src[i+bOff]
+			if hasAlpha {
+				dst[i+3] = src[i+aOff]
+			} else {
+				dst[i+3] = 0xff
+			}
+		}
+	}
 }
 
 // formatOffsets returns the byte position of each channel within a 4-byte
@@ -999,6 +1041,7 @@ func (g *GPU) resetLocked() {
 	g.resources = map[uint32]*gpuResource{}
 	g.resourceBytes = 0
 	g.scanout = [gpuNumScanouts]uint32{}
+	g.scanoutRect = image.Rectangle{}
 	g.frame, g.composite = nil, nil
 	g.cursor = gpuCursor{}
 	g.events = 0

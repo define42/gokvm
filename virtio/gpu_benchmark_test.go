@@ -16,6 +16,15 @@ func BenchmarkGPUDesktop(b *testing.B) {
 			resourceImageInto(res, false, img)
 		}
 	})
+	b.Run("Convert64x64", func(b *testing.B) {
+		img := image.NewRGBA(image.Rect(0, 0, width, height))
+		damage := image.Rect(400, 300, 464, 364)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			resourceImageRectInto(res, false, img, damage, image.Point{})
+		}
+	})
 	b.Run("FlushCursor", func(b *testing.B) {
 		d := gpuTestFramebuffer{newFramebuffer()}
 		defer d.Close()

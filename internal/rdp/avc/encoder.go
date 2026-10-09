@@ -3,9 +3,10 @@
 package avc
 
 import (
-	"bytes"
 	"errors"
 	"image"
+
+	"github.com/bobuhiro11/gokvm/internal/rdp/damage"
 )
 
 // FrameRate is the maximum frame rate of the RDP AVC420 encoder.
@@ -31,7 +32,9 @@ type Encoder struct {
 	codec         nativeEncoder
 	width, height int
 	i420          []byte
-	previous      []byte
+	source        image.Rectangle
+	initialized   bool
+	retry         bool
 	frame         int64
 }
 
@@ -58,6 +61,16 @@ func NewEncoder(width, height int) (*Encoder, error) {
 // The returned slice is owned by the caller and survives the next Encode call.
 // Identical I420 frames return nil unless force is true.
 func (e *Encoder) Encode(img *image.RGBA, force bool) ([]byte, error) {
+	return e.EncodeDamage(img, nil, force)
+}
+
+// EncodeDamage updates only changed source regions in the retained I420 image.
+// Nil damage means the entire image; an empty, nonnil slice means no new changes.
+// First frames, source geometry changes, and forced refreshes convert everything.
+// Callers must include all changes since the previous call, including frames
+// skipped by pacing. A codec failure retains the candidate image and requests an
+// IDR on retry, so subsequent partial updates cannot lose the failed changes.
+func (e *Encoder) EncodeDamage(img *image.RGBA, regions []image.Rectangle, force bool) ([]byte, error) {
 	if e.codec == nil {
 		return nil, ErrClosed
 	}
@@ -65,18 +78,23 @@ func (e *Encoder) Encode(img *image.RGBA, force bool) ([]byte, error) {
 		return nil, ErrGeometry
 	}
 
-	scaleI420(e.i420, e.width, e.height, img)
-	if !force && bytes.Equal(e.i420, e.previous) {
-		return nil, nil
-	}
-	data, err := e.codec.encode(e.i420, force, e.frame*1000/FrameRate)
-	e.frame++
-	if err == nil {
-		e.previous, e.i420 = e.i420, e.previous
-		if e.i420 == nil {
-			e.i420 = make([]byte, len(e.previous))
+	changed := !e.initialized || e.retry
+	output := image.Rect(0, 0, e.width, e.height)
+	if force || regions == nil || !e.initialized || e.source != img.Rect {
+		changed = scaleI420Region(e.i420, e.width, e.height, img, output) || changed
+	} else {
+		for _, region := range regions {
+			mapped := damage.Align(damage.Map(region, img.Rect, output), 2, output)
+			changed = scaleI420Region(e.i420, e.width, e.height, img, mapped) || changed
 		}
 	}
+	e.source, e.initialized = img.Rect, true
+	if !force && !changed {
+		return nil, nil
+	}
+	data, err := e.codec.encode(e.i420, force || e.retry, e.frame*1000/FrameRate)
+	e.frame++
+	e.retry = err != nil
 
 	return data, err
 }
@@ -87,45 +105,42 @@ func (e *Encoder) Close() {
 		e.codec.close()
 		e.codec = nil
 		e.i420 = nil
-		e.previous = nil
 	}
 }
 
-func validRGBA(img *image.RGBA) bool {
-	if img == nil || img.Rect.Empty() {
-		return false
-	}
-
-	w, h := img.Rect.Dx(), img.Rect.Dy()
-	if w <= 0 || h <= 0 {
-		return false
-	}
-	// Check using division before multiplication so malformed image metadata
-	// cannot overflow an offset and panic during conversion.
-	return w <= len(img.Pix)/4 && img.Stride >= w*4 &&
-		h-1 <= (len(img.Pix)-w*4)/img.Stride
-}
+func validRGBA(img *image.RGBA) bool { return damage.ValidRGBA(img) }
 
 // MS-RDPEGFX 3.3.8.3.1 requires full-range BT.709, rather than the studio-range
 // BT.601 used by many general-purpose I420 conversion routines. Average each
 // 2x2 source block for the subsampled chroma planes.
 func scaleI420(dst []byte, width, height int, img *image.RGBA) {
+	scaleI420Region(dst, width, height, img, image.Rect(0, 0, width, height))
+}
+
+// region is clipped to the output and aligned to complete 2x2 chroma blocks.
+// The persistent image is compared while converting, avoiding a second full
+// frame buffer and a separate full-image comparison or copy.
+func scaleI420Region(dst []byte, width, height int, img *image.RGBA, region image.Rectangle) bool {
+	if region.Empty() {
+		return false
+	}
 	luma := width * height
 	chroma := luma / 4
 	// Mapping columns once avoids repeated integer divisions for every pixel.
 	// NewEncoder bounds width, so this fixed-size scratch array stays on the
 	// stack without allocating a lookup table for every frame.
 	var columns [maxDimension]int
-	for x := range width {
+	for x := region.Min.X; x < region.Max.X; x++ {
 		columns[x] = x * img.Rect.Dx() / width * 4
 	}
-	var pos int
-	for y := 0; y < height; y += 2 {
+	changed := false
+	for y := region.Min.Y; y < region.Max.Y; y += 2 {
+		pos := y/2*(width/2) + region.Min.X/2
 		row0 := img.Pix[(y*img.Rect.Dy()/height)*img.Stride:]
 		row1 := img.Pix[((y+1)*img.Rect.Dy()/height)*img.Stride:]
 		luma0 := dst[y*width : (y+1)*width]
 		luma1 := dst[(y+1)*width : (y+2)*width]
-		for x := 0; x+1 < width; x += 2 {
+		for x := region.Min.X; x < region.Max.X; x += 2 {
 			p00 := row0[columns[x]:][:3]
 			p01 := row0[columns[x+1]:][:3]
 			p10 := row1[columns[x]:][:3]
@@ -134,16 +149,22 @@ func scaleI420(dst []byte, width, height int, img *image.RGBA) {
 			r01, g01, b01 := int(p01[0]), int(p01[1]), int(p01[2])
 			r10, g10, b10 := int(p10[0]), int(p10[1]), int(p10[2])
 			r11, g11, b11 := int(p11[0]), int(p11[1]), int(p11[2])
-			luma0[x] = byte((54*r00 + 183*g00 + 18*b00) >> 8)
-			luma0[x+1] = byte((54*r01 + 183*g01 + 18*b01) >> 8)
-			luma1[x] = byte((54*r10 + 183*g10 + 18*b10) >> 8)
-			luma1[x+1] = byte((54*r11 + 183*g11 + 18*b11) >> 8)
+			y00 := byte((54*r00 + 183*g00 + 18*b00) >> 8)
+			y01 := byte((54*r01 + 183*g01 + 18*b01) >> 8)
+			y10 := byte((54*r10 + 183*g10 + 18*b10) >> 8)
+			y11 := byte((54*r11 + 183*g11 + 18*b11) >> 8)
 			red := (r00 + r01 + r10 + r11) / 4
 			green := (g00 + g01 + g10 + g11) / 4
 			blue := (b00 + b01 + b10 + b11) / 4
-			dst[luma+pos] = byte(((-29*red - 99*green + 128*blue) >> 8) + 128)
-			dst[luma+chroma+pos] = byte(((128*red - 116*green - 12*blue) >> 8) + 128)
+			u := byte(((-29*red - 99*green + 128*blue) >> 8) + 128)
+			v := byte(((128*red - 116*green - 12*blue) >> 8) + 128)
+			changed = changed || luma0[x] != y00 || luma0[x+1] != y01 ||
+				luma1[x] != y10 || luma1[x+1] != y11 || dst[luma+pos] != u || dst[luma+chroma+pos] != v
+			luma0[x], luma0[x+1], luma1[x], luma1[x+1] = y00, y01, y10, y11
+			dst[luma+pos], dst[luma+chroma+pos] = u, v
 			pos++
 		}
 	}
+
+	return changed
 }

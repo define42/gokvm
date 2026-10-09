@@ -4,8 +4,11 @@ package rdp
 import (
 	"encoding/binary"
 	"errors"
+	"image"
 	"sync"
 	"time"
+
+	"github.com/bobuhiro11/gokvm/internal/rdp/damage"
 )
 
 const (
@@ -14,6 +17,7 @@ const (
 	graphicsMaxMessage  = 8 << 20
 	graphicsMaxIncoming = 1 << 20
 	graphicsMaxFrames   = 2
+	graphicsMaxRegions  = 128
 	graphicsVersion81   = 0x00080105
 )
 
@@ -100,7 +104,17 @@ func (g *graphicsState) canSend() bool {
 // encoder must use YUV420 and dimensions rounded up to multiples of 16. Returns
 // false without writing if negotiation or frame acknowledgments are pending.
 func (s *Session) WriteAVC420(annexB []byte) (bool, error) {
-	if len(annexB) == 0 || len(annexB) > graphicsMaxMessage-128 {
+	return s.WriteAVC420Damage(annexB, nil)
+}
+
+// WriteAVC420Damage sends a complete H.264 access unit with a repaint mask in
+// output desktop coordinates. The client decodes the entire access unit while
+// converting and repainting only the listed regions. Nil, empty, invalid-only,
+// or excessively fragmented masks repaint everything: an already encoded
+// interframe must never be dropped because its dirty region became empty.
+// IDR keyframes automatically repaint the complete desktop.
+func (s *Session) WriteAVC420Damage(annexB []byte, regions []image.Rectangle) (bool, error) {
+	if len(annexB) == 0 || len(annexB) > avc420MaxPayload(1) {
 		return false, errors.New("rdp: invalid AVC420 frame length")
 	}
 	g := s.graphics
@@ -112,9 +126,21 @@ func (s *Session) WriteAVC420(annexB []byte) (bool, error) {
 	if !g.canSend() {
 		return false, nil
 	}
-	g.frameID++
 	width, height := s.Size()
-	frame := avc420Frame(width, height, g.frameID, graphicsTimestamp(time.Now()), annexB)
+	if width <= 0 || height <= 0 || width > 4096 || height > 4096 {
+		return false, errors.New("rdp: invalid AVC420 desktop geometry")
+	}
+	if len(regions) != 0 && avc420Keyframe(annexB) {
+		// Periodic IDRs may re-quantize unchanged macroblocks. Repaint the
+		// complete picture, including keyframes not explicitly forced by us.
+		regions = nil
+	}
+	regions = avc420Regions(width, height, regions)
+	if len(annexB) > avc420MaxPayload(len(regions)) {
+		return false, errors.New("rdp: AVC420 frame and region metadata exceed message limit")
+	}
+	g.frameID++
+	frame := avc420FrameDamage(width, height, g.frameID, graphicsTimestamp(time.Now()), annexB, regions)
 	if err := s.writeGraphics(frame); err != nil {
 		return false, err
 	}
@@ -293,24 +319,89 @@ func graphicsSurface(width, height int) []byte {
 	return append(data, graphicsPDU(0x0f, make([]byte, 12))...)
 }
 
+// Annex B uses both three-byte and four-byte start codes. An emulation-
+// prevention byte keeps these delimiters out of NAL payloads.
+func avc420Keyframe(annexB []byte) bool {
+	for index := 0; index+3 < len(annexB); index++ {
+		if annexB[index] == 0 && annexB[index+1] == 0 && annexB[index+2] == 1 && annexB[index+3]&31 == 5 {
+			return true
+		}
+	}
+
+	return false
+}
+
+// avc420MaxPayload reserves the complete graphics frame envelope and the
+// largest possible ZGFX segmentation overhead, keeping the DVC message bounded.
+func avc420MaxPayload(rectCount int) int {
+	const segmentOverhead = 7 + 5*((graphicsMaxMessage+65534)/65535)
+
+	return graphicsMaxMessage - segmentOverhead - 57 - 10*rectCount
+}
+
+func avc420Regions(width, height int, regions []image.Rectangle) []image.Rectangle {
+	bounds := image.Rect(0, 0, width, height)
+	if len(regions) == 0 || len(regions) > graphicsMaxRegions {
+		return []image.Rectangle{bounds}
+	}
+	result := make([]image.Rectangle, 0, len(regions))
+	for _, rect := range regions {
+		rect = rect.Intersect(bounds)
+		if rect.Empty() {
+			continue
+		}
+		// Include neighboring samples affected by chroma and filtering, then
+		// repaint complete H.264 macroblocks. Right/bottom remain exclusive.
+		rect = damage.Align(rect.Inset(-1), 16, bounds)
+		if rect == bounds {
+			return []image.Rectangle{bounds}
+		}
+		result = append(result, rect)
+	}
+	if len(result) == 0 {
+		return []image.Rectangle{bounds}
+	}
+
+	return result
+}
+
 func avc420Frame(width, height int, frameID, timestamp uint32, annexB []byte) []byte {
+	return avc420FrameDamage(width, height, frameID, timestamp, annexB,
+		[]image.Rectangle{image.Rect(0, 0, width, height)})
+}
+
+// regions have already been normalized by WriteAVC420Damage. MS-RDPEGFX
+// 2.2.4.4.1 places all RECT16 entries before the array of QP/quality pairs.
+func avc420FrameDamage(width, height int, frameID, timestamp uint32,
+	annexB []byte, regions []image.Rectangle,
+) []byte {
 	start := make([]byte, 8)
 	binary.LittleEndian.PutUint32(start, timestamp)
 	binary.LittleEndian.PutUint32(start[4:], frameID)
 	data := graphicsPDU(0x0b, start)
-	// WIRE_TO_SURFACE_1 followed by one full-screen AVC420 metadata rectangle.
-	wire := make([]byte, 31+len(annexB))
+	// WIRE_TO_SURFACE_1 describes the complete coded desktop; its AVC420
+	// metadata mask tells the client which decoded regions to repaint.
+	metadataLength := 4 + 10*len(regions)
+	wire := make([]byte, 17+metadataLength+len(annexB))
 	put16(wire, 2, 0x0b)
 	wire[4] = 0x20
 	put16(wire, 9, width)
 	put16(wire, 11, height)
-	binary.LittleEndian.PutUint32(wire[13:], uint32(14+len(annexB)))
-	binary.LittleEndian.PutUint32(wire[17:], 1)
-	put16(wire, 25, width)
-	put16(wire, 27, height)
-	// Quantization and quality are advisory metadata for progressive rendering.
-	wire[29], wire[30] = 22, 100
-	copy(wire[31:], annexB)
+	binary.LittleEndian.PutUint32(wire[13:], uint32(metadataLength+len(annexB)))
+	binary.LittleEndian.PutUint32(wire[17:], uint32(len(regions)))
+	for index, rect := range regions {
+		offset := 21 + 8*index
+		put16(wire, offset, rect.Min.X)
+		put16(wire, offset+2, rect.Min.Y)
+		put16(wire, offset+4, rect.Max.X)
+		put16(wire, offset+6, rect.Max.Y)
+	}
+	for index := range regions {
+		offset := 21 + 8*len(regions) + 2*index
+		// Quantization and quality are advisory progressive-rendering metadata.
+		wire[offset], wire[offset+1] = 22, 100
+	}
+	copy(wire[17+metadataLength:], annexB)
 	data = append(data, graphicsPDU(1, wire)...)
 	end := make([]byte, 4)
 	binary.LittleEndian.PutUint32(end, frameID)

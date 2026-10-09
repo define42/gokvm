@@ -35,6 +35,8 @@ type framebuffer struct {
 	width          int
 	height         int
 	frame          []byte
+	frameShared    bool
+	tileVersions   []uint64
 	seq            uint64
 	input          VNCInput
 	done           chan struct{}
@@ -120,7 +122,9 @@ func (d *framebuffer) flush(width, height int, img *image.RGBA) error {
 	d.width = width
 	d.height = height
 	d.frame = frame
+	d.frameShared = false
 	d.seq++
+	d.markFrameDamageLocked(nil)
 	close(d.changed)
 	d.changed = make(chan struct{})
 	d.cond.Broadcast()
@@ -375,6 +379,7 @@ func (d *framebuffer) changedFrame(sequence uint64, force bool) (vncFrame, bool,
 	if !force && d.seq == sequence {
 		return vncFrame{}, false, d.changed
 	}
+	d.frameShared = true
 
 	return vncFrame{width: d.width, height: d.height, pix: d.frame, seq: d.seq}, true, d.changed
 }

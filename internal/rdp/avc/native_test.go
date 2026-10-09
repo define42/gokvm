@@ -40,7 +40,11 @@ func TestNativeRoundTrip(t *testing.T) {
 	var expected [][]byte
 	for index := range 3 {
 		fillColorBars(img, index)
-		data, err := encoder.Encode(img, index == 2)
+		var regions []image.Rectangle
+		if index == 1 {
+			regions = []image.Rectangle{image.Rect(16, 16, 32, 32)}
+		}
+		data, err := encoder.EncodeDamage(img, regions, index == 2)
 		if err != nil {
 			t.Fatal(err)
 		}

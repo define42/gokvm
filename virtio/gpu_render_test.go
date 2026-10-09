@@ -45,6 +45,12 @@ func TestGPUResourcePixelFormats(t *testing.T) {
 				if !bytes.Equal(img.Pix, want) {
 					t.Fatalf("cursor=%v: pixels %v, want %v", cursor, img.Pix, want)
 				}
+				clear(img.Pix)
+				resourceImageRectInto(res, cursor, img, image.Rect(1, 0, 2, 1), image.Point{})
+				clear(want[:4])
+				if !bytes.Equal(img.Pix, want) {
+					t.Fatalf("cursor=%v: partial conversion %v, want %v", cursor, img.Pix, want)
+				}
 			}
 		})
 	}

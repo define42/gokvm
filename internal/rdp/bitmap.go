@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"image"
+
+	"github.com/bobuhiro11/gokvm/internal/rdp/damage"
 )
 
 var ErrBitmapFormat = errors.New("unsupported RDP bitmap geometry or color depth")
@@ -16,7 +18,10 @@ const bitmapTileSize = 64
 // specified by MS-RDPBCGR 2.2.9.1.1.3.1.2. Small tiles fit the MCS PER envelope.
 type BitmapEncoder struct {
 	width, height, bytesPerPixel int
-	previous                     []byte
+	pixels, previous             []byte
+	source                       image.Rectangle
+	pending                      []bool
+	refresh                      bool
 }
 
 func NewBitmapEncoder(width, height, bitsPerPixel int) (*BitmapEncoder, error) {
@@ -29,53 +34,114 @@ func NewBitmapEncoder(width, height, bitsPerPixel int) (*BitmapEncoder, error) {
 }
 
 // WriteFrame calls send with TS_UPDATE_BITMAP_DATA payloads (including the
-// updateType field). A failed send leaves the previous frame unchanged, so a
-// retry retransmits every tile that might not have reached the client.
+// updateType field). A failed send retains all dirty tiles, so a retry sends
+// every tile that might not have reached the client.
 func (e *BitmapEncoder) WriteFrame(img *image.RGBA, force bool, send func([]byte) error) error {
+	return e.WriteFrameDamage(img, nil, force, send)
+}
+
+// WriteFrameDamage converts only changed source regions into a retained packed
+// image. Nil damage means a full update, while an empty, nonnil slice adds no new
+// damage. Initial frames, source geometry changes, and forced refreshes convert
+// the entire image. Callers must include changes from any skipped source frames.
+func (e *BitmapEncoder) WriteFrameDamage(
+	img *image.RGBA, regions []image.Rectangle, force bool, send func([]byte) error,
+) error {
 	if img == nil || img.Bounds().Empty() {
 		return nil
 	}
+	if !damage.ValidRGBA(img) {
+		return ErrBitmapFormat
+	}
 
-	pixels := e.scale(img)
-	for top := 0; top < e.height; top += bitmapTileSize {
-		for left := 0; left < e.width; left += bitmapTileSize {
-			width := min(bitmapTileSize, e.width-left)
-			height := min(bitmapTileSize, e.height-top)
-			if !force && e.unchanged(pixels, left, top, width, height) {
-				continue
-			}
+	output := image.Rect(0, 0, e.width, e.height)
+	if e.pixels == nil {
+		e.pixels = make([]byte, e.width*e.height*e.bytesPerPixel)
+		e.previous = make([]byte, len(e.pixels))
+		e.pending = make([]bool, e.columns()*((e.height+bitmapTileSize-1)/bitmapTileSize))
+		e.refresh = true
+	}
+	if force || e.source != img.Rect {
+		e.refresh = true
+	}
+	if regions == nil || e.refresh {
+		e.scaleRegion(img, output)
+		e.markPending(output)
+	} else {
+		for _, region := range regions {
+			mapped := damage.Map(region, img.Rect, output)
+			e.scaleRegion(img, mapped)
+			e.markPending(mapped)
+		}
+	}
+	e.source = img.Rect
 
-			if err := send(e.tile(pixels, left, top, width, height)); err != nil {
-				return err
-			}
+	for index, pending := range e.pending {
+		if !pending {
+			continue
+		}
+		left, top, width, height := e.tileBounds(index)
+		if !e.refresh && e.unchanged(e.pixels, left, top, width, height) {
+			continue
+		}
+		if err := send(e.tile(e.pixels, left, top, width, height)); err != nil {
+			return err
 		}
 	}
 
-	e.previous = pixels
+	// Commit only after every send succeeds; failed writes preserve all pending
+	// changes even if the caller supplies different or empty damage on retry.
+	for index, pending := range e.pending {
+		if !pending {
+			continue
+		}
+		left, top, width, height := e.tileBounds(index)
+		for y := top; y < top+height; y++ {
+			start := (y*e.width + left) * e.bytesPerPixel
+			end := start + width*e.bytesPerPixel
+			copy(e.previous[start:end], e.pixels[start:end])
+		}
+		e.pending[index] = false
+	}
+	e.refresh = false
 
 	return nil
 }
 
-func (e *BitmapEncoder) scale(img *image.RGBA) []byte {
-	packed := make([]byte, e.width*e.height*e.bytesPerPixel)
-	bounds := img.Bounds()
-	for y := 0; y < e.height; y++ {
-		srcY := bounds.Min.Y + y*bounds.Dy()/e.height
-		for x := 0; x < e.width; x++ {
-			srcX := bounds.Min.X + x*bounds.Dx()/e.width
-			src := img.PixOffset(srcX, srcY)
+func (e *BitmapEncoder) columns() int { return (e.width + bitmapTileSize - 1) / bitmapTileSize }
+
+func (e *BitmapEncoder) tileBounds(index int) (left, top, width, height int) {
+	left, top = index%e.columns()*bitmapTileSize, index/e.columns()*bitmapTileSize
+
+	return left, top, min(bitmapTileSize, e.width-left), min(bitmapTileSize, e.height-top)
+}
+
+func (e *BitmapEncoder) markPending(region image.Rectangle) {
+	if region.Empty() {
+		return
+	}
+	for y := region.Min.Y / bitmapTileSize; y <= (region.Max.Y-1)/bitmapTileSize; y++ {
+		for x := region.Min.X / bitmapTileSize; x <= (region.Max.X-1)/bitmapTileSize; x++ {
+			e.pending[y*e.columns()+x] = true
+		}
+	}
+}
+
+func (e *BitmapEncoder) scaleRegion(img *image.RGBA, region image.Rectangle) {
+	for y := region.Min.Y; y < region.Max.Y; y++ {
+		srcY := y * img.Rect.Dy() / e.height
+		for x := region.Min.X; x < region.Max.X; x++ {
+			src := srcY*img.Stride + x*img.Rect.Dx()/e.width*4
 			dst := (y*e.width + x) * e.bytesPerPixel
 			r, g, b := img.Pix[src], img.Pix[src+1], img.Pix[src+2]
 			if e.bytesPerPixel == 2 {
 				value := uint16(r>>3)<<11 | uint16(g>>2)<<5 | uint16(b>>3)
-				binary.LittleEndian.PutUint16(packed[dst:], value)
+				binary.LittleEndian.PutUint16(e.pixels[dst:], value)
 			} else {
-				packed[dst], packed[dst+1], packed[dst+2] = b, g, r
+				e.pixels[dst], e.pixels[dst+1], e.pixels[dst+2] = b, g, r
 			}
 		}
 	}
-
-	return packed
 }
 
 func (e *BitmapEncoder) unchanged(pixels []byte, left, top, width, height int) bool {

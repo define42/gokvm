@@ -10,7 +10,6 @@ enum { GOKVM_AVC_MAX_FRAME = 16 * 1024 * 1024 };
 
 struct gokvm_avc_encoder {
     ISVCEncoder *codec;
-    unsigned char *i420;
     unsigned char *output;
     int capacity;
     int width, height;
@@ -22,7 +21,6 @@ void gokvm_avc_destroy(gokvm_avc_encoder *encoder) {
         (*encoder->codec)->Uninitialize(encoder->codec);
         WelsDestroySVCEncoder(encoder->codec);
     }
-    free(encoder->i420);
     free(encoder->output);
     free(encoder);
 }
@@ -37,9 +35,8 @@ int gokvm_avc_create(int width, int height, gokvm_avc_encoder **out) {
     if (!encoder) return -2;
     encoder->width = width;
     encoder->height = height;
-    encoder->i420 = malloc((size_t)width * height * 3 / 2);
     int status = WelsCreateSVCEncoder(&encoder->codec);
-    if (status || !encoder->codec || !encoder->i420) {
+    if (status || !encoder->codec) {
         gokvm_avc_destroy(encoder);
         return status ? status : -2;
     }
@@ -100,16 +97,18 @@ int gokvm_avc_encode(gokvm_avc_encoder *encoder, const unsigned char *i420,
         if (status) return status;
     }
     const int luma = encoder->width * encoder->height;
-    memcpy(encoder->i420, i420, (size_t)luma * 3 / 2);
     SSourcePicture picture;
     memset(&picture, 0, sizeof(picture));
     picture.iColorFormat = videoFormatI420;
     picture.iPicWidth = picture.iStride[0] = encoder->width;
     picture.iPicHeight = encoder->height;
     picture.iStride[1] = picture.iStride[2] = encoder->width / 2;
-    picture.pData[0] = encoder->i420;
-    picture.pData[1] = encoder->i420 + luma;
-    picture.pData[2] = encoder->i420 + luma + luma / 4;
+    // EncodeFrame consumes the input synchronously and copies reference pictures
+    // into its own storage. The Go byte buffer stays pinned for this cgo call;
+    // never save these pointers in encoder state after returning to Go.
+    picture.pData[0] = (unsigned char *)i420;
+    picture.pData[1] = (unsigned char *)i420 + luma;
+    picture.pData[2] = (unsigned char *)i420 + luma + luma / 4;
     picture.uiTimeStamp = timestamp;
     SFrameBSInfo frame;
     memset(&frame, 0, sizeof(frame));

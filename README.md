@@ -215,11 +215,18 @@ enable codec support in an already-built FreeRDP client. Use a client built
 with H.264 decoding, or omit `/gfx:AVC420` to connect using bitmap updates.
 The interoperability tests used a separate H.264-enabled FreeRDP build.
 
-For the X11 client, also check for `WITH_XCURSOR=ON`. The framebuffer includes
-the guest's software cursor or the virtio-gpu hardware cursor composed by gokvm,
-and gokvm asks the client to hide its local cursor. FreeRDP builds without
-Xcursor support ignore that request, leaving
-two cursors visible; during movement they can appear separated or offset.
+For the X11 client, also check for `WITH_XCURSOR=ON`. Virtio-gpu hardware cursors
+are sent as separate RDP pointer updates, so the client draws them immediately
+without waiting for a video frame. Shapes and hotspots are cached; moving the
+hardware cursor alone does not encode desktop video. Transparent padding is
+trimmed, and shapes larger than the supported 32×32 RDP pointer size are reduced.
+Older clients receive a compatible color cursor without alpha blending.
+
+Guest software cursors, including the VESA fallback, remain in the desktop
+image and require the client's local cursor to be hidden. FreeRDP builds without
+Xcursor support can show a second pointer in this case. VNC and PNG outputs
+continue receiving an image with the guest cursor composed into it, including
+when used alongside RDP.
 
 The server logs `using OpenH264 AVC420 graphics` after negotiation. Clients
 without AVC420 support receive bitmap updates automatically. The tagged binary
@@ -231,11 +238,18 @@ AVC420 uses lossy YUV 4:2:0 compression and software encoding, so small colored
 text can be softer than bitmap output. AVC444 and hardware encoding are not
 implemented. TLS and authentication behavior are the same as for bitmap RDP.
 
-The H.264 path captures the linear framebuffer and sends changed frames at up
-to 60 fps. Frame notifications avoid waiting for a separate polling cycle,
-and slow clients receive the latest available frame when they are ready.
-Actual frame rate depends on guest rendering, host CPU, and client decoding.
-Bitmap RDP remains capped at 30 fps.
+The H.264 path sends changed frames at up to 60 fps. Virtio-gpu dirty rectangles
+limit pixel conversion and framebuffer copying to changed regions; each client
+retains its own image and catches up safely after skipping intermediate frames.
+Bitmap output updates changed 64×64 tiles, while H.264 updates a persistent YUV
+image and sends repaint rectangles with its compressed video. H.264 still
+encodes a complete video picture, using references to earlier frames.
+
+Frame notifications avoid waiting for a separate polling cycle, and slow clients
+receive the latest available image when ready. Resizing and refresh requests
+repaint the whole desktop. Serial/VGA/VESA fallbacks still publish full images.
+Actual frame rate depends on guest rendering, host CPU, and client decoding;
+bitmap RDP remains capped at 30 fps.
 
 Virtio-gpu currently provides a 2D framebuffer without guest 3D acceleration.
 Complex browser pages can therefore be limited by software rendering inside

@@ -42,6 +42,7 @@ type Session struct {
 	dynamic       *dynamicState
 	graphics      *graphicsState
 	audio         *audioState
+	pointer       pointerState
 }
 
 type queuedPacket struct {
@@ -799,7 +800,7 @@ func (s *Session) demandActive() []byte {
 	}{
 		{1, general},
 		{2, bitmap},
-		{8, []byte{1, 0, 0, 0}},
+		{8, []byte{1, 0, pointerCacheEntries, 0, pointerCacheEntries, 0}},
 		{13, input},
 		{14, []byte{1, 0, 0, 0}},
 		{9, []byte{0xea, 3, 0, 0}},
@@ -841,6 +842,8 @@ func (s *Session) confirmActiveDepth(p []byte, update bool) error {
 	count := int(binary.LittleEndian.Uint16(p[off : off+2]))
 	off += 4
 	bitmap := false
+	pointerSeen := false
+	pointer := pointerCapabilities{}
 	for i := 0; i < count; i++ {
 		if off > len(p)-4 {
 			return errors.New("rdp: missing capability header")
@@ -864,11 +867,25 @@ func (s *Session) confirmActiveDepth(p []byte, update bool) error {
 				return errors.New("rdp: color depth changed during reactivation")
 			}
 		}
+		if kind == 8 {
+			if pointerSeen || n < 8 || n == 9 {
+				return errors.New("rdp: invalid pointer capability")
+			}
+			pointerSeen = true
+			pointer.colors = int(binary.LittleEndian.Uint16(p[off+6 : off+8]))
+			if n >= 10 {
+				pointer.alpha = int(binary.LittleEndian.Uint16(p[off+8 : off+10]))
+			}
+		}
 		off += n
 	}
 	if !bitmap || off != len(p) {
 		return errors.New("rdp: incomplete capability data")
 	}
+	s.pointer.mu.Lock()
+	s.pointer.caps = pointer
+	s.pointer.reset()
+	s.pointer.mu.Unlock()
 
 	return nil
 }

@@ -20,6 +20,7 @@ import (
 	"github.com/bobuhiro11/gokvm/internal/audio"
 	"github.com/bobuhiro11/gokvm/internal/rdp"
 	"github.com/bobuhiro11/gokvm/internal/rdp/avc"
+	rdpdamage "github.com/bobuhiro11/gokvm/internal/rdp/damage"
 )
 
 const (
@@ -39,17 +40,21 @@ type RDPConfig struct {
 // network or an authenticated tunnel when allowing access beyond localhost.
 type RDPDisplay struct {
 	*framebuffer
-	listener net.Listener
-	tls      *tls.Config
-	h264     bool
-	audio    *audio.Hub
-	connMu   sync.Mutex
-	conns    map[net.Conn]struct{}
-	wg       sync.WaitGroup
-	once     sync.Once
-	resizeMu sync.Mutex
-	resize   func(int, int) error
-	viewers  []*rdp.Session
+	listener       net.Listener
+	tls            *tls.Config
+	h264           bool
+	audio          *audio.Hub
+	connMu         sync.Mutex
+	conns          map[net.Conn]struct{}
+	wg             sync.WaitGroup
+	once           sync.Once
+	resizeMu       sync.Mutex
+	resize         func(int, int) error
+	viewers        []*rdp.Session
+	cursorMu       sync.Mutex
+	cursor         rdpCursorState
+	motions        []rdpPointerMotion
+	pointerInputMu sync.Mutex
 }
 
 // NewRDPDisplay starts an RDP listener with an ephemeral self-signed certificate.
@@ -131,6 +136,7 @@ func (d *RDPDisplay) addResizeViewer(session *rdp.Session) {
 }
 
 func (d *RDPDisplay) removeResizeViewer(session *rdp.Session) {
+	d.forgetPointerMotions(session)
 	d.resizeMu.Lock()
 	defer d.resizeMu.Unlock()
 	for i, viewer := range d.viewers {
@@ -262,8 +268,8 @@ func (d *RDPDisplay) serveConn(conn net.Conn) (serveErr error) {
 	d.addResizeViewer(session)
 	defer d.removeResizeViewer(session)
 
-	// The guest draws its own cursor, as it does on the VNC console.
-	if err := session.WriteDataPDU(27, []byte{1, 0, 0, 0, 0, 0, 0, 0}); err != nil {
+	// Software cursors remain in the image until the GPU supplies a shape.
+	if err := session.WritePointer(nil, 0, 0); err != nil {
 		return err
 	}
 
@@ -412,10 +418,19 @@ func (d *RDPDisplay) writeFrames(
 		if writer.updateGraphics(conn) {
 			writer.force = true
 		}
-		frame, changed, published := d.changedFrame(writer.sequence, writer.force)
+		cursor, cursorChanged := d.cursorSnapshot()
+		if session.DisplayReady() {
+			d.mu.Lock()
+			guestWidth, guestHeight := d.width, d.height
+			d.mu.Unlock()
+			if err := writer.updatePointer(cursor, guestWidth, guestHeight); err != nil {
+				return err
+			}
+		}
+		changed, published := d.frameChanged(writer.sequence, writer.force)
 		var paced <-chan time.Time
 		if changed && session.DisplayReady() && !suppressed.Load() && (!writer.graphics || session.GraphicsCanSend()) {
-			paced, err = writer.writeWhenReady(frame, timer)
+			paced, err = writer.writeWhenReady(d.framebuffer, timer)
 			if err != nil {
 				return err
 			}
@@ -430,6 +445,7 @@ func (d *RDPDisplay) writeFrames(
 			writer.force = true
 		case <-published:
 		case <-graphicsChanged:
+		case <-cursorChanged:
 		case <-displayChanged:
 		case pending = <-resizeRequests:
 			resizeReady = false
@@ -448,12 +464,14 @@ type rdpFrameWriter struct {
 	session   *rdp.Session
 	bitmap    *rdp.BitmapEncoder
 	avc       *avc.Encoder
+	frame     vncFrame
 	width     int
 	height    int
 	graphics  bool
 	sequence  uint64
 	force     bool
 	nextFrame time.Time
+	pointer   rdpPointerWriter
 }
 
 // Encoders retain geometry and the previous frame. Discard both after a resize
@@ -473,24 +491,27 @@ func (w *rdpFrameWriter) updateSize() error {
 	w.width, w.height = width, height
 	w.force = true
 	w.nextFrame = time.Time{}
+	w.pointer = rdpPointerWriter{}
+	w.session.ResetPointerCache()
 
 	return nil
 }
 
-func (w *rdpFrameWriter) writeWhenReady(frame vncFrame, timer *time.Timer) (<-chan time.Time, error) {
+func (w *rdpFrameWriter) writeWhenReady(display *framebuffer, timer *time.Timer) (<-chan time.Time, error) {
 	if delay := time.Until(w.nextFrame); delay > 0 {
 		timer.Reset(delay)
 
 		return timer.C, nil
 	}
 	w.nextFrame = time.Now().Add(w.frameInterval())
-	sent, err := w.write(frame, w.force)
+	damage := display.copyFrameChanges(&w.frame, w.force)
+	sent, err := w.write(w.frame, damage, w.force)
 	if err != nil {
 		return nil, err
 	}
 	w.force = !sent
 	if sent {
-		w.sequence = frame.seq
+		w.sequence = w.frame.seq
 	}
 
 	return nil, nil //nolint:nilnil // A nil timer channel keeps an idle writer asleep until an event.
@@ -523,13 +544,13 @@ func (w *rdpFrameWriter) close() {
 	}
 }
 
-func (w *rdpFrameWriter) write(frame vncFrame, force bool) (bool, error) {
+func (w *rdpFrameWriter) write(frame vncFrame, damage []image.Rectangle, force bool) (bool, error) {
 	img := &image.RGBA{Pix: frame.pix, Stride: frame.width * 4, Rect: image.Rect(0, 0, frame.width, frame.height)}
 	if len(frame.pix) == 0 {
 		img = image.NewRGBA(img.Rect)
 	}
 	if !w.graphics {
-		err := w.bitmap.WriteFrame(img, force, func(data []byte) error {
+		err := w.bitmap.WriteFrameDamage(img, damage, force, func(data []byte) error {
 			return w.session.WriteDataPDU(2, data)
 		})
 
@@ -543,12 +564,24 @@ func (w *rdpFrameWriter) write(frame vncFrame, force bool) (bool, error) {
 		}
 		w.avc = encoder
 	}
-	data, err := w.avc.Encode(img, force)
+	data, err := w.avc.EncodeDamage(img, damage, force)
 	if err != nil || len(data) == 0 {
 		return err == nil, err
 	}
 
-	return w.session.WriteAVC420(data)
+	var regions []image.Rectangle
+	if !force && damage != nil {
+		width, height := w.session.Size()
+		output := image.Rect(0, 0, width, height)
+		for _, rect := range damage {
+			mapped := rdpdamage.Map(rect, img.Bounds(), output)
+			if !mapped.Empty() {
+				regions = append(regions, mapped)
+			}
+		}
+	}
+
+	return w.session.WriteAVC420Damage(data, regions)
 }
 
 func (d *RDPDisplay) dispatchInput(session *rdp.Session, events []rdp.InputEvent) {
@@ -557,13 +590,16 @@ func (d *RDPDisplay) dispatchInput(session *rdp.Session, events []rdp.InputEvent
 		case rdp.InputKey:
 			d.sendKeyEvent(event.Down, event.Key)
 		case rdp.InputPointer:
+			d.pointerInputMu.Lock()
 			d.mu.Lock()
 			width, height := d.width, d.height
 			d.mu.Unlock()
 			clientWidth, clientHeight := session.Size()
 			x := min(int(event.X), clientWidth-1) * width / clientWidth
 			y := min(int(event.Y), clientHeight-1) * height / clientHeight
+			d.rememberPointerMotion(session, x, y)
 			d.sendPointerEvent(event.Buttons, uint16(x), uint16(y))
+			d.pointerInputMu.Unlock()
 		}
 	}
 }

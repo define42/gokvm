@@ -68,3 +68,36 @@ func BenchmarkEncode(b *testing.B) {
 		frame++
 	}
 }
+
+// BenchmarkI420Damage measures the conversion and change detection stage only;
+// H.264 still encodes the complete retained picture after a changed region.
+func BenchmarkI420Damage(b *testing.B) {
+	for _, size := range []struct {
+		name          string
+		width, height int
+	}{
+		{"1080p", 1920, 1080},
+		{"4K", 3840, 2160},
+	} {
+		for _, partial := range []bool{false, true} {
+			name := size.name + "/Full"
+			if partial {
+				name = size.name + "/64x32"
+			}
+			b.Run(name, func(b *testing.B) {
+				img := image.NewRGBA(image.Rect(0, 0, size.width, size.height))
+				dst := make([]byte, size.width*size.height*3/2)
+				region := img.Rect
+				if partial {
+					region = image.Rect(64, 64, 128, 96)
+				}
+				b.ReportAllocs()
+				b.SetBytes(int64(region.Dx() * region.Dy() * 4))
+				for b.Loop() {
+					img.Pix[img.PixOffset(64, 64)] ^= 255
+					scaleI420Region(dst, size.width, size.height, img, region)
+				}
+			})
+		}
+	}
+}
