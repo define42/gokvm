@@ -4,9 +4,9 @@ import (
 	"log"
 	"os"
 
-	"github.com/bobuhiro11/gokvm/flag"
-	"github.com/bobuhiro11/gokvm/probe"
-	"github.com/bobuhiro11/gokvm/vmm"
+	"github.com/define42/gokvm/flag"
+	"github.com/define42/gokvm/probe"
+	"github.com/define42/gokvm/vmm"
 )
 
 func main() {

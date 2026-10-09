@@ -66,6 +66,8 @@ linters:
       - legacy
       - std-error-handling
     paths:
+      # The mechanical OpenH264 port preserves upstream C identifiers and layout.
+      - ^pkg/h264/
       - third_party$
       - builtin$
       - examples$
@@ -78,6 +80,7 @@ formatters:
   exclusions:
     generated: lax
     paths:
+      - ^pkg/h264/
       - third_party$
       - builtin$
       - examples$

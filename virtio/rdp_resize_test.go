@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bobuhiro11/gokvm/internal/rdp"
+	"github.com/define42/gokvm/internal/rdp"
 )
 
 func TestRDPResizeControllerReconnect(t *testing.T) {

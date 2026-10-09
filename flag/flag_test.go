@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/bobuhiro11/gokvm/flag"
+	"github.com/define42/gokvm/flag"
 )
 
 func TestParsesize(t *testing.T) { // nolint:paralleltest

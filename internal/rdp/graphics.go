@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bobuhiro11/gokvm/internal/rdp/damage"
+	"github.com/define42/gokvm/internal/rdp/damage"
 )
 
 const (

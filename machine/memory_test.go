@@ -8,7 +8,7 @@ import (
 	"testing"
 	"unsafe"
 
-	"github.com/bobuhiro11/gokvm/kvm"
+	"github.com/define42/gokvm/kvm"
 )
 
 func TestGuestMemoryAlignment(t *testing.T) {

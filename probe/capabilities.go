@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/bobuhiro11/gokvm/kvm"
+	"github.com/define42/gokvm/kvm"
 )
 
 // KVMCapabilities probes the system for kvm capabilities.

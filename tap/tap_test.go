@@ -6,7 +6,7 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/bobuhiro11/gokvm/tap"
+	"github.com/define42/gokvm/tap"
 )
 
 func TestNew(t *testing.T) { // nolint:paralleltest

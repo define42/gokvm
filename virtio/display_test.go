@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bobuhiro11/gokvm/virtio"
+	"github.com/define42/gokvm/virtio"
 )
 
 // TestPNGDisplayFlush checks the default backend writes a decodable PNG whose

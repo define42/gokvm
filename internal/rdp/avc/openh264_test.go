@@ -6,22 +6,21 @@ import (
 	"image/color"
 	"testing"
 
-	go264 "github.com/oops1/go.264"
+	openh264 "github.com/define42/gokvm/pkg/h264"
 )
 
-func TestGo264RoundTrip(t *testing.T) {
+func TestOpenH264RoundTrip(t *testing.T) {
 	t.Parallel()
 	encoder, err := NewEncoder(64, 48)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer encoder.Close()
-	decoder := go264.NewDecoderWithConfig(go264.DecoderConfig{ForceSoftware: true})
-	defer func() {
-		if err := decoder.Close(); err != nil {
-			t.Error(err)
-		}
-	}()
+	decoder, err := openh264.NewDecoder(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer decoder.Close()
 
 	img := image.NewRGBA(image.Rect(0, 0, 64, 48))
 	var first, firstCopy []byte
@@ -58,13 +57,15 @@ func TestGo264RoundTrip(t *testing.T) {
 		t.Fatal("a later encode mutated an earlier access unit")
 	}
 
-	var decoded []*go264.Frame
+	var decoded []*openh264.Frame
 	for index, packet := range packets {
-		frames, err := decoder.Decode(packet)
+		frame, err := decoder.Decode(packet)
 		if err != nil {
 			t.Fatalf("decode frame %d: %v", index, err)
 		}
-		decoded = append(decoded, frames...)
+		if frame != nil {
+			decoded = append(decoded, frame)
+		}
 	}
 	rest, err := decoder.Flush()
 	if err != nil {
@@ -79,7 +80,7 @@ func TestGo264RoundTrip(t *testing.T) {
 			t.Fatalf("frame %d dimensions = %dx%d", index, frame.Width, frame.Height)
 		}
 		want := expected[index]
-		pixels := frame.AppendI420(nil)
+		pixels := appendFrameI420(nil, frame)
 		if len(pixels) != len(want) {
 			t.Fatalf("frame %d decoded length = %d, want %d", index, len(pixels), len(want))
 		}
@@ -91,6 +92,13 @@ func TestGo264RoundTrip(t *testing.T) {
 			t.Fatalf("frame %d average sample error = %f", index, average)
 		}
 	}
+}
+
+func appendFrameI420(dst []byte, frame *openh264.Frame) []byte {
+	dst = append(dst, frame.Y...)
+	dst = append(dst, frame.U...)
+
+	return append(dst, frame.V...)
 }
 
 func fillColorBars(img *image.RGBA, frame int) {

@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bobuhiro11/gokvm/kvm"
-	"github.com/bobuhiro11/gokvm/machine"
-	"github.com/bobuhiro11/gokvm/pvh"
+	"github.com/define42/gokvm/kvm"
+	"github.com/define42/gokvm/machine"
+	"github.com/define42/gokvm/pvh"
 	"golang.org/x/arch/x86/x86asm"
 )
 

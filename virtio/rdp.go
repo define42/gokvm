@@ -18,10 +18,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bobuhiro11/gokvm/internal/audio"
-	"github.com/bobuhiro11/gokvm/internal/rdp"
-	"github.com/bobuhiro11/gokvm/internal/rdp/avc"
-	rdpdamage "github.com/bobuhiro11/gokvm/internal/rdp/damage"
+	"github.com/define42/gokvm/internal/audio"
+	"github.com/define42/gokvm/internal/rdp"
+	"github.com/define42/gokvm/internal/rdp/avc"
+	rdpdamage "github.com/define42/gokvm/internal/rdp/damage"
 )
 
 const rdpResizeDelay = 150 * time.Millisecond
@@ -31,7 +31,7 @@ type RDPConfig struct {
 	TLS         *tls.Config
 	H264        bool
 	Audio       bool
-	H264Threads int // Parallel slice request; zero chooses a bounded automatic count.
+	H264Threads int // Slice request; zero chooses a bounded automatic count.
 	GuestCPUs   int // Guest vCPUs considered when bounding the encoder slice request.
 	Stats       bool
 }

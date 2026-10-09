@@ -10,7 +10,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/bobuhiro11/gokvm/pci"
+	"github.com/define42/gokvm/pci"
 )
 
 var (

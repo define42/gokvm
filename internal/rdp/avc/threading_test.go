@@ -8,11 +8,11 @@ import (
 	"image/draw"
 	"testing"
 
-	go264 "github.com/oops1/go.264"
+	openh264 "github.com/define42/gokvm/pkg/h264"
 )
 
 //nolint:paralleltest,tparallel // Sequential subtests bound codec reference-picture memory.
-func TestGo264ParallelSlicesRoundTrip(t *testing.T) {
+func TestOpenH264SlicesRoundTrip(t *testing.T) {
 	t.Parallel()
 	// Sequential subtests bound codec reference-picture memory. Each stream
 	// changes resolution through a fresh encoder, just as an RDP resize does.
@@ -20,9 +20,9 @@ func TestGo264ParallelSlicesRoundTrip(t *testing.T) {
 		t.Run(fmt.Sprint(threads), func(t *testing.T) {
 			var frames []decodedReference
 			for _, size := range [][2]int{{16, 16}, {64, 48}, {200, 200}, {320, 240}, {1024, 768}} {
-				frames = append(frames, threadedTestFrames(t, threads, size[0], size[1])...)
+				frames = append(frames, slicedTestFrames(t, threads, size[0], size[1])...)
 			}
-			decodeThreadedFrames(t, threads, frames)
+			decodeSlicedFrames(t, threads, frames)
 		})
 	}
 }
@@ -33,21 +33,22 @@ type decodedReference struct {
 	pixels        []byte
 }
 
-func decodeThreadedFrames(t *testing.T, threads int, frames []decodedReference) {
+func decodeSlicedFrames(t *testing.T, threads int, frames []decodedReference) {
 	t.Helper()
-	decoder := go264.NewDecoderWithConfig(go264.DecoderConfig{ForceSoftware: true})
-	defer func() {
-		if err := decoder.Close(); err != nil {
-			t.Error(err)
-		}
-	}()
-	var decoded []*go264.Frame
+	decoder, err := openh264.NewDecoder(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer decoder.Close()
+	var decoded []*openh264.Frame
 	for index, frame := range frames {
-		pictures, err := decoder.Decode(frame.data)
+		picture, err := decoder.Decode(frame.data)
 		if err != nil {
 			t.Fatalf("decode %d-slice frame %d: %v", threads, index, err)
 		}
-		decoded = append(decoded, pictures...)
+		if picture != nil {
+			decoded = append(decoded, picture)
+		}
 	}
 	rest, err := decoder.Flush()
 	if err != nil {
@@ -63,7 +64,7 @@ func decodeThreadedFrames(t *testing.T, threads int, frames []decodedReference) 
 			t.Fatalf("frame %d dimensions %dx%d, want %dx%d",
 				index, picture.Width, picture.Height, frame.width, frame.height)
 		}
-		decoded := picture.AppendI420(nil)
+		decoded := appendFrameI420(nil, picture)
 		if len(decoded) != len(frame.pixels) {
 			t.Fatalf("frame %d decoded length = %d, want %d", index, len(decoded), len(frame.pixels))
 		}
@@ -78,7 +79,7 @@ func decodeThreadedFrames(t *testing.T, threads int, frames []decodedReference) 
 	}
 }
 
-func threadedTestFrames(t *testing.T, threads, width, height int) []decodedReference {
+func slicedTestFrames(t *testing.T, threads, width, height int) []decodedReference {
 	t.Helper()
 	encoder, err := NewEncoderWithOptions(width, height, Options{Threads: threads, Measure: true})
 	if err != nil {

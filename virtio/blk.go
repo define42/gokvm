@@ -8,8 +8,8 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/bobuhiro11/gokvm/disk"
-	"github.com/bobuhiro11/gokvm/pci"
+	"github.com/define42/gokvm/disk"
+	"github.com/define42/gokvm/pci"
 )
 
 const (

@@ -7,13 +7,14 @@ import (
 	"image"
 	"time"
 
-	"github.com/bobuhiro11/gokvm/internal/rdp/damage"
+	"github.com/define42/gokvm/internal/rdp/damage"
 )
 
 // FrameRate is the maximum frame rate of the RDP AVC420 encoder.
 const FrameRate = 60
 
-// MaxThreads limits the number of parallel slices used by one encoder.
+// MaxThreads limits the requested H.264 slice count. The historical name
+// matches the command-line option; the bundled codec encodes slices sequentially.
 const MaxThreads = 16
 
 const maxDimension = 4096
@@ -22,10 +23,10 @@ var (
 	ErrGeometry = errors.New("invalid H.264 frame geometry")
 	ErrCodec    = errors.New("H.264 encoding failed")
 	ErrClosed   = errors.New("H.264 encoder is closed")
-	ErrThreads  = errors.New("H.264 parallelism must be between 1 and 16")
+	ErrThreads  = errors.New("H.264 slice count must be between 1 and 16")
 )
 
-// Options controls slice parallelism and optional per-frame measurements.
+// Options controls the H.264 slice count and optional per-frame measurements.
 type Options struct {
 	Threads int
 	Measure bool
@@ -64,9 +65,9 @@ func NewEncoder(width, height int) (*Encoder, error) {
 	return NewEncoderWithOptions(width, height, Options{Threads: 1})
 }
 
-// NewEncoderWithOptions fixes the output size and requested parallel slice count.
-// Threads must be between 1 and MaxThreads. The codec reduces the slice count
-// for pictures with fewer macroblock rows; Threads reports the configured count.
+// NewEncoderWithOptions fixes the output size and requested slice count.
+// Threads must be between 1 and MaxThreads. The codec may reduce the slice count
+// for small pictures; Threads reports the effective count.
 func NewEncoderWithOptions(width, height int, options Options) (*Encoder, error) {
 	if width < 16 || height < 16 || width > maxDimension || height > maxDimension || width%2 != 0 || height%2 != 0 {
 		return nil, ErrGeometry
@@ -87,7 +88,7 @@ func NewEncoderWithOptions(width, height int, options Options) (*Encoder, error)
 	}, nil
 }
 
-// Threads returns the configured parallel slice count.
+// Threads returns the effective H.264 slice count.
 func (e *Encoder) Threads() int { return e.threads }
 
 // LastStats returns measurements for the most recent encode call. Measurements

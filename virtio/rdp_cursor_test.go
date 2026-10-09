@@ -6,7 +6,7 @@ import (
 	"image/color"
 	"testing"
 
-	"github.com/bobuhiro11/gokvm/internal/rdp"
+	"github.com/define42/gokvm/internal/rdp"
 )
 
 func TestRDPCursorMovementDoesNotPublishDesktop(t *testing.T) {

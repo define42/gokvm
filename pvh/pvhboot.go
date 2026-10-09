@@ -7,7 +7,7 @@ import (
 	"errors"
 	"io"
 
-	"github.com/bobuhiro11/gokvm/kvm"
+	"github.com/define42/gokvm/kvm"
 )
 
 const (

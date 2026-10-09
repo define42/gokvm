@@ -3,7 +3,7 @@ package kvm_test
 import (
 	"testing"
 
-	"github.com/bobuhiro11/gokvm/kvm"
+	"github.com/define42/gokvm/kvm"
 )
 
 func TestCapabilityStringer(t *testing.T) {

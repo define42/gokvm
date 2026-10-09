@@ -5,7 +5,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/bobuhiro11/gokvm/machine"
+	"github.com/define42/gokvm/machine"
 )
 
 func TestDebug(t *testing.T) { // nolint:paralleltest

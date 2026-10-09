@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/bobuhiro11/gokvm/kvm"
+	"github.com/define42/gokvm/kvm"
 	"golang.org/x/arch/x86/x86asm"
 )
 

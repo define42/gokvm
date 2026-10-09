@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bobuhiro11/gokvm/pci"
+	"github.com/define42/gokvm/pci"
 )
 
 // Sound implements the message-based playback subset of virtio 1.2 section

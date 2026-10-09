@@ -5,7 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/bobuhiro11/gokvm/bootparam"
+	"github.com/define42/gokvm/bootparam"
 )
 
 const (

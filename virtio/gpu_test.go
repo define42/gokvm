@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/bobuhiro11/gokvm/virtio"
+	"github.com/define42/gokvm/virtio"
 )
 
 // Wire-format command/response values, mirrored here so the external test does

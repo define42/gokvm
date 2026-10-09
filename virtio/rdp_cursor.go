@@ -5,8 +5,8 @@ import (
 	"image"
 	"time"
 
-	"github.com/bobuhiro11/gokvm/internal/rdp"
-	"github.com/bobuhiro11/gokvm/internal/rdp/damage"
+	"github.com/define42/gokvm/internal/rdp"
+	"github.com/define42/gokvm/internal/rdp/damage"
 )
 
 type rdpCursorState struct {

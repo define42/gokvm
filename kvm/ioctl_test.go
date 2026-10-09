@@ -4,7 +4,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/bobuhiro11/gokvm/kvm"
+	"github.com/define42/gokvm/kvm"
 )
 
 func TestIoctlEINTRRetry(t *testing.T) {

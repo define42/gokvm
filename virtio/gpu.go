@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bobuhiro11/gokvm/pci"
+	"github.com/define42/gokvm/pci"
 )
 
 // virtio-gpu is a 2D display device on the modern (virtio 1.0) PCI transport.

@@ -15,11 +15,11 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/bobuhiro11/gokvm/iso9660"
-	"github.com/bobuhiro11/gokvm/machine"
-	"github.com/bobuhiro11/gokvm/pvh"
-	"github.com/bobuhiro11/gokvm/term"
-	"github.com/bobuhiro11/gokvm/virtio"
+	"github.com/define42/gokvm/iso9660"
+	"github.com/define42/gokvm/machine"
+	"github.com/define42/gokvm/pvh"
+	"github.com/define42/gokvm/term"
+	"github.com/define42/gokvm/virtio"
 	"golang.org/x/sync/errgroup"
 )
 

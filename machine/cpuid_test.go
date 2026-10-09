@@ -8,7 +8,7 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/bobuhiro11/gokvm/kvm"
+	"github.com/define42/gokvm/kvm"
 )
 
 func TestCPUIDTopologySingleSocket(t *testing.T) {

@@ -1,4 +1,4 @@
-# gokvm [![CI](https://github.com/bobuhiro11/gokvm/actions/workflows/ci.yml/badge.svg)](https://github.com/bobuhiro11/gokvm/actions/workflows/ci.yml) [![Coverage Status](https://coveralls.io/repos/github/bobuhiro11/gokvm/badge.svg?branch=main)](https://coveralls.io/github/bobuhiro11/gokvm?branch=main) [![code lines](https://sloc.xyz/github/bobuhiro11/gokvm?category=code)](https://sloc.xyz/github/bobuhiro11/gokvm?category=code) [![Go Reference](https://pkg.go.dev/badge/github.com/bobuhiro11/gokvm.svg)](https://pkg.go.dev/github.com/bobuhiro11/gokvm) [![Go Report Card](https://goreportcard.com/badge/github.com/bobuhiro11/gokvm)](https://goreportcard.com/report/github.com/bobuhiro11/gokvm)
+# gokvm [![CI](https://github.com/define42/gokvm/actions/workflows/ci.yml/badge.svg)](https://github.com/define42/gokvm/actions/workflows/ci.yml) [![Coverage Status](https://coveralls.io/repos/github/define42/gokvm/badge.svg?branch=main)](https://coveralls.io/github/define42/gokvm?branch=main) [![code lines](https://sloc.xyz/github/define42/gokvm?category=code)](https://sloc.xyz/github/define42/gokvm?category=code) [![Go Reference](https://pkg.go.dev/badge/github.com/define42/gokvm.svg)](https://pkg.go.dev/github.com/define42/gokvm) [![Go Report Card](https://goreportcard.com/badge/github.com/define42/gokvm)](https://goreportcard.com/report/github.com/define42/gokvm)
 
 
 gokvm is a hypervisor that uses KVM as an acceleration.
@@ -27,11 +27,11 @@ The latest version supports the following features:
 
 **This is an experimental project, so please do not use it in production.**
 
-![demo](https://raw.githubusercontent.com/bobuhiro11/gokvm/main/demo.gif)
+![demo](demo.gif)
 
 ## CLI
 
-Extract the latest release from [the Github Release tab](https://github.com/bobuhiro11/gokvm/releases) and run it.
+Extract the latest release from [the Github Release tab](https://github.com/define42/gokvm/releases) and run it.
 Before running, make sure /dev/kvm exists.
 You can use existing bzImage and initrd, or you can create them using the Makefile of this project.
 
@@ -71,8 +71,8 @@ Slax can boot directly from its ISO with its normal graphical startup:
 Run `make slax` to build gokvm with the software-only pure-Go H.264 encoder and
 boot the local `slax.iso` with two guest CPUs, 2 GB of memory, user-mode
 networking, and H.264 RDP listening on `127.0.0.1:3390`. It requests four
-parallel encoder slices, bounded by the available CPU budget. The server needs
-no native H.264 library.
+encoder slices, bounded by the existing host-budget calculation. The bundled
+codec emits those slices sequentially and needs no native H.264 library.
 
 With `make slax` running, use `make rdp` in another terminal to open FreeRDP and
 connect to `127.0.0.1:3390` with automatic resizing. Run `make freerdp` first to
@@ -209,13 +209,13 @@ add `sh "$HOME/.local/bin/gokvm-resize" &` before the line that starts Fluxbox i
 
 #### H.264 graphics
 
-The server uses the pure-Go [go.264](https://github.com/oops1/go.264) encoder for
+The server uses the bundled pure-Go OpenH264 port in [`pkg/h264`](pkg/h264) for
 H.264/AVC420 over the RDP graphics pipeline. It needs no C compiler,
-`pkg-config`, or native codec library. A normal build includes AVC420 support;
-the software-only build below also excludes go.264's optional hardware backends:
+`pkg-config`, native codec library, or special build tag. A normal build includes
+AVC420 support:
 
 ```bash
-CGO_ENABLED=0 go build -tags go264_nohwaccel -o gokvm .
+CGO_ENABLED=0 go build -o gokvm .
 ./gokvm boot -iso ./TinyCore-current.iso -rdp 127.0.0.1:3389 -rdp-h264 -m 512M
 ```
 
@@ -268,15 +268,14 @@ The server logs `using pure-Go H.264 AVC420 graphics` after negotiation. Clients
 without AVC420 support receive bitmap updates automatically. The server does not
 load a shared codec library, and AVC420 is available in normal builds.
 
-go.264 can divide a frame into slices and process those slices in parallel. The
-default `-rdp-h264-threads 0` requests up to two slices. Explicit values from 1
-to 16 request a slice count; `-rdp-h264-threads 1` requests one slice. The count
-is fixed for the session and bounded by the Go runtime CPU limit minus the guest
-vCPU count and one CPU for host work, including audio, with a minimum of one
-slice. This is a parallel slice count, not a strict worker cap: the Go scheduler
-decides how many encoder goroutines run simultaneously, and small pictures may
-use fewer slices. Frames remain ordered, and a slow client receives the latest
-frame without building a queue.
+The bundled OpenH264 port can divide a frame into slices, which it encodes
+sequentially on the calling goroutine. The default `-rdp-h264-threads 0` requests
+up to two slices. Explicit values from 1 to 16 request a slice count;
+`-rdp-h264-threads 1` requests one slice. The count is fixed for the session and
+bounded by the existing calculation using the Go runtime CPU limit, guest vCPU
+count, and one CPU for host work, with a minimum of one slice. The codec may use
+fewer slices for small pictures. Frames remain ordered, and a slow client
+receives the latest frame without building a queue.
 
 Use `-rdp-stats` to log performance measurements every five seconds while frames
 are active, plus a summary when the client disconnects. Statistics include frame
@@ -291,10 +290,12 @@ default and also work with bitmap RDP. For example:
 ```
 
 Try slice counts of 1, 2, and 4 while scrolling the same page, then compare
-encoding time and responsiveness. More slices can help when encoding is the
-bottleneck; guest rendering, color conversion, and client acknowledgement waits
-can also limit frame rate. These options require no changes to the RDP client
-command. `-rdp-h264-threads` requires `-rdp-h264`; `-rdp-stats` requires `-rdp`.
+encoding time, payload size, and responsiveness. Because this codec processes
+slices sequentially, extra slices can add overhead and reduce compression; one
+slice is the usual performance choice. Guest rendering, color conversion, and
+client acknowledgement waits can also limit frame rate. These options require no
+changes to the RDP client command. `-rdp-h264-threads` requires `-rdp-h264`;
+`-rdp-stats` requires `-rdp`.
 
 AVC420 uses lossy YUV 4:2:0 compression and software encoding, so small colored
 text can be softer than bitmap output. AVC444 and hardware encoding are not
@@ -357,18 +358,18 @@ go test ./internal/rdp ./virtio ./flag ./vmm -short
 go test -race ./internal/rdp ./virtio ./vmm -run 'Test(RDP|GPU|Modern|Framebuffer|SerialMirror)'
 ```
 
-Run the pure-Go encoder roundtrip and graphics pipeline tests without cgo or
-hardware-backend probing:
+Run the bundled pure-Go encoder roundtrip and graphics pipeline tests without
+cgo:
 
 ```bash
-CGO_ENABLED=0 go test -tags go264_nohwaccel -short ./internal/rdp/... ./virtio ./vmm ./flag
+CGO_ENABLED=0 go test -short ./internal/rdp/... ./virtio ./vmm ./flag
 ```
 
 ## Go package
 
 This project includes a thin wrapper for the KVM API using ioctl. Please refer to the following link to use it.
 
-https://pkg.go.dev/github.com/bobuhiro11/gokvm
+https://pkg.go.dev/github.com/define42/gokvm
 
 ## Reference
 

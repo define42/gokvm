@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/bobuhiro11/gokvm/pci"
+	"github.com/define42/gokvm/pci"
 )
 
 func TestGetDeviceHeader(t *testing.T) {

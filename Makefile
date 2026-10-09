@@ -116,7 +116,7 @@ tinycore: gokvm
 
 .PHONY: slax
 slax: generate
-	CGO_ENABLED=0 $(GO) build -tags go264_nohwaccel -o gokvm .
+	CGO_ENABLED=0 $(GO) build -o gokvm .
 	./gokvm boot -iso ./slax.iso -m 2G -net user -rdp 127.0.0.1:3390 \
 		-rdp-h264 -rdp-h264-threads 4
 

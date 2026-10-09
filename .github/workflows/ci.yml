@@ -107,19 +107,19 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y ffmpeg
-    - name: Build pure-Go AVC without cgo
+    - name: Build bundled pure-Go AVC without cgo
       env:
         CGO_ENABLED: '0'
-      run: go build -tags go264_nohwaccel ./...
-    - name: Test pure-Go AVC and RDP without cgo
+      run: go build ./...
+    - name: Test bundled pure-Go AVC and RDP without cgo
       env:
         CGO_ENABLED: '0'
-      run: go test -tags go264_nohwaccel -short ./internal/rdp/... ./virtio ./vmm ./flag
+      run: go test -short ./internal/rdp/... ./virtio ./vmm ./flag
     - name: Check AVC and RDP concurrency
       run: |
         go test -race ./internal/audio
-        go test -tags go264_nohwaccel -race ./internal/rdp/...
-        go test -tags go264_nohwaccel -race ./virtio ./vmm -run 'Test(RDP|GPU|MultiDisplay|Audio|Sound|Modern|Framebuffer|SerialMirror)'
+        go test -race ./internal/rdp/...
+        go test -race ./virtio ./vmm -run 'Test(RDP|GPU|MultiDisplay|Audio|Sound|Modern|Framebuffer|SerialMirror)'
 
   deploy:
     runs-on: ubuntu-22.04

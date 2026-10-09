@@ -3,7 +3,7 @@ package cpuid_test
 import (
 	"testing"
 
-	"github.com/bobuhiro11/gokvm/cpuid"
+	"github.com/define42/gokvm/cpuid"
 )
 
 func TestCPUID(t *testing.T) {

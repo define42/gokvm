@@ -6,8 +6,8 @@ var errRDPThreads = errors.New("rdp: H.264 slice count must be 0..16; nonzero re
 
 const rdpAutoSlices = 2
 
-// rdpEncoderSlices bounds the requested slice count using the host CPU budget.
-// Small hosts still get one slice. The Go scheduler controls actual CPU use.
+// rdpEncoderSlices bounds the requested slice count using the existing host
+// budget calculation. Small hosts still get one slice.
 func rdpEncoderSlices(cpus, guestCPUs, limit int) int {
 	if limit == 0 {
 		limit = rdpAutoSlices

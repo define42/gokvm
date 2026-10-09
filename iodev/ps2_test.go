@@ -4,7 +4,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/bobuhiro11/gokvm/iodev"
+	"github.com/define42/gokvm/iodev"
 )
 
 type ps2IRQCounter struct {

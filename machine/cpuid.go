@@ -3,7 +3,7 @@ package machine
 import (
 	"math/bits"
 
-	"github.com/bobuhiro11/gokvm/kvm"
+	"github.com/define42/gokvm/kvm"
 )
 
 func (m *Machine) initCPUID(cpu int) error {

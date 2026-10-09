@@ -7,16 +7,16 @@ import (
 	"time"
 )
 
-// BenchmarkThreadedDesktop includes persistent RGB-to-I420 conversion and H.264
+// BenchmarkSlicedDesktop includes persistent RGB-to-I420 conversion and H.264
 // encoding. It alternates two deterministic desktop views, either scrolling the
 // main content pane by eight pixels or changing a small widget. The timing and
-// compressed size metrics separate CPU savings from slice overhead. Only two
-// RGBA images and one encoder are retained at a time.
-func BenchmarkThreadedDesktop(b *testing.B) {
+// compressed size metrics show the overhead and output-size effect of sequential
+// slices. Only two RGBA images and one encoder are retained at a time.
+func BenchmarkSlicedDesktop(b *testing.B) {
 	for _, workload := range []string{"Scroll", "Widget"} {
 		for _, threads := range []int{1, 2, 4} {
 			b.Run(fmt.Sprintf("1080p/%s/%dSlices", workload, threads), func(b *testing.B) {
-				frames, regions := threadedDesktopFrames(1920, 1080, workload == "Scroll")
+				frames, regions := slicedDesktopFrames(1920, 1080, workload == "Scroll")
 				encoder, err := NewEncoderWithOptions(1920, 1080, Options{Threads: threads, Measure: true})
 				if err != nil {
 					b.Fatal(err)
@@ -48,7 +48,7 @@ func BenchmarkThreadedDesktop(b *testing.B) {
 	}
 }
 
-func threadedDesktopFrames(width, height int, scroll bool) ([2]*image.RGBA, []image.Rectangle) {
+func slicedDesktopFrames(width, height int, scroll bool) ([2]*image.RGBA, []image.Rectangle) {
 	region := image.Rect(224, 80, width-32, height-32)
 	if !scroll {
 		region = image.Rect(256, 96, 320, 128)

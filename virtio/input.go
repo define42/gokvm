@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bobuhiro11/gokvm/pci"
+	"github.com/define42/gokvm/pci"
 )
 
 const (

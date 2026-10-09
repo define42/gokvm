@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/bobuhiro11/gokvm/iodev"
-	"github.com/bobuhiro11/gokvm/kvm"
-	"github.com/bobuhiro11/gokvm/pci"
-	"github.com/bobuhiro11/gokvm/serial"
+	"github.com/define42/gokvm/iodev"
+	"github.com/define42/gokvm/kvm"
+	"github.com/define42/gokvm/pci"
+	"github.com/define42/gokvm/serial"
 )
 
 func TestAbsentLegacyIOPorts(t *testing.T) {

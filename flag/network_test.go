@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/bobuhiro11/gokvm/flag"
+	"github.com/define42/gokvm/flag"
 )
 
 func TestNetworkOptions(t *testing.T) {

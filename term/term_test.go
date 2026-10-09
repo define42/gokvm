@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/bobuhiro11/gokvm/term"
+	"github.com/define42/gokvm/term"
 	"golang.org/x/sys/unix"
 )
 

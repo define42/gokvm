@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bobuhiro11/gokvm/internal/rdp/avc"
+	"github.com/define42/gokvm/internal/rdp/avc"
 )
 
 var _ ConsoleDisplay = (*RDPDisplay)(nil)

@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/bobuhiro11/gokvm/serial"
+	"github.com/define42/gokvm/serial"
 )
 
 type mockInjector struct{}

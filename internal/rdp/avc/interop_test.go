@@ -8,7 +8,7 @@ import (
 )
 
 // TestFFmpegCompatibility keeps an independent decoder in CI so matching bugs
-// in go.264's encoder and decoder cannot make all interoperability tests pass.
+// in the bundled OpenH264 encoder and decoder cannot hide interoperability failures.
 func TestFFmpegCompatibility(t *testing.T) {
 	t.Parallel()
 	ffmpeg, err := exec.LookPath("ffmpeg")

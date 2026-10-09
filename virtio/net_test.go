@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bobuhiro11/gokvm/virtio"
+	"github.com/define42/gokvm/virtio"
 )
 
 type mockInjector struct {
