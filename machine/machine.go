@@ -150,6 +150,7 @@ type Machine struct {
 	kvmFile        *os.File
 	vcpuFds        []uintptr
 	mem            []byte
+	memMapping     []byte // Original allocation, including guest RAM alignment padding.
 	runs           []*kvm.RunData
 	pci            *pci.PCI
 	serial         *serial.Serial
@@ -209,11 +210,7 @@ func New(kvmPath string, nCpus int, memSize int) (*Machine, error) {
 		}
 	}
 
-	// Another coding anti-pattern reguired by golangci-lint.
-	// Would not pass review in Google.
-	if m.mem, err = syscall.Mmap(-1, 0, memSize,
-		syscall.PROT_READ|syscall.PROT_WRITE,
-		syscall.MAP_SHARED|syscall.MAP_ANONYMOUS); err != nil {
+	if m.memMapping, m.mem, err = mapGuestMemory(memSize); err != nil {
 		return m, err
 	}
 
@@ -910,44 +907,6 @@ func (m *Machine) initSregs(vcpufd uintptr, amd64 bool) error {
 	sregs.DS, sregs.ES, sregs.FS, sregs.GS, sregs.SS = seg, seg, seg, seg, seg
 
 	if err := kvm.SetSregs(vcpufd, sregs); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (m *Machine) initCPUID(cpu int) error {
-	cpuid := kvm.CPUID{
-		Nent:    100,
-		Entries: make([]kvm.CPUIDEntry2, 100),
-	}
-
-	if err := kvm.GetSupportedCPUID(m.kvmFd, &cpuid); err != nil {
-		return err
-	}
-
-	// https://www.kernel.org/doc/html/latest/virt/kvm/cpuid.html
-	for i := 0; i < int(cpuid.Nent); i++ {
-		switch cpuid.Entries[i].Function {
-		case kvm.CPUIDFuncPerMon:
-			cpuid.Entries[i].Eax = 0 // disable
-
-		case kvm.CPUIDSignature:
-			cpuid.Entries[i].Eax = kvm.CPUIDFeatures
-			cpuid.Entries[i].Ebx = 0x4b4d564b // KVMK
-			cpuid.Entries[i].Ecx = 0x564b4d56 // VMKV
-			cpuid.Entries[i].Edx = 0x4d       // M
-
-		case 7:
-			// Unset X86_FEATURE_FSRM (Fast Short Rep Mov)
-			cpuid.Entries[i].Edx &= ^(uint32(1) << 4)
-
-		default:
-			continue
-		}
-	}
-
-	if err := kvm.SetCPUID2(m.vcpuFds[cpu], &cpuid); err != nil {
 		return err
 	}
 

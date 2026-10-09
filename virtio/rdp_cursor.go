@@ -151,7 +151,7 @@ func (d *RDPDisplay) rememberPointerMotion(session *rdp.Session, x, y int) {
 
 // Do not send a delayed guest echo back to the client moving its local cursor.
 // Consuming the matched history still allows subsequent guest warps to that
-// same position to be sent, and other viewers receive every latest position.
+// same position to be sent.
 func (d *RDPDisplay) consumePointerMotionLocked(x, y int) *rdp.Session {
 	for i := len(d.motions) - 1; i >= 0; i-- {
 		motion := d.motions[i]
@@ -172,27 +172,8 @@ func (d *RDPDisplay) consumePointerMotionLocked(x, y int) *rdp.Session {
 }
 
 func (w *rdpFrameWriter) updatePointer(cursor rdpCursorState, guestWidth, guestHeight int) error {
-	return w.pointer.update(rdpScheduledPointer{w, w.session}, w.session,
+	return w.pointer.update(w.session, w.session,
 		cursor, guestWidth, guestHeight, w.width, w.height)
-}
-
-// A slow control write must not keep this client at the head of the encoder
-// admission queue. No-op and input-echo cursor updates retain their position.
-type rdpScheduledPointer struct {
-	writer *rdpFrameWriter
-	sink   rdpPointerSink
-}
-
-func (p rdpScheduledPointer) WritePointer(shape *image.RGBA, x, y int) error {
-	p.writer.cancelWorkerWait()
-
-	return p.sink.WritePointer(shape, x, y)
-}
-
-func (p rdpScheduledPointer) WritePointerPosition(x, y int) error {
-	p.writer.cancelWorkerWait()
-
-	return p.sink.WritePointerPosition(x, y)
 }
 
 func (p *rdpPointerWriter) update(

@@ -50,6 +50,7 @@ func TestRDPDisplayRequiresTLSSecurity(t *testing.T) {
 			t.Fatalf("protocols %#x: got negotiation response %x, want SSL_REQUIRED_BY_SERVER", requested, response)
 		}
 		assertRDPConnectionClosed(t, conn)
+		waitRDPClientCount(t, d, 0)
 	}
 }
 
@@ -71,6 +72,10 @@ func TestRDPDisplayTLSMinimumVersionAndCertificate(t *testing.T) {
 	if state.Version < tls.VersionTLS12 || len(state.VerifiedChains) == 0 {
 		t.Fatalf("unverified or obsolete TLS connection: version %#x, chains %d", state.Version, len(state.VerifiedChains))
 	}
+	if err := secured.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitRDPClientCount(t, d, 0)
 
 	oldConn := dialRDPTestDisplay(t, d)
 	negotiateRDPTestDisplay(t, oldConn, 1)
@@ -85,34 +90,39 @@ func TestRDPDisplayTLSMinimumVersionAndCertificate(t *testing.T) {
 func TestRDPDisplayCloseInterruptsStalledHandshakes(t *testing.T) {
 	t.Parallel()
 
-	d := newRDPTestDisplay(t)
 	// Cover a client that sends nothing, one stalled after RDP security
 	// negotiation, and one that completes TLS but never sends MCS Connect Initial.
-	beforeNegotiation := dialRDPTestDisplay(t, d)
-	beforeTLS := dialRDPTestDisplay(t, d)
-	negotiateRDPTestDisplay(t, beforeTLS, 1)
-	beforeMCS := dialRDPTestDisplay(t, d)
-	negotiateRDPTestDisplay(t, beforeMCS, 1)
-	secured := tls.Client(beforeMCS, rdpTestClientTLS(t, d))
-	if err := secured.Handshake(); err != nil {
-		t.Fatal(err)
-	}
-	waitRDPClientCount(t, d, 3)
+	for _, stage := range []string{"negotiation", "TLS", "MCS"} {
+		t.Run(stage, func(t *testing.T) {
+			t.Parallel()
+			d := newRDPTestDisplay(t)
+			conn := dialRDPTestDisplay(t, d)
+			if stage != "negotiation" {
+				negotiateRDPTestDisplay(t, conn, 1)
+			}
+			if stage == "MCS" {
+				secured := tls.Client(conn, rdpTestClientTLS(t, d))
+				if err := secured.Handshake(); err != nil {
+					t.Fatal(err)
+				}
+				conn = secured
+			}
+			waitRDPClientCount(t, d, 1)
 
-	closed := make(chan error, 1)
-	go func() { closed <- d.Close() }()
-	select {
-	case err := <-closed:
-		if err != nil {
-			t.Fatalf("Close: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Close waited for stalled handshakes")
+			closed := make(chan error, 1)
+			go func() { closed <- d.Close() }()
+			select {
+			case err := <-closed:
+				if err != nil {
+					t.Fatalf("Close: %v", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("Close waited for stalled handshake")
+			}
+			assertRDPConnectionClosed(t, conn)
+			waitRDPClientCount(t, d, 0)
+		})
 	}
-	for _, conn := range []net.Conn{beforeNegotiation, beforeTLS, secured} {
-		assertRDPConnectionClosed(t, conn)
-	}
-	waitRDPClientCount(t, d, 0)
 }
 
 func TestRDPDisplayMalformedClientsDoNotStopListener(t *testing.T) {
@@ -128,6 +138,7 @@ func TestRDPDisplayMalformedClientsDoNotStopListener(t *testing.T) {
 		conn := dialRDPTestDisplay(t, d)
 		writeRDPTest(t, conn, packet)
 		assertRDPConnectionClosed(t, conn)
+		waitRDPClientCount(t, d, 0)
 	}
 
 	// A client that sends malformed MCS over valid TLS also must not affect
@@ -140,6 +151,7 @@ func TestRDPDisplayMalformedClientsDoNotStopListener(t *testing.T) {
 	}
 	writeRDPTest(t, secured, []byte{3, 0, 0, 7, 2, 0xf0, 0x80})
 	assertRDPConnectionClosed(t, secured)
+	waitRDPClientCount(t, d, 0)
 
 	healthy := dialRDPTestDisplay(t, d)
 	response := negotiateRDPTestDisplay(t, healthy, 1)
@@ -151,28 +163,34 @@ func TestRDPDisplayMalformedClientsDoNotStopListener(t *testing.T) {
 	}
 }
 
-func TestRDPDisplayLimitsAndReleasesClientSlots(t *testing.T) {
+func TestRDPDisplayRejectsSecondClientAndReusesSlot(t *testing.T) {
 	t.Parallel()
 
 	d := newRDPTestDisplay(t)
-	clients := make([]net.Conn, rdpMaxClients)
-	for i := range clients {
-		clients[i] = dialRDPTestDisplay(t, d)
-		negotiateRDPTestDisplay(t, clients[i], 1)
-	}
-	waitRDPClientCount(t, d, rdpMaxClients)
+	first := dialRDPTestDisplay(t, d)
+	negotiateRDPTestDisplay(t, first, 1)
+	waitRDPClientCount(t, d, 1)
 
 	excess := dialRDPTestDisplay(t, d)
 	assertRDPConnectionClosed(t, excess)
-	if err := clients[0].Close(); err != nil {
+	waitRDPClientCount(t, d, 1)
+	// Rejecting another viewer must leave the admitted connection usable.
+	secured := tls.Client(first, rdpTestClientTLS(t, d))
+	if err := secured.Handshake(); err != nil {
+		t.Fatalf("existing client disrupted by rejected connection: %v", err)
+	}
+	if err := secured.Close(); err != nil {
 		t.Fatal(err)
 	}
-	waitRDPClientCount(t, d, rdpMaxClients-1)
+	waitRDPClientCount(t, d, 0)
 
 	replacement := dialRDPTestDisplay(t, d)
 	response := negotiateRDPTestDisplay(t, replacement, 1)
 	if response[11] != 2 {
 		t.Fatalf("client slot was not reusable: %x", response)
+	}
+	if err := tls.Client(replacement, rdpTestClientTLS(t, d)).Handshake(); err != nil {
+		t.Fatalf("replacement client could not complete TLS: %v", err)
 	}
 }
 
@@ -254,7 +272,10 @@ func waitRDPClientCount(t *testing.T, d *RDPDisplay, want int) {
 	deadline := time.Now().Add(time.Second)
 	for {
 		d.connMu.Lock()
-		got := len(d.conns)
+		got := 0
+		if d.conn != nil {
+			got = 1
+		}
 		d.connMu.Unlock()
 		if got == want {
 			return

@@ -30,3 +30,8 @@ CLOUDHV.fd
 # Dependency directories (remove the comment below to include it)
 # vendor/
 _linux/
+
+# Local FreeRDP sources, build dependencies, and installed client.
+/tools/.cache/
+/tools/.deps/
+/tools/freerdp/

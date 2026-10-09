@@ -73,14 +73,16 @@ func parseBootArgs(args []string) (*BootArgs, error) {
 		`If empty, no virtio-gpu device is created. (default "")`)
 	bootCmd.StringVar(&c.VNC, "vnc", "", `VNC listen address for virtio-gpu, for example ":5900". `+
 		`If empty, no VNC server is created. (default "")`)
-	bootCmd.StringVar(&c.RDP, "rdp", "", "RDP console listen address, for example 127.0.0.1:3389 (TLS, no authentication)")
+	bootCmd.StringVar(&c.RDP, "rdp", "", "RDP console listen address, for example 127.0.0.1:3389 "+
+		"(one connection at a time, TLS, no authentication)")
 	bootCmd.StringVar(&c.RDPCert, "rdp-cert", "",
 		"RDP TLS certificate PEM file (default: temporary self-signed certificate)")
 	bootCmd.StringVar(&c.RDPKey, "rdp-key", "", "RDP TLS private key PEM file")
 	bootCmd.BoolVar(&c.RDPH264, "rdp-h264", false,
 		"enable OpenH264 AVC420 graphics for compatible RDP clients (requires an openh264 build)")
 	bootCmd.IntVar(&c.RDPH264Threads, "rdp-h264-threads", 0,
-		"OpenH264 encoding workers per client: 0 selects automatically, 1..16 sets a limit (requires -rdp-h264)")
+		"OpenH264 encoder workers: 0 selects up to 2 automatically, "+
+			"1..16 sets a limit within the CPU budget (requires -rdp-h264)")
 	bootCmd.BoolVar(&c.RDPStats, "rdp-stats", false, "log RDP performance statistics every 5 seconds")
 	bootCmd.StringVar(&c.Audio, "audio", "", "audio output: rdp (virtio-snd playback through RDP) or none (default)")
 

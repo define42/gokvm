@@ -79,13 +79,14 @@ func TestRDPCursorSuppressesInputEchoButPreservesWarps(t *testing.T) {
 	if cursor.echo != nil {
 		t.Fatal("a guest warp back to an earlier input position was mistaken for an echo")
 	}
+	d.forgetPointerMotions(first)
 	d.rememberPointerMotion(second, 20, 30)
 	if err := d.SetCursor(DisplayCursor{Image: shape, X: 20, Y: 30}); err != nil {
 		t.Fatal(err)
 	}
 	cursor, _ = d.cursorSnapshot()
 	if cursor.echo != second {
-		t.Fatal("input ownership did not follow the second viewer")
+		t.Fatal("input ownership did not follow the reconnected viewer")
 	}
 	serial := cursor.positionSerial
 	shape.SetRGBA(0, 0, color.RGBA{R: 255, A: 255})

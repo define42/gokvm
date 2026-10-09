@@ -4,13 +4,15 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"unsafe"
 
 	"github.com/bobuhiro11/gokvm/bootparam"
 )
 
 const (
-	maxVCPUs = 64
+	maxVCPUs           = 64
+	mpcTableOffset     = 0x40
+	mpcTableHeaderSize = 44
+	mpcCPUEntrySize    = 20
 
 	// Use the default physical address for the APIC.
 	// https://github.com/torvalds/linux/blob/c5c17547b778975b3d83a73c8d84e8fb5ecf3ba5/arch/x86/include/asm/apicdef.h#L13
@@ -39,7 +41,7 @@ const (
 	mpAPICVersion = uint8(0x14)
 )
 
-var errorVCPUNumExceed = fmt.Errorf("the number of vCPUs must be less than or equal to %d", maxVCPUs)
+var errInvalidVCPUNumber = fmt.Errorf("the number of vCPUs must be between 1 and %d", maxVCPUs)
 
 type (
 	// Extended BIOS Data Area (EBDA).
@@ -70,17 +72,17 @@ type (
 	// MP Configuration Table Header
 	// ported from https://github.com/torvalds/linux/blob/5bfc75d92/arch/x86/include/asm/mpspec_def.h#L37-L49
 	mpcTable struct {
-		signature uint32
-		length    uint16
-		spec      uint8
-		checkSum  uint8
-		OEMId     [8]uint8
-		ProdID    [12]uint8
-		_         uint32 // oemPtr
-		_         uint16 // oemSize
-		oemCount  uint16
-		lapic     uint32 // Local APIC addresss must be set.
-		_         uint32 // reserved
+		signature  uint32
+		length     uint16
+		spec       uint8
+		checkSum   uint8
+		OEMId      [8]uint8
+		ProdID     [12]uint8
+		_          uint32 // oemPtr
+		_          uint16 // oemSize
+		entryCount uint16
+		lapic      uint32 // Local APIC addresss must be set.
+		_          uint32 // reserved
 
 		mpcCPU [maxVCPUs]mpcCPU
 	}
@@ -93,7 +95,9 @@ func (e *EBDA) Bytes() ([]byte, error) {
 		return []byte{}, err
 	}
 
-	return buf.Bytes(), nil
+	// Only publish the configured CPU entries. Zero-filled capacity would be
+	// interpreted by Linux as disabled CPUs available for hotplug.
+	return buf.Bytes()[:mpcTableOffset+int(e.mpcTable.length)], nil
 }
 
 func New(nCPUs int) (*EBDA, error) {
@@ -121,7 +125,7 @@ func newMPFIntel() (*mpfIntel, error) {
 	m.signature = mpfIntelSignature
 	m.length = 1 // this must be 1
 	m.specification = 4
-	m.physPtr = bootparam.EBDAStart + 0x40
+	m.physPtr = bootparam.EBDAStart + mpcTableOffset
 
 	var err error
 
@@ -165,17 +169,17 @@ func apicAddr(apic uint32) uint32 {
 }
 
 func newMPCTable(nCPUs int) (*mpcTable, error) {
+	if nCPUs < 1 || nCPUs > maxVCPUs {
+		return nil, errInvalidVCPUNumber
+	}
+
 	m := &mpcTable{}
 	m.signature = mpcTableSignature
-	m.length = uint16(unsafe.Sizeof(mpcTable{})) // this field must contain the size of entries.
+	m.length = uint16(mpcTableHeaderSize + nCPUs*mpcCPUEntrySize)
 	m.spec = 4
 	m.lapic = apicAddr(0)
 	m.OEMId = [8]byte{0x47, 0x4F, 0x4B, 0x56, 0x4D, 0x00, 0x00, 0x00} // "GOKVM   "
-	m.oemCount = maxVCPUs                                             // This must be the number of entries
-
-	if nCPUs > maxVCPUs {
-		return nil, errorVCPUNumExceed
-	}
+	m.entryCount = uint16(nCPUs)
 
 	var err error
 
@@ -215,7 +219,7 @@ func (m *mpcTable) bytes() ([]byte, error) {
 		return []byte{}, err
 	}
 
-	return buf.Bytes(), nil
+	return buf.Bytes()[:m.length], nil
 }
 
 type mpcCPU struct {

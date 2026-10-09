@@ -1,6 +1,9 @@
 GOLANGCI_LINT_VERSION = v2.12.2
 
 GO ?= $(shell go env GOROOT)/bin/go
+RDP_CLIENT ?= $(shell if [ -x ./tools/freerdp/bin/xfreerdp ]; then \
+	printf '%s\n' ./tools/freerdp/bin/xfreerdp; \
+	else command -v xfreerdp3 2>/dev/null || command -v xfreerdp 2>/dev/null; fi)
 
 export GOPATH := $(shell $(GO) env GOPATH)
 export PATH := $(GOPATH)/bin:$(PATH)
@@ -110,3 +113,28 @@ qemu: initrd bzImage
 .PHONY: tinycore
 tinycore: gokvm
 	./gokvm boot -iso TinyCore-current.iso -vnc 127.0.0.1:5900 -m 512M
+
+.PHONY: slax
+slax: generate
+	CGO_ENABLED=1 $(GO) build -tags openh264 -o gokvm .
+	./gokvm boot -iso ./slax.iso -m 2G -c 2 -net user -rdp 127.0.0.1:3390 \
+		-rdp-h264 -rdp-h264-threads 4
+
+.PHONY: freerdp
+freerdp:
+	./tools/build-freerdp.sh
+
+.PHONY: rdp
+rdp:
+	@client="$(RDP_CLIENT)"; \
+	if ! command -v "$$client" >/dev/null 2>&1; then \
+		echo "FreeRDP client not found; run make freerdp or set RDP_CLIENT=/path/to/xfreerdp." >&2; \
+		exit 1; \
+	fi; \
+	set --; \
+	case "$$("$$client" /buildconfig 2>&1)" in \
+		*WITH_GFX_H264=ON*) set -- /gfx:AVC420 ;; \
+		*) echo "FreeRDP has no H.264 support; connecting with bitmap updates." >&2 ;; \
+	esac; \
+	exec "$$client" /v:127.0.0.1:3390 /sec:tls /u:console /p:console \
+		/cert:ignore /dynamic-resolution "$$@"

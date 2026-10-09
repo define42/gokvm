@@ -37,8 +37,9 @@ var errRDPStatsConfig = errors.New("RDP statistics require an RDP listener")
 // ISO-specific policy. The ISO's own boot config still supplies the distro
 // command line; this list only adds the host/VMM plumbing that a real firmware
 // boot path would normally provide or hide from the guest.
+// Do not add nosmp: the guest must be able to start the vCPUs requested by -c.
 const gokvmDirectLinuxBootParams = "console=tty0 console=ttyS0 earlyprintk=serial " +
-	"noapic noacpi nosmp nortc nowatchdog nmi_watchdog=0 mitigations=off " +
+	"noapic noacpi nortc nowatchdog nmi_watchdog=0 mitigations=off " +
 	"lapic pci=realloc=off virtio_pci.force_legacy=1"
 
 // Config defines the configuration of the

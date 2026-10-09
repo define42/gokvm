@@ -24,22 +24,19 @@ import (
 	rdpdamage "github.com/bobuhiro11/gokvm/internal/rdp/damage"
 )
 
-const (
-	rdpMaxClients  = 8
-	rdpResizeDelay = 150 * time.Millisecond
-)
+const rdpResizeDelay = 150 * time.Millisecond
 
 // RDPConfig selects the server certificate, OpenH264 graphics, and audio playback.
 type RDPConfig struct {
 	TLS         *tls.Config
 	H264        bool
 	Audio       bool
-	H264Threads int // Per-client upper limit; zero chooses a bounded automatic limit.
+	H264Threads int // Encoder worker limit; zero chooses a bounded automatic limit.
 	GuestCPUs   int // Guest vCPUs to reserve when calculating the encoder CPU budget.
 	Stats       bool
 }
 
-// RDPDisplay exports the guest console using TLS-secured RDP bitmap updates.
+// RDPDisplay exports the guest console to one RDP viewer at a time.
 // It is a console server, without account authentication or NLA. Use a trusted
 // network or an authenticated tunnel when allowing access beyond localhost.
 type RDPDisplay struct {
@@ -48,16 +45,15 @@ type RDPDisplay struct {
 	tls            *tls.Config
 	h264           bool
 	h264Threads    int
-	encoderBudget  *rdpEncoderBudget
 	stats          bool
 	audio          *audio.Hub
 	connMu         sync.Mutex
-	conns          map[net.Conn]struct{}
+	conn           net.Conn // Includes an in-progress handshake; guarded by connMu.
 	wg             sync.WaitGroup
 	once           sync.Once
 	resizeMu       sync.Mutex
 	resize         func(int, int) error
-	viewers        []*rdp.Session
+	viewer         *rdp.Session
 	cursorMu       sync.Mutex
 	cursor         rdpCursorState
 	motions        []rdpPointerMotion
@@ -110,9 +106,8 @@ func NewRDPDisplayWithConfig(addr string, options RDPConfig) (*RDPDisplay, error
 
 	display := &RDPDisplay{
 		framebuffer: newFramebuffer(), listener: listener, tls: config,
-		conns: make(map[net.Conn]struct{}), h264: options.H264,
-		h264Threads: options.H264Threads, stats: options.Stats,
-		encoderBudget: newRDPEncoderBudget(runtime.GOMAXPROCS(0), options.GuestCPUs),
+		h264: options.H264, stats: options.Stats,
+		h264Threads: rdpEncoderThreads(runtime.GOMAXPROCS(0), options.GuestCPUs, options.H264Threads),
 	}
 	if options.Audio {
 		display.audio = audio.NewHub()
@@ -128,54 +123,41 @@ func NewRDPDisplayWithConfig(addr string, options RDPConfig) (*RDPDisplay, error
 
 func (d *RDPDisplay) Addr() string { return d.listener.Addr().String() }
 
-// SetResizeHandler attaches the guest GPU. The first connected viewer controls
-// its resolution; other viewers display that shared desktop at their own size.
+// SetResizeHandler attaches the guest GPU. The connected viewer controls its resolution.
 func (d *RDPDisplay) SetResizeHandler(resize func(int, int) error) {
 	d.resizeMu.Lock()
 	defer d.resizeMu.Unlock()
 	d.resize = resize
-	if len(d.viewers) != 0 {
-		d.resizeGuestLocked(d.viewers[0])
+	if d.viewer != nil {
+		d.resizeGuestLocked(d.viewer)
 	}
 }
 
 func (d *RDPDisplay) addResizeViewer(session *rdp.Session) {
 	d.resizeMu.Lock()
 	defer d.resizeMu.Unlock()
-	d.viewers = append(d.viewers, session)
-	if len(d.viewers) == 1 {
-		d.resizeGuestLocked(session)
-	}
+	d.viewer = session
+	d.resizeGuestLocked(session)
 }
 
 func (d *RDPDisplay) removeResizeViewer(session *rdp.Session) {
 	d.forgetPointerMotions(session)
 	d.resizeMu.Lock()
 	defer d.resizeMu.Unlock()
-	for i, viewer := range d.viewers {
-		if viewer != session {
-			continue
-		}
-		copy(d.viewers[i:], d.viewers[i+1:])
-		d.viewers[len(d.viewers)-1] = nil
-		d.viewers = d.viewers[:len(d.viewers)-1]
-		if i == 0 && len(d.viewers) != 0 {
-			d.resizeGuestLocked(d.viewers[0])
-		}
-
-		return
+	if d.viewer == session {
+		d.viewer = nil
 	}
 }
 
 func (d *RDPDisplay) resizeGuest(session *rdp.Session) {
 	d.resizeMu.Lock()
 	defer d.resizeMu.Unlock()
-	if len(d.viewers) != 0 && d.viewers[0] == session {
+	if d.viewer == session {
 		d.resizeGuestLocked(session)
 	}
 }
 
-// resizeMu orders GPU mode requests against controller disconnect/handoff.
+// resizeMu orders GPU mode requests against viewer disconnects.
 // The callback must not call back into viewer management.
 func (d *RDPDisplay) resizeGuestLocked(session *rdp.Session) {
 	if d.resize != nil {
@@ -202,8 +184,8 @@ func (d *RDPDisplay) Close() error {
 		}
 		err = d.listener.Close()
 		d.connMu.Lock()
-		for conn := range d.conns {
-			_ = conn.Close()
+		if d.conn != nil {
+			_ = d.conn.Close()
 		}
 		d.connMu.Unlock()
 		d.wg.Wait()
@@ -229,13 +211,13 @@ func (d *RDPDisplay) acceptLoop() {
 			return
 		default:
 		}
-		if len(d.conns) >= rdpMaxClients {
+		if d.conn != nil {
 			d.connMu.Unlock()
 			_ = conn.Close()
 
 			continue
 		}
-		d.conns[conn] = struct{}{}
+		d.conn = conn
 		d.wg.Add(1)
 		d.connMu.Unlock()
 		go d.handleConn(conn)
@@ -247,7 +229,7 @@ func (d *RDPDisplay) handleConn(conn net.Conn) {
 	defer func() {
 		_ = conn.Close()
 		d.connMu.Lock()
-		delete(d.conns, conn)
+		d.conn = nil
 		d.connMu.Unlock()
 	}()
 
@@ -399,8 +381,8 @@ func (d *RDPDisplay) writeFrames(
 	}
 	writer := &rdpFrameWriter{
 		session: session, bitmap: bitmap, width: width, height: height, force: true,
-		budget: d.encoderBudget, threadLimit: d.h264Threads,
-		stats: rdpFrameStats{enabled: d.stats, peer: conn.RemoteAddr().String()},
+		threads: d.h264Threads,
+		stats:   rdpFrameStats{enabled: d.stats, peer: conn.RemoteAddr().String()},
 	}
 	writer.stats.start = writer.stats.begin()
 	defer writer.shutdown()
@@ -421,7 +403,6 @@ func (d *RDPDisplay) writeFrames(
 	// the timer for a pending frame; idle clients need no periodic polling.
 	for {
 		if resizeReady && session.DisplayReady() {
-			writer.cancelWorkerWait()
 			resized, resizeErr := session.Resize(pending.Width, pending.Height)
 			if resizeErr != nil {
 				return resizeErr
@@ -450,15 +431,12 @@ func (d *RDPDisplay) writeFrames(
 		var paced <-chan time.Time
 		pendingFrame := changed && session.DisplayReady() && !suppressed.Load()
 		ackBlocked := pendingFrame && writer.graphics && !session.GraphicsCanSend()
-		writer.workerReady = nil
-		writer.stats.waiting(ackBlocked, false, writer.nextFrame)
+		writer.stats.waiting(ackBlocked, writer.nextFrame)
 		if pendingFrame && !ackBlocked {
 			paced, err = writer.writeWhenReady(d.framebuffer, timer)
 			if err != nil {
 				return err
 			}
-		} else {
-			writer.budget.cancel(&writer.workerRequest)
 		}
 		writer.stats.report(writer.actualThreads(), false)
 
@@ -481,32 +459,25 @@ func (d *RDPDisplay) writeFrames(
 			resizeDue = nil
 			resizeReady = true
 		case <-paced:
-		case <-writer.workerReady:
 		}
 		timer.Stop()
 	}
 }
 
 type rdpFrameWriter struct {
-	session         *rdp.Session
-	bitmap          *rdp.BitmapEncoder
-	avc             *avc.Encoder
-	frame           vncFrame
-	width           int
-	height          int
-	graphics        bool
-	sequence        uint64
-	force           bool
-	nextFrame       time.Time
-	pointer         rdpPointerWriter
-	budget          *rdpEncoderBudget
-	threadLimit     int
-	threadTarget    int
-	encoderTarget   int
-	reservedWorkers int
-	workerReady     <-chan struct{}
-	workerRequest   rdpWorkerRequest
-	stats           rdpFrameStats
+	session   *rdp.Session
+	bitmap    *rdp.BitmapEncoder
+	avc       *avc.Encoder
+	frame     vncFrame
+	width     int
+	height    int
+	graphics  bool
+	sequence  uint64
+	force     bool
+	nextFrame time.Time
+	pointer   rdpPointerWriter
+	threads   int
+	stats     rdpFrameStats
 }
 
 // Encoders retain geometry and the previous frame. Discard both after a resize
@@ -534,20 +505,9 @@ func (w *rdpFrameWriter) updateSize() error {
 
 func (w *rdpFrameWriter) writeWhenReady(display *framebuffer, timer *time.Timer) (<-chan time.Time, error) {
 	if delay := time.Until(w.nextFrame); delay > 0 {
-		w.budget.cancel(&w.workerRequest)
 		timer.Reset(delay)
 
 		return timer.C, nil
-	}
-	if w.graphics {
-		w.reservedWorkers, w.workerReady = w.budget.tryAcquire(w.threadLimit, &w.workerRequest)
-		if w.reservedWorkers == 0 {
-			w.stats.waiting(false, true, time.Time{})
-
-			return nil, nil //nolint:nilnil // Wait on workerReady without capturing an obsolete frame.
-		}
-		w.threadTarget = w.reservedWorkers
-		defer w.releaseWorkers()
 	}
 	w.nextFrame = time.Now().Add(w.frameInterval())
 	start := w.stats.begin()
@@ -572,11 +532,8 @@ func (w *rdpFrameWriter) updateGraphics(conn net.Conn) bool {
 	}
 	w.graphics = ready
 	if ready {
-		w.budget.viewer(1)
 		log.Printf("rdp: client %s using OpenH264 AVC420 graphics", conn.RemoteAddr())
 	} else {
-		w.budget.cancel(&w.workerRequest)
-		w.budget.viewer(-1)
 		w.close()
 	}
 
@@ -599,23 +556,8 @@ func (w *rdpFrameWriter) close() {
 }
 
 func (w *rdpFrameWriter) shutdown() {
-	w.budget.cancel(&w.workerRequest)
-	w.releaseWorkers()
 	w.stats.report(w.actualThreads(), true)
 	w.close()
-	if w.graphics {
-		w.budget.viewer(-1)
-	}
-}
-
-func (w *rdpFrameWriter) releaseWorkers() {
-	w.budget.release(w.reservedWorkers)
-	w.reservedWorkers = 0
-}
-
-func (w *rdpFrameWriter) cancelWorkerWait() {
-	w.budget.cancel(&w.workerRequest)
-	w.stats.waiting(false, false, time.Time{})
 }
 
 func (w *rdpFrameWriter) actualThreads() int {
@@ -651,22 +593,19 @@ func (w *rdpFrameWriter) write(frame vncFrame, damage []image.Rectangle, force b
 
 		return err == nil, err
 	}
-	if w.avc == nil || w.encoderTarget != max(1, w.threadTarget) {
-		w.close()
+	if w.avc == nil {
 		width, height := w.session.Size()
 		encoder, err := avc.NewEncoderWithOptions(width, height, avc.Options{
-			Threads: max(1, w.threadTarget), Measure: w.stats.enabled,
+			Threads: max(1, w.threads), Measure: w.stats.enabled,
 		})
 		if err != nil {
 			return false, err
 		}
 		w.avc = encoder
-		w.encoderTarget = max(1, w.threadTarget)
-		force = true // Changing slice/worker configuration starts a new reference chain.
-		log.Printf("rdp: client %s OpenH264 workers=%d requested=%d", w.stats.peer, encoder.Threads(), w.encoderTarget)
+		force = true // A new encoder starts an independent reference chain.
+		log.Printf("rdp: client %s OpenH264 workers=%d requested=%d", w.stats.peer, encoder.Threads(), max(1, w.threads))
 	}
 	data, err := w.avc.EncodeDamage(img, damage, force)
-	w.releaseWorkers() // Network backpressure must not reserve encoder CPUs.
 	if w.stats.enabled {
 		stats := w.avc.LastStats()
 		w.stats.convert.add(stats.Conversion)

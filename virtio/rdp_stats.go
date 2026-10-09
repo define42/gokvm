@@ -61,7 +61,6 @@ type rdpFrameStats struct {
 	encode  rdpStageTime
 	write   rdpStageTime
 	ack     rdpWaitTime
-	workers rdpWaitTime
 }
 
 func (s *rdpFrameStats) begin() time.Time {
@@ -80,14 +79,13 @@ func (s *rdpFrameStats) elapsed(start time.Time) time.Duration {
 	return time.Since(start)
 }
 
-func (s *rdpFrameStats) waiting(ack, workers bool, nextFrame time.Time) {
+func (s *rdpFrameStats) waiting(ack bool, nextFrame time.Time) {
 	if s.enabled {
 		now := time.Now()
 		s.ack.update(ack, now)
 		if ack && s.ack.start.Before(nextFrame) {
 			s.ack.start = nextFrame
 		}
-		s.workers.update(workers, now)
 	}
 }
 
@@ -110,15 +108,14 @@ func (s *rdpFrameStats) report(threads int, final bool) {
 		return
 	}
 	s.ack.update(!s.ack.start.IsZero(), now)
-	s.workers.update(!s.workers.start.IsZero(), now)
-	if s.frames != 0 || s.ack.total != 0 || s.workers.total != 0 {
+	if s.frames != 0 || s.ack.total != 0 {
 		log.Printf("rdp: stats client=%s threads=%d frames=%d payload_bytes=%d elapsed=%.2fs "+
-			"avg/max copy=%s convert=%s encode=%s write=%s ack_wait=%s worker_wait=%s",
+			"avg/max copy=%s convert=%s encode=%s write=%s ack_wait=%s",
 			s.peer, threads, s.frames, s.bytes, now.Sub(s.start).Seconds(),
-			s.copy, s.convert, s.encode, s.write, s.ack.total.Round(time.Millisecond), s.workers.total.Round(time.Millisecond))
+			s.copy, s.convert, s.encode, s.write, s.ack.total.Round(time.Millisecond))
 	}
 	*s = rdpFrameStats{
 		enabled: true, peer: s.peer, start: now,
-		ack: rdpWaitTime{start: s.ack.start}, workers: rdpWaitTime{start: s.workers.start},
+		ack: rdpWaitTime{start: s.ack.start},
 	}
 }

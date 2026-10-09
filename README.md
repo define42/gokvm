@@ -68,6 +68,21 @@ Slax can boot directly from its ISO with its normal graphical startup:
 ./gokvm boot -iso ./slax.iso -m 2G -rdp 127.0.0.1:3390
 ```
 
+Run `make slax` to build gokvm with OpenH264 and boot the local `slax.iso` with
+two guest CPUs, 2 GB of memory, user-mode networking, and H.264 RDP listening on
+`127.0.0.1:3390`. It requests four encoder threads, bounded by the available CPU
+budget. Install the dependencies listed under
+[OpenH264 graphics](#openh264-graphics) first.
+
+With `make slax` running, use `make rdp` in another terminal to open FreeRDP and
+connect to `127.0.0.1:3390` with automatic resizing. Run `make freerdp` first to
+build the local H.264 client using the [dependencies below](#openh264-graphics).
+`make rdp` prefers `tools/freerdp/bin/xfreerdp` and enables AVC420. Without the
+local build, it finds `xfreerdp3` or `xfreerdp` on your PATH and reports a fallback
+to bitmap updates if that client lacks H.264. To use a custom client, run
+`make rdp RDP_CLIENT=/path/to/xfreerdp`. The local connection accepts the
+console's self-signed TLS certificate.
+
 The Slackware-based Slax image with Linux 6.1.38 has been tested through to the
 desktop. Keep the ISO's default boot parameters; no extracted kernel, custom
 initrd, or driver blacklist is needed. For AVC420, build with the `openh264` tag
@@ -136,6 +151,10 @@ values and are not checked. TLS encrypts the connection; it does not restrict wh
 can control the VM. Keep the listener on loopback and use an authenticated SSH
 tunnel for access from another machine.
 
+The server accepts one RDP connection at a time, including during the handshake.
+Additional connections are rejected; a new client can connect after the current
+connection closes.
+
 The RDP session uses the client's requested desktop size and supports live
 single-monitor resizing. By default it sends uncompressed bitmap updates with
 16-, 24-, or 32-bit color. The optional OpenH264 build adds compressed AVC420 graphics.
@@ -165,9 +184,7 @@ over 150 ms. Each dimension must be 200–4096 pixels, with at most 4096×2160 t
 pixels; odd dimensions round down to even pixels for AVC420. Unsupported layouts
 leave the current size active. Only one monitor is supported.
 
-The first connected RDP viewer controls the shared GPU's preferred mode. Other
-viewers scale that desktop to their own requested sizes. When the controlling
-viewer disconnects, the next connected viewer takes over. Mouse coordinates
+The active RDP session controls the GPU's preferred mode. Mouse coordinates
 follow the current framebuffer size throughout a mode change.
 
 The guest must use `virtio_gpu` and apply its DRM/RandR hotplug notification to
@@ -215,6 +232,25 @@ enable codec support in an already-built FreeRDP client. Use a client built
 with H.264 decoding, or omit `/gfx:AVC420` to connect using bitmap updates.
 The interoperability tests used a separate H.264-enabled FreeRDP build.
 
+To build FreeRDP 3.32.1 locally with OpenH264 decoding, install the following
+build dependencies on Debian or Ubuntu:
+
+```bash
+sudo apt install build-essential cmake curl pkg-config libssl-dev libopenh264-dev \
+  libx11-dev libxext-dev libxfixes-dev libxrandr-dev libxrender-dev libxcursor-dev \
+  libxi-dev libxinerama-dev libxkbfile-dev libasound2-dev libpulse-dev libxv-dev \
+  zlib1g-dev
+make freerdp
+```
+
+The build downloads the pinned 3.32.1 release and verifies its SHA-256 checksum.
+Downloaded sources, build files, and the local installation are ignored by Git.
+The client is installed under `tools/freerdp`; its FreeRDP libraries are in
+`tools/freerdp/lib` and are found relative to the executable without setting
+`LD_LIBRARY_PATH`. It uses system libraries for OpenH264, X11, and audio.
+`make rdp` selects this build automatically and connects to the Slax console on
+port 3390 with AVC420 enabled.
+
 For the X11 client, also check for `WITH_XCURSOR=ON`. Virtio-gpu hardware cursors
 are sent as separate RDP pointer updates, so the client draws them immediately
 without waiting for a video frame. Shapes and hotspots are cached; moving the
@@ -235,21 +271,20 @@ Normal builds need no OpenH264 dependency and report a clear error if
 `-rdp-h264` is requested.
 
 OpenH264 can encode slices of the same frame on multiple CPU cores. The default
-`-rdp-h264-threads 0` selects up to two workers per client, taking the Go CPU
-limit, guest vCPU count, and number of active AVC clients into account. Explicit
-values from 1 to 16 set a per-client worker limit; `-rdp-h264-threads 1` forces
-serial encoding. Clients share an encoding CPU budget that reserves capacity
-for guest vCPUs and one CPU for host work, including audio, with a minimum budget
-of one encoding worker. Frames remain ordered, and slow
-clients continue receiving the latest frame without building a queue.
+`-rdp-h264-threads 0` selects up to two encoder workers. Explicit values from 1 to
+16 set a worker limit; `-rdp-h264-threads 1` forces serial encoding. The worker
+limit is fixed for the session and bounded by the Go runtime CPU limit minus
+the guest vCPU count and one CPU for host work, including audio, with a minimum
+of one encoder worker. OpenH264 may use fewer workers for small pictures.
+Frames remain ordered, and a slow client receives the latest frame without
+building a queue.
 
 Use `-rdp-stats` to log performance measurements every five seconds while frames
 are active, plus a summary when the client disconnects. Statistics include frame
 and compressed payload byte counts, actual worker count, average/maximum time
 for framebuffer copying, color conversion, H.264 encoding and network writes,
-and time spent waiting for client acknowledgements
-or available encoding workers. Statistics are disabled by default and also
-work with bitmap RDP. For example:
+and time spent waiting for client acknowledgements. Statistics are disabled by
+default and also work with bitmap RDP. For example:
 
 ```bash
 ./gokvm boot -iso ./slax.iso -m 2G -net user \
@@ -267,14 +302,14 @@ text can be softer than bitmap output. AVC444 and hardware encoding are not
 implemented. TLS and authentication behavior are the same as for bitmap RDP.
 
 The H.264 path sends changed frames at up to 60 fps. Virtio-gpu dirty rectangles
-limit pixel conversion and framebuffer copying to changed regions; each client
-retains its own image and catches up safely after skipping intermediate frames.
+limit pixel conversion and framebuffer copying to changed regions; the session
+retains its image and catches up safely after skipping intermediate frames.
 Bitmap output updates changed 64×64 tiles, while H.264 updates a persistent YUV
 image and sends repaint rectangles with its compressed video. H.264 still
 encodes a complete video picture, using references to earlier frames.
 
-Frame notifications avoid waiting for a separate polling cycle, and slow clients
-receive the latest available image when ready. Resizing and refresh requests
+Frame notifications avoid waiting for a separate polling cycle, and a slow client
+receives the latest available image when ready. Resizing and refresh requests
 repaint the whole desktop. Serial/VGA/VESA fallbacks still publish full images.
 Actual frame rate depends on guest rendering, host CPU, and client decoding;
 bitmap RDP remains capped at 30 fps.

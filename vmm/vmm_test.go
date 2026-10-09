@@ -19,7 +19,6 @@ func TestISOBootParamsAddsOnlyDirectLinuxDefaults(t *testing.T) {
 		"earlyprintk=serial",
 		"noapic",
 		"noacpi",
-		"nosmp",
 		"nortc",
 		"pci=realloc=off",
 		"virtio_pci.force_legacy=1",
@@ -32,6 +31,10 @@ func TestISOBootParamsAddsOnlyDirectLinuxDefaults(t *testing.T) {
 	}
 
 	for _, unwanted := range []string{
+		"nosmp",
+		"maxcpus=0",
+		"maxcpus=1",
+		"nr_cpus=1",
 		"desktop=flwm",
 		"icons=wbar",
 		"notsc",
@@ -39,8 +42,22 @@ func TestISOBootParamsAddsOnlyDirectLinuxDefaults(t *testing.T) {
 		"xvesa=1024x768x32",
 	} {
 		if hasField(cmdline, unwanted) {
-			t.Fatalf("cmdline %q should not add ISO-specific %q", cmdline, unwanted)
+			t.Fatalf("cmdline %q should not add %q", cmdline, unwanted)
 		}
+	}
+}
+
+func TestISOBootParamsPreservesExplicitCPULimits(t *testing.T) {
+	t.Parallel()
+
+	for _, limit := range []string{"nosmp", "maxcpus=1", "nr_cpus=1"} {
+		t.Run(limit, func(t *testing.T) {
+			t.Parallel()
+			cmdline := isoBootParams("loglevel=3 " + limit)
+			if got := countField(cmdline, limit); got != 1 {
+				t.Fatalf("explicit CPU limit %q appears %d times in %q", limit, got, cmdline)
+			}
+		})
 	}
 }
 

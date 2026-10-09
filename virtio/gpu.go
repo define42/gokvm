@@ -1032,7 +1032,13 @@ func (g *GPU) Size() uint64 { return 0 }
 func (g *GPU) Reset() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	hadCursor := g.cursor.image != nil
 	g.resetLocked()
+	if hadCursor && !g.closed {
+		// Separate cursor displays retain their last shape across desktop
+		// flushes. Clear it while publication is still serialized by mu.
+		g.present()
+	}
 }
 
 func (g *GPU) resetLocked() {

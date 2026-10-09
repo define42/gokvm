@@ -33,7 +33,7 @@ func TestRDPStatsDisabled(t *testing.T) {
 	if !stats.begin().IsZero() || stats.elapsed(time.Time{}) != 0 {
 		t.Fatal("disabled stats sampled the clock")
 	}
-	stats.waiting(true, true, time.Time{})
+	stats.waiting(true, time.Time{})
 	stats.sent(1024)
 	stats.report(2, true)
 	if stats != (rdpFrameStats{}) {

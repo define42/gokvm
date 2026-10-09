@@ -9,7 +9,7 @@ import (
 	"github.com/bobuhiro11/gokvm/internal/rdp"
 )
 
-func TestRDPResizeControllerHandoff(t *testing.T) {
+func TestRDPResizeControllerReconnect(t *testing.T) {
 	t.Parallel()
 	d := &RDPDisplay{}
 	first := &rdp.Session{Width: 1280, Height: 720}
@@ -17,7 +17,6 @@ func TestRDPResizeControllerHandoff(t *testing.T) {
 	third := &rdp.Session{Width: 1920, Height: 1080}
 	var modes []rdp.DesktopSize
 	d.addResizeViewer(first)
-	d.addResizeViewer(second)
 	// The GPU can attach after a client has completed negotiation.
 	d.SetResizeHandler(func(width, height int) error {
 		modes = append(modes, rdp.DesktopSize{Width: width, Height: height})
@@ -25,13 +24,18 @@ func TestRDPResizeControllerHandoff(t *testing.T) {
 		return nil
 	})
 	d.resizeGuest(second)
-	d.addResizeViewer(third)
-	d.removeResizeViewer(third)
+	d.removeResizeViewer(second)
 	d.removeResizeViewer(first)
 	d.resizeGuest(first) // A departed viewer cannot reclaim control.
+	d.addResizeViewer(second)
+	d.removeResizeViewer(first)
+	if d.viewer != second {
+		t.Fatal("departed viewer removed the new resize controller")
+	}
 	d.removeResizeViewer(second)
 	d.removeResizeViewer(second)
 	d.addResizeViewer(third)
+	d.resizeGuest(second)
 	want := []rdp.DesktopSize{{Width: 1280, Height: 720}, {Width: 800, Height: 600}, {Width: 1920, Height: 1080}}
 	if !reflect.DeepEqual(modes, want) {
 		t.Fatalf("GPU modes: got %v, want %v", modes, want)
