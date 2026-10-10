@@ -177,6 +177,45 @@ func scaleI420Region(dst []byte, width, height int, img *image.RGBA, region imag
 	if region.Empty() {
 		return false
 	}
+	if img.Rect.Dx() == width && img.Rect.Dy() == height {
+		if changed, ok := scaleI420RegionNative(dst, width, height, img, region); ok {
+			return changed
+		}
+	}
+
+	return scaleI420RegionScalar(dst, width, height, img, region)
+}
+
+// scaleI420RegionNative converts an unscaled region two rows at a time. The
+// architecture-specific row kernel returns ok=false when it cannot handle the
+// input, allowing the caller to preserve the portable scaling path.
+func scaleI420RegionNative(dst []byte, width, height int, img *image.RGBA, region image.Rectangle) (bool, bool) {
+	luma := width * height
+	chroma := luma / 4
+	changed := false
+	for y := region.Min.Y; y < region.Max.Y; y += 2 {
+		chromaStart := y/2*(width/2) + region.Min.X/2
+		chromaEnd := chromaStart + region.Dx()/2
+		x0, x1 := region.Min.X, region.Max.X
+		src0 := img.Pix[y*img.Stride+x0*4 : y*img.Stride+x1*4]
+		src1 := img.Pix[(y+1)*img.Stride+x0*4 : (y+1)*img.Stride+x1*4]
+		rowChanged, ok := rgbaToI420AVX2(
+			dst[y*width+x0:y*width+x1],
+			dst[(y+1)*width+x0:(y+1)*width+x1],
+			dst[luma+chromaStart:luma+chromaEnd],
+			dst[luma+chroma+chromaStart:luma+chroma+chromaEnd],
+			src0, src1,
+		)
+		if !ok {
+			return false, false
+		}
+		changed = rowChanged || changed
+	}
+
+	return changed, true
+}
+
+func scaleI420RegionScalar(dst []byte, width, height int, img *image.RGBA, region image.Rectangle) bool {
 	luma := width * height
 	chroma := luma / 4
 	// Mapping columns once avoids repeated integer divisions for every pixel.
