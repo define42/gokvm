@@ -1,66 +1,170 @@
-# gokvm [![CI](https://github.com/define42/gokvm/actions/workflows/ci.yml/badge.svg)](https://github.com/define42/gokvm/actions/workflows/ci.yml) [![Coverage Status](https://coveralls.io/repos/github/define42/gokvm/badge.svg?branch=main)](https://coveralls.io/github/define42/gokvm?branch=main) [![code lines](https://sloc.xyz/github/define42/gokvm?category=code)](https://sloc.xyz/github/define42/gokvm?category=code) [![Go Reference](https://pkg.go.dev/badge/github.com/define42/gokvm.svg)](https://pkg.go.dev/github.com/define42/gokvm) [![Go Report Card](https://goreportcard.com/badge/github.com/define42/gokvm)](https://goreportcard.com/report/github.com/define42/gokvm)
+# gokvm
 
+[![Go Version](https://img.shields.io/github/go-mod/go-version/define42/gokvm)](go.mod) [![License](https://img.shields.io/github/license/define42/gokvm)](LICENSE) [![CI](https://github.com/define42/gokvm/actions/workflows/ci.yml/badge.svg)](https://github.com/define42/gokvm/actions/workflows/ci.yml) [![Coverage Status](https://coveralls.io/repos/github/define42/gokvm/badge.svg?branch=main)](https://coveralls.io/github/define42/gokvm?branch=main) [![Go Reference](https://pkg.go.dev/badge/github.com/define42/gokvm.svg)](https://pkg.go.dev/github.com/define42/gokvm) [![Go Report Card](https://goreportcard.com/badge/github.com/define42/gokvm)](https://goreportcard.com/report/github.com/define42/gokvm)
 
-gokvm is a hypervisor that uses KVM as an acceleration.
-It is implemented completely in the Go language.
-With **only 1.5k lines of code**, it can **boot Linux 5.10**, the latest version at the time, without any modifications
-(see [v0.0.1](https://github.com/bobuhiro11/gokvm/releases/tag/v0.0.1)).
-It includes naive and simple device emulation for serial console, virtio-net, and virtio-blk.
-The execution environment is limited to the x86-64 Linux environment.
-This should be useful for those who are interested in how to use KVM from userland.
-The latest version supports the following features:
-
-- [x] kvm acceleration
-- [x] multi processors
-- [x] serial console
-- [x] virtio-net (virtio 1.0, modern PCI transport)
-- [x] virtio-blk (virtio 1.0, modern PCI transport)
-- [x] virtio-gpu (virtio 1.0, 2D; frames written to PNG via `-g`)
-- [x] VNC server for virtio-gpu with keyboard and mouse input (`-vnc`)
-- [x] Built-in TLS RDP console with keyboard and mouse input (`-rdp`)
-- [x] Optional pure-Go H.264 AVC420 compression for RDP (`-rdp-h264`)
-- [x] RDP initial resolution and live single-monitor resizing with virtio-gpu hotplug
-- [x] Virtio-snd playback through the built-in RDP server (`-audio rdp`)
-- [x] Built-in user-mode networking with DHCP, DNS, and outbound TCP/UDP (`-net user`)
-- [x] PVH Boot Protocol
-- [x] ISO boot via the El Torito boot catalog (no SeaBIOS/UEFI firmware required)
+gokvm is an experimental virtual machine monitor written in Go that boots Linux
+guests using KVM on x86-64 Linux hosts. It provides emulated devices, a serial
+console, and VNC/RDP desktops for exploring virtualization from user space.
 
 **This is an experimental project, so please do not use it in production.**
 
-![demo](demo.gif)
+![gokvm booting a Linux guest](demo.gif)
 
-## CLI
+## Getting Started
 
-Extract the latest release from [the Github Release tab](https://github.com/define42/gokvm/releases) and run it.
-Before running, make sure /dev/kvm exists.
-You can use existing bzImage and initrd, or you can create them using the Makefile of this project.
+### Requirements
+
+- An x86-64 Linux host with hardware virtualization enabled and read/write access
+  to `/dev/kvm`. Nested hosts must expose KVM to the environment running gokvm.
+- Go 1.26.0 or newer to build from source, plus Git to clone the repository.
+  A C compiler and native codec libraries are not needed to build gokvm.
+- A Linux kernel and optional initrd, or a supported Linux live ISO. VNC and RDP
+  also require a client on the machine where you want to view the guest.
+
+### Installation
+
+Build the current checkout with cgo disabled:
 
 ```bash
-tar zxvf gokvm*.tar.gz
-./gokvm boot -k ./bzImage -i ./initrd  # To exit, press Ctrl-a x.
-./gokvm boot -k ./bzImage -i ./initrd -vnc :5900  # Enable virtio-gpu over VNC.
-./gokvm boot -iso ./TinyCore-current.iso -vnc :5900  # Boot kernel/initrd from an ISO.
-./gokvm boot -iso ./TinyCore-current.iso -rdp 127.0.0.1:3389 -m 512M  # RDP desktop.
-./gokvm boot -iso http://www.tinycorelinux.net/17.x/x86/release/TinyCore-current.iso -vnc :5900
+git clone https://github.com/define42/gokvm.git
+cd gokvm
+CGO_ENABLED=0 go build -o gokvm .
+./gokvm boot -help
 ```
 
-The bundled kernel config enables virtio-gpu and framebuffer console support, so
-VNC shows the Linux framebuffer console once the guest probes the GPU. If you
-use a different kernel, make sure it has `CONFIG_DRM_VIRTIO_GPU`,
-`CONFIG_DRM_FBDEV_EMULATION`, and `CONFIG_FRAMEBUFFER_CONSOLE` built in.
+For packaged versions, see [GitHub Releases](https://github.com/define42/gokvm/releases).
+Extract the Linux amd64 archive and run its `gokvm` executable. The examples below
+describe the current source tree.
+
+### Boot a guest
+
+With `TinyCore-current.iso` saved in the working directory, start a desktop:
+
+```bash
+./gokvm boot -iso ./TinyCore-current.iso -m 512M -vnc 127.0.0.1:5900
+```
+
+Connect a VNC client to `127.0.0.1:5900`. The TinyCore desktop starts automatically.
+From a source checkout, `make tinycore` builds gokvm and runs the same example;
+it expects the ISO to exist locally. VNC has no authentication or encryption,
+so keep it on loopback and use an authenticated SSH tunnel for remote access.
+
+To boot an existing kernel and initrd with a serial console:
+
+```bash
+./gokvm boot -k ./bzImage -i ./initrd
+```
+
+Press **Ctrl-a, then x** in the host terminal to exit. The defaults are one guest
+CPU and 1 GiB of RAM; use `-c` and `-m` to change them. Networking, graphics, and
+audio are disabled until requested. Run `./gokvm probe` to inspect the host's KVM
+capabilities and supported CPUID information.
+
+The repository also provides `make bzImage initrd` to prepare its sample kernel
+and u-root initrd. These targets download build tools and guest artifacts and may
+compile a kernel locally. See the [Makefile](Makefile),
+[kernel script](scripts/get_kernel.bash), and [initrd script](scripts/get_initrd.bash)
+for their additional host dependencies.
+
+## Features
+
+| Area | Support |
+| --- | --- |
+| CPU and boot | KVM acceleration, multiple vCPUs, direct Linux and PVH boot, Linux ISO discovery through El Torito and boot configs |
+| Storage | Modern virtio-blk, writable raw/qcow2 disks, read-only ISO media |
+| Networking | Modern virtio-net, built-in IPv4 DHCP/DNS and outbound TCP/UDP, or a host-managed TAP interface |
+| Display and input | Modern virtio-gpu 2D framebuffer, PNG output, VNC/RDP keyboard and mouse input |
+| RDP graphics | TLS, bitmap updates or bundled H.264 AVC420, hardware cursor updates, live single-monitor resizing |
+| Audio | Virtio-snd stereo playback through RDP |
+| Console and API | Serial console and Go wrappers for KVM ioctls |
+
+### CLI reference
+
+Use `gokvm boot [flags]` to start a VM and `gokvm probe` to inspect the host.
+`gokvm boot -help` prints every boot option. VM configuration is supplied through
+flags; there is no VM configuration file.
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `-D path` | `/dev/kvm` | KVM device used by `boot`. |
+| `-k path` | `./bzImage` | Linux kernel image; PVH is detected automatically. |
+| `-i path` | Unset | Optional initrd for direct kernel boot. |
+| `-iso path-or-url` | Unset | Linux ISO path or HTTP(S) URL; takes precedence over `-k` and `-i`. |
+| `-p parameters` | Built-in kernel command line | Replace the kernel command line; ISO boot otherwise uses its boot config plus gokvm defaults. |
+| `-c count` | `1` | Number of guest vCPUs. |
+| `-m size` | `1G` | Guest RAM; `K`, `M`, and `G` use binary units. Unitless values mean GiB. |
+| `-d path` | Unset | Existing writable raw or qcow2 disk, exposed as `/dev/vda`. |
+| `-net user\|none` | `none` | Built-in networking or no network; mutually exclusive with `-t`. |
+| `-t name` | Unset | Host TAP interface. |
+| `-g path` | Unset | Write the framebuffer to a PNG file. |
+| `-vnc address` | Unset | VNC listener, for example `127.0.0.1:5900`. |
+| `-rdp address` | Unset | TLS RDP listener, for example `127.0.0.1:3389`. |
+| `-rdp-cert path` | Temporary self-signed certificate | PEM certificate; requires `-rdp-key` and `-rdp`. |
+| `-rdp-key path` | Unset | PEM private key; requires `-rdp-cert` and `-rdp`. |
+| `-rdp-h264` | `false` | Enable AVC420 for compatible clients; requires `-rdp`. |
+| `-rdp-h264-threads count` | `0` | One automatic slice, or request 1–16 within the host CPU budget; requires `-rdp-h264`. |
+| `-rdp-stats` | `false` | Log RDP performance statistics; requires `-rdp`. |
+| `-audio none\|rdp` | `none` | Virtio-snd playback through RDP; `rdp` requires `-rdp`. |
+| `-T count` | `0` | Instructions to skip between trace prints; zero disables tracing. |
+
+Any of `-g`, `-vnc`, or `-rdp` enables the virtio-gpu device. They can be combined;
+`-g` is not required for a remote console. See [RDP console](#rdp-console) for
+connection, security, graphics, and audio details.
+
+### Boot and storage
+
+Direct boot accepts a Linux kernel with `-k` and an optional initrd with `-i`.
+A kernel with a PVH entry point uses the PVH loader automatically. Use `-p` when
+the guest requires a different root device, init program, or console setup;
+`boot -help` shows the full default command line.
 
 ISO boot support reads the El Torito boot catalog when present, uses the boot
 image location to find common syslinux/isolinux or GRUB configs, then loads the
 Linux kernel/initrd through gokvm's direct Linux loader. It does not emulate the
 BIOS/UEFI bootloader code, so no SeaBIOS firmware is required. The raw ISO is
 attached to the guest as a read-only virtio-blk device so the booted kernel can
-mount its live media.
+mount its live media. This supports recognized Linux ISO layouts, not arbitrary
+operating-system installers. An explicit `-p` replaces the ISO command line
+entirely, including gokvm's added defaults.
+
+`-iso` also accepts HTTP(S) URLs. The image is fully downloaded to a temporary
+file for the lifetime of the VM; it is not cached between runs. For example:
+
+```bash
+./gokvm boot -iso http://www.tinycorelinux.net/17.x/x86/release/TinyCore-current.iso \
+  -m 512M -vnc 127.0.0.1:5900
+```
+
+Attach an existing raw or qcow2 disk with `-d`:
+
+```bash
+./gokvm boot -k ./bzImage -i ./initrd -d ./disk.qcow2
+```
+
+The format is detected from the file contents. The disk is writable and appears
+as `/dev/vda`; when combined with `-iso`, the read-only ISO follows it as another
+virtio-blk device. `-d` attaches storage; a kernel or ISO is still needed to boot.
+
+The qcow2 backend supports standalone v2/v3 images with 16-bit refcounts.
+Backing files, internal snapshots, encryption, compressed or shared data
+clusters, external data files, and extended L2 entries are unsupported.
+Dirty or corrupt images are rejected. To create a blank disk with `qemu-img`
+(an optional host tool):
+
+```bash
+qemu-img create -f qcow2 disk.qcow2 4G
+```
+
+Create a filesystem in the guest before storing files on a new disk; partition
+the disk first if needed.
+
+### Desktop guests
 
 When booting a TinyCore ISO with `-vnc` or `-rdp`, gokvm injects an autostart overlay into
 the initrd so the guest brings up the FLWM desktop (Xvesa) on the remote display
 instead of a text login. Both servers forward keyboard and mouse input back
 to the guest. Try it with `make tinycore`, which builds gokvm and boots
-`TinyCore-current.iso` on `127.0.0.1:5900`.
+the local `TinyCore-current.iso` on `127.0.0.1:5900`.
 
 Slax can boot directly from its ISO with its normal graphical startup:
 
@@ -69,7 +173,7 @@ Slax can boot directly from its ISO with its normal graphical startup:
 ```
 
 Run `make slax` to build gokvm with the software-only pure-Go H.264 encoder and
-boot the local `slax.iso` with two guest CPUs, 2 GB of memory, user-mode
+boot the local `slax.iso` with four guest CPUs, 2 GiB of memory, user-mode
 networking, and H.264 RDP listening on `127.0.0.1:3390`. It requests four
 encoder slices, bounded by the existing host-budget calculation. The bundled
 codec encodes those fixed slices concurrently with bounded Go workers and needs
@@ -125,6 +229,26 @@ ln -s certs/ca-certificates.crt /etc/ssl/cert.pem
 
 Networking remains disabled by default (`-net none`). The existing `-t tap0`
 option attaches a host-managed TAP interface; it cannot be combined with `-net`.
+
+### VNC and PNG output
+
+Use `-vnc` for a remote framebuffer with keyboard and mouse input, or `-g` to
+write the current framebuffer to a PNG file:
+
+```bash
+./gokvm boot -k ./bzImage -i ./initrd -vnc 127.0.0.1:5900
+./gokvm boot -k ./bzImage -i ./initrd -g ./framebuffer.png
+```
+
+The bundled kernel config enables virtio-gpu and framebuffer console support, so
+VNC shows the Linux framebuffer console once the guest probes the GPU. If you
+use a different kernel, make sure it has `CONFIG_DRM_VIRTIO_GPU`,
+`CONFIG_DRM_FBDEV_EMULATION`, and `CONFIG_FRAMEBUFFER_CONSOLE` built in.
+
+VNC has no authentication or encryption. Bind to loopback and use an
+authenticated SSH tunnel for access from another machine. Both VNC and PNG
+outputs include the guest cursor. Virtio-gpu provides 2D display only; guest 3D
+acceleration is not implemented.
 
 ### RDP console
 
@@ -182,8 +306,8 @@ xfreerdp /v:127.0.0.1:3390 /sec:tls /u:console /p \
 Omit `/gfx:AVC420` for bitmap clients. Both paths resize without reconnecting;
 audio and input remain on the same connection. Rapid window changes are combined
 over 150 ms. Each dimension must be 200–4096 pixels, with at most 4096×2160 total
-pixels; odd dimensions round down to even pixels for AVC420. Unsupported layouts
-leave the current size active. Only one monitor is supported.
+pixels; odd dimensions round down to even pixels. Unsupported layouts leave the
+current size active. Only one monitor is supported.
 
 The active RDP session controls the GPU's preferred mode. Mouse coordinates
 follow the current framebuffer size throughout a mode change.
@@ -213,7 +337,8 @@ add `sh "$HOME/.local/bin/gokvm-resize" &` before the line that starts Fluxbox i
 The server uses the bundled pure-Go OpenH264 port in [`pkg/h264`](pkg/h264) for
 H.264/AVC420 over the RDP graphics pipeline. It needs no C compiler,
 `pkg-config`, native codec library, or special build tag. A normal build includes
-AVC420 support:
+AVC420 support. On amd64, selected codec kernels use SIMD when supported by the
+host CPU, with scalar fallbacks:
 
 ```bash
 CGO_ENABLED=0 go build -o gokvm .
@@ -245,6 +370,8 @@ make freerdp
 ```
 
 The build downloads the pinned 3.32.1 release and verifies its SHA-256 checksum.
+It uses four parallel build jobs by default; set `FREERDP_JOBS` to change this
+(for example, `FREERDP_JOBS=8 make freerdp`).
 Downloaded sources, build files, and the local installation are ignored by Git.
 The client is installed under `tools/freerdp`; its FreeRDP libraries are in
 `tools/freerdp/lib` and are found relative to the executable without setting
@@ -358,27 +485,68 @@ not implemented. Audio is off by default, and `-audio rdp` requires `-rdp`.
 Disconnected or slow clients cannot stop the guest audio clock; old queued
 samples are discarded to keep buffering bounded. VNC carries no audio.
 
-Run the protocol, input, framebuffer, and listener tests without booting a VM:
+### Go packages
 
-```bash
-go test ./internal/rdp ./virtio ./flag ./vmm -short
-go test -race ./internal/rdp ./virtio ./vmm -run 'Test(RDP|GPU|Modern|Framebuffer|SerialMirror)'
-```
+The [`kvm`](kvm) package provides wrappers for KVM ioctls; [`vmm`](vmm) combines
+them with guest boot and device setup. The bundled codec has a separate
+[H.264 API and usage guide](pkg/h264/README.md). Browse the
+[Go package reference](https://pkg.go.dev/github.com/define42/gokvm/kvm)
+for the published KVM API.
 
-Run the bundled pure-Go encoder roundtrip and graphics pipeline tests without
-cgo:
+## Contributing
+
+Build from source using the [installation steps](#installation). Include a
+reproduction or focused test for behavior changes, and update examples when
+changing CLI options or guest requirements.
+
+Run the RDP, graphics, input, and flag tests without booting a VM or enabling cgo:
 
 ```bash
 CGO_ENABLED=0 go test -short ./internal/rdp/... ./virtio ./vmm ./flag
 ```
 
-## Go package
+Check audio, networking, storage, ISO parsing, and the resize helper separately:
 
-This project includes a thin wrapper for the KVM API using ioctl. Please refer to the following link to use it.
+```bash
+go test ./internal/audio ./internal/usernet ./disk ./iso9660 ./scripts
+```
 
-https://pkg.go.dev/github.com/define42/gokvm
+The disk tests use `qemu-img` and `qemu-io` when available; the AVC interoperability
+test uses `ffmpeg` when available. Set `GOKVM_TEST_ISO` to a local ISO path to opt into the
+ISO parser's real-image test.
 
-## Reference
+For concurrency changes, run the relevant race checks (these require cgo and a
+C compiler):
+
+```bash
+go test -race ./internal/audio ./internal/rdp/...
+go test -race ./virtio ./vmm -run 'Test(RDP|GPU|MultiDisplay|Audio|Sound|Modern|Framebuffer|SerialMirror)'
+```
+
+`make golangci` runs code generation and the repository's pinned linter.
+`make test` prepares guest images, runs generation and linting, then executes the
+full test suite with coverage in a network namespace and checks module tidiness.
+It needs the additional host tools in the [Makefile](Makefile) and
+[CI workflow](.github/workflows/ci.yml), KVM access, and permission to create user
+and network namespaces. Some VM integration tests also require root and guest
+artifacts; they skip when their prerequisites are missing. Short mode alone does
+not remove the KVM requirements of every package.
+
+For device debugging, set these variables to any nonempty value:
+
+| Variable | Output |
+| --- | --- |
+| `GOKVM_TRACE_IO` | Guest port I/O exits. |
+| `GOKVM_TRACE_MMIO` | Unhandled guest MMIO accesses. |
+| `GOKVM_TRACE_ATAPI` | Commands received by the emulated ATAPI device. |
+
+## Contributors
+
+gokvm builds on [Nobuhiro MIKI's original project](https://github.com/bobuhiro11/gokvm).
+Thanks to everyone who contributes code, tests, bug reports, and documentation;
+see the [contributors](https://github.com/define42/gokvm/graphs/contributors).
+
+### References
 
 Thanks to the many useful resources on KVM, this project was able to boot Linux on a virtual machine.
 
@@ -402,3 +570,9 @@ Thanks to the many useful resources on KVM, this project was able to boot Linux 
 - [ハイパーバイザの作り方～ちゃんと理解する仮想化技術～ 第１２回 virtioによる準仮想化デバイス その２「Virtqueueとvirtio-netの実現」](https://syuu1228.github.io/howto_implement_hypervisor/part12.html)
 - [Xen PVH boot protocol](https://github.com/mirage/xen/blob/master/docs/misc/hvmlite.markdown)
 - [Cloud Hypervisor](https://github.com/cloud-hypervisor/cloud-hypervisor)
+
+## License
+
+gokvm is licensed under the [MIT License](LICENSE). The bundled OpenH264 port is
+covered by the [BSD 2-Clause license](LICENSE-OpenH264). The repository also
+retains the [go.264 license notice](LICENSE-go.264).
