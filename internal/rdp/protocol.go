@@ -552,6 +552,7 @@ func writeTPKT(w io.Writer, payload []byte) error {
 	packet[0] = 3
 	binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
 	copy(packet[4:], payload)
+
 	return writeFull(w, packet)
 }
 

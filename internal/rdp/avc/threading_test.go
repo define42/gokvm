@@ -29,6 +29,8 @@ func TestOpenH264SlicesRoundTrip(t *testing.T) {
 }
 
 func TestOpenH264ProductionPolicy(t *testing.T) {
+	t.Parallel()
+
 	encoder, err := NewEncoderWithOptions(320, 240, Options{Threads: 4})
 	if err != nil {
 		t.Fatal(err)
@@ -105,6 +107,8 @@ func TestOpenH264ProductionPolicy(t *testing.T) {
 }
 
 func TestOpenH264ParallelSlicesMatchSequential(t *testing.T) {
+	t.Parallel()
+
 	const width, height, slices = 320, 240, 4
 	sequential := newFixedSliceTestEncoder(t, width, height, slices, 1)
 	defer sequential.Close()
@@ -162,6 +166,7 @@ func newFixedSliceTestEncoder(t *testing.T, width, height, slices, workers int) 
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	return encoder
 }
 

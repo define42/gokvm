@@ -87,11 +87,13 @@ func newCodecEncoderWithConfig(width, height, threads int, config codecConfig) (
 	var effective api.SEncParamExt
 	if rv := codec.Raw().GetOption(api.ENCODER_OPTION_SVC_ENCODE_PARAM_EXT, &effective); rv != 0 {
 		codec.Close()
+
 		return nil, 0, fmt.Errorf("%w: read initialized parameters: %d", ErrCodec, rv)
 	}
 	slices = int(effective.SSpatialLayers[0].SSliceArgument.UiSliceNum)
 	if slices < 1 {
 		codec.Close()
+
 		return nil, 0, fmt.Errorf("%w: initialized with no slices", ErrCodec)
 	}
 

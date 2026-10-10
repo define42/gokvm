@@ -16,77 +16,108 @@ func TestCPUIDTopologySingleSocket(t *testing.T) {
 	for _, count := range []int{1, 2, 3, 64} {
 		t.Run(fmt.Sprintf("%d-cores", count), func(t *testing.T) {
 			t.Parallel()
-			seen := make(map[uint32]bool)
-			for cpu := range count {
-				cpuid := topologyFixture()
-				configureCPUIDTopology(&cpuid, cpu, count)
-				legacy := topologyEntry(t, cpuid, 1, 0)
-				id := legacy.Ebx >> 24
-				if id != uint32(cpu) || seen[id] {
-					t.Fatalf("CPU %d has duplicate or incorrect APIC ID %d", cpu, id)
-				}
-				seen[id] = true
-				if got := (legacy.Ebx >> 16) & 0xff; got != uint32(count) {
-					t.Fatalf("logical CPUs per socket: got %d, want %d", got, count)
-				}
-				if htt := legacy.Edx&(1<<28) != 0; htt != (count > 1) {
-					t.Fatalf("HTT topology bit = %v for %d cores", htt, count)
-				}
-
-				for _, function := range []uint32{0xb, 0x1f, 0x80000026} {
-					endIndex := uint32(2)
-					if function == 0x80000026 {
-						endIndex = 4
-					}
-					smt := topologyEntry(t, cpuid, function, 0)
-					core := topologyEntry(t, cpuid, function, 1)
-					end := topologyEntry(t, cpuid, function, endIndex)
-					if smt.Eax != 0 || smt.Ebx != 1 || smt.Ecx != 0x100 || smt.Edx != id {
-						t.Fatalf("leaf %#x advertises incorrect SMT topology: %+v", function, smt)
-					}
-					if core.Ebx != uint32(count) || core.Ecx != 0x201 || core.Edx != id {
-						t.Fatalf("leaf %#x advertises incorrect core topology: %+v", function, core)
-					}
-					// The package shift must fit every core ID, without wasting
-					// another bit (including non-power-of-two core counts).
-					if uint32(count) > 1<<core.Eax || (core.Eax > 0 && uint32(count) <= 1<<(core.Eax-1)) ||
-						id>>core.Eax != 0 {
-						t.Fatalf("leaf %#x puts cores into multiple sockets: %+v", function, core)
-					}
-					if end.Eax != 0 || end.Ebx != 0 || end.Ecx != endIndex || end.Edx != id {
-						t.Fatalf("leaf %#x has no valid topology terminator: %+v", function, end)
-					}
-					for index := uint32(2); index < endIndex; index++ {
-						node := topologyEntry(t, cpuid, function, index)
-						if node.Eax != core.Eax || node.Ebx != core.Ebx || node.Edx != id || node.Ecx != (index+1)<<8|index {
-							t.Fatalf("AMD CCD/socket does not contain exactly the guest cores: %+v", node)
-						}
-					}
-				}
-				amd := topologyEntry(t, cpuid, 0x80000008, 0)
-				if amd.Ecx&0xff != uint32(count-1) || id>>((amd.Ecx>>12)&0xf) != 0 {
-					t.Fatalf("inconsistent AMD core count/socket ID: %+v", amd)
-				}
-				ext := topologyEntry(t, cpuid, 0x8000001e, 0)
-				if ext.Eax != id || ext.Ebx&0xffff != id || ext.Ecx&0x7ff != 0 {
-					t.Fatalf("inconsistent AMD APIC/core/node IDs: %+v", ext)
-				}
-				for _, function := range []uint32{4, 0x8000001d} {
-					private := topologyEntry(t, cpuid, function, 0)
-					shared := topologyEntry(t, cpuid, function, 1)
-					end := topologyEntry(t, cpuid, function, 2)
-					if (private.Eax>>14)&0xfff != 0 || (shared.Eax>>14)&0xfff != uint32(count-1) {
-						t.Fatalf("leaf %#x has cache sharing outside the guest topology", function)
-					}
-					if function == 4 && (shared.Eax>>26)+1 != uint32(count) {
-						t.Fatalf("cache leaf has wrong core count: %+v", shared)
-					}
-					if end.Eax != 0 {
-						t.Fatalf("leaf %#x cache terminator was turned into a cache", function)
-					}
-				}
-			}
+			checkCPUIDTopologySingleSocket(t, count)
 		})
+	}
+}
+
+func checkCPUIDTopologySingleSocket(t *testing.T, count int) {
+	t.Helper()
+	seen := make(map[uint32]bool)
+	for cpu := range count {
+		cpuid := topologyFixture()
+		configureCPUIDTopology(&cpuid, cpu, count)
+		id := checkCPUIDLegacyTopology(t, cpuid, cpu, count, seen)
+		checkCPUIDExtendedTopology(t, cpuid, id, count)
+		checkCPUIDAMDTopology(t, cpuid, id, count)
+		checkCPUIDCacheTopology(t, cpuid, count)
+	}
+}
+
+func checkCPUIDLegacyTopology(t *testing.T, cpuid kvm.CPUID, cpu, count int, seen map[uint32]bool) uint32 {
+	t.Helper()
+	legacy := topologyEntry(t, cpuid, 1, 0)
+	id := legacy.Ebx >> 24
+	if id != uint32(cpu) || seen[id] {
+		t.Fatalf("CPU %d has duplicate or incorrect APIC ID %d", cpu, id)
+	}
+	seen[id] = true
+	if got := (legacy.Ebx >> 16) & 0xff; got != uint32(count) {
+		t.Fatalf("logical CPUs per socket: got %d, want %d", got, count)
+	}
+	if htt := legacy.Edx&(1<<28) != 0; htt != (count > 1) {
+		t.Fatalf("HTT topology bit = %v for %d cores", htt, count)
+	}
+
+	return id
+}
+
+func checkCPUIDExtendedTopology(t *testing.T, cpuid kvm.CPUID, id uint32, count int) {
+	t.Helper()
+	leaves := []struct {
+		function uint32
+		endIndex uint32
+	}{
+		{function: 0xb, endIndex: 2},
+		{function: 0x1f, endIndex: 2},
+		{function: 0x80000026, endIndex: 4},
+	}
+	for _, leaf := range leaves {
+		smt := topologyEntry(t, cpuid, leaf.function, 0)
+		core := topologyEntry(t, cpuid, leaf.function, 1)
+		end := topologyEntry(t, cpuid, leaf.function, leaf.endIndex)
+		if smt.Eax != 0 || smt.Ebx != 1 || smt.Ecx != 0x100 || smt.Edx != id {
+			t.Fatalf("leaf %#x advertises incorrect SMT topology: %+v", leaf.function, smt)
+		}
+		if core.Ebx != uint32(count) || core.Ecx != 0x201 || core.Edx != id {
+			t.Fatalf("leaf %#x advertises incorrect core topology: %+v", leaf.function, core)
+		}
+		// The package shift must fit every core ID, without wasting
+		// another bit (including non-power-of-two core counts).
+		if uint32(count) > 1<<core.Eax || (core.Eax > 0 && uint32(count) <= 1<<(core.Eax-1)) ||
+			id>>core.Eax != 0 {
+			t.Fatalf("leaf %#x puts cores into multiple sockets: %+v", leaf.function, core)
+		}
+		if end.Eax != 0 || end.Ebx != 0 || end.Ecx != leaf.endIndex || end.Edx != id {
+			t.Fatalf("leaf %#x has no valid topology terminator: %+v", leaf.function, end)
+		}
+		for index := uint32(2); index < leaf.endIndex; index++ {
+			node := topologyEntry(t, cpuid, leaf.function, index)
+			if node.Eax != core.Eax || node.Ebx != core.Ebx || node.Edx != id ||
+				node.Ecx != (index+1)<<8|index {
+				t.Fatalf("AMD CCD/socket does not contain exactly the guest cores: %+v", node)
+			}
+		}
+	}
+}
+
+func checkCPUIDAMDTopology(t *testing.T, cpuid kvm.CPUID, id uint32, count int) {
+	t.Helper()
+	amd := topologyEntry(t, cpuid, 0x80000008, 0)
+	if amd.Ecx&0xff != uint32(count-1) || id>>((amd.Ecx>>12)&0xf) != 0 {
+		t.Fatalf("inconsistent AMD core count/socket ID: %+v", amd)
+	}
+	ext := topologyEntry(t, cpuid, 0x8000001e, 0)
+	if ext.Eax != id || ext.Ebx&0xffff != id || ext.Ecx&0x7ff != 0 {
+		t.Fatalf("inconsistent AMD APIC/core/node IDs: %+v", ext)
+	}
+}
+
+func checkCPUIDCacheTopology(t *testing.T, cpuid kvm.CPUID, count int) {
+	t.Helper()
+	for _, function := range []uint32{4, 0x8000001d} {
+		private := topologyEntry(t, cpuid, function, 0)
+		shared := topologyEntry(t, cpuid, function, 1)
+		end := topologyEntry(t, cpuid, function, 2)
+		if (private.Eax>>14)&0xfff != 0 || (shared.Eax>>14)&0xfff != uint32(count-1) {
+			t.Fatalf("leaf %#x has cache sharing outside the guest topology", function)
+		}
+		if function == 4 && (shared.Eax>>26)+1 != uint32(count) {
+			t.Fatalf("cache leaf has wrong core count: %+v", shared)
+		}
+		if end.Eax != 0 {
+			t.Fatalf("leaf %#x cache terminator was turned into a cache", function)
+		}
 	}
 }
 

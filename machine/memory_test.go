@@ -13,8 +13,18 @@ import (
 
 func TestGuestMemoryAlignment(t *testing.T) {
 	t.Parallel()
-	for _, size := range []int{1, 4096, MinMemSize, guestMemoryAlignment, guestMemoryAlignment + 4096, 3*guestMemoryAlignment + 17} {
+	sizes := []int{
+		1,
+		4096,
+		MinMemSize,
+		guestMemoryAlignment,
+		guestMemoryAlignment + 4096,
+		3*guestMemoryAlignment + 17,
+	}
+	for _, size := range sizes {
 		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			t.Parallel()
+
 			mapping, mem, err := mapGuestMemory(size)
 			if err != nil {
 				t.Fatal(err)
@@ -54,6 +64,8 @@ func TestGuestMemoryRejectsInvalidSize(t *testing.T) {
 }
 
 func TestGuestMemoryKVMCoherence(t *testing.T) {
+	t.Parallel()
+
 	dev, err := os.OpenFile("/dev/kvm", os.O_RDWR, 0)
 	if errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission) {
 		t.Skipf("KVM unavailable: %v", err)
