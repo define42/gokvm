@@ -1,26 +1,42 @@
 // constants for creating ioctl commands.
 package kvm
 
-import "syscall"
+import (
+	"errors"
+	"syscall"
+)
 
 // Ioctl is a convenience function to call ioctl.
 // Its main purpose is to format arguments
 // and return values to make things easier for
-// programmers.
+// programmers. Pointer-valued arguments must be converted in the call expression;
+// uintptrescapes keeps their storage alive and off movable goroutine stacks
+// while this wrapper forwards the address to the syscall helper.
+//
+//go:uintptrescapes
 func Ioctl(fd, op, arg uintptr) (uintptr, error) {
 	for {
-		res, _, errno := syscall.Syscall(
-			syscall.SYS_IOCTL, fd, op, arg)
-		if errno == syscall.EINTR {
+		res, err := ioctlOnce(fd, op, arg)
+		if errors.Is(err, syscall.EINTR) {
 			continue
 		}
 
-		if errno != 0 {
-			return res, errno
-		}
-
-		return res, nil
+		return res, err
 	}
+}
+
+// ioctlOnce leaves interrupted calls to the caller. KVM_RUN must observe EINTR
+// so its owner can stop the vCPU instead of retrying immediate_exit forever.
+// It has the same pointer-lifetime contract as Ioctl.
+//
+//go:uintptrescapes
+func ioctlOnce(fd, op, arg uintptr) (uintptr, error) {
+	res, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, op, arg)
+	if errno != 0 {
+		return res, errno
+	}
+
+	return res, nil
 }
 
 const (

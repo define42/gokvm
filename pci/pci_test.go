@@ -3,7 +3,10 @@ package pci_test
 import (
 	"bytes"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/define42/gokvm/pci"
 )
@@ -306,3 +309,149 @@ func (d *testMMIODevice) MMIOBARIndex() int { return 0 }
 func (d *testMMIODevice) MMIOSize() uint64 { return 0x1000 }
 
 func (d *testMMIODevice) MMIO(uint64, []byte, bool) {}
+
+func TestPCIConcurrentBARProgrammingAndMMIO(t *testing.T) {
+	t.Parallel()
+
+	p := pci.New()
+	dev := &reentrantMMIODevice{bus: p}
+	p.AddDevices(dev)
+	_ = p.PciConfAddrOut(0xcf8, pci.NumToBytes(uint32(0x80000010)))
+	bases := [2]uint32{0xd0000000, 0xd1000000}
+	var workers sync.WaitGroup
+	workers.Go(func() {
+		for i := range 1000 {
+			_ = p.PciConfDataOut(0xcfc, pci.NumToBytes(bases[i%len(bases)]))
+		}
+	})
+	workers.Go(func() {
+		var value [4]byte
+		for range 1000 {
+			_ = p.PciConfDataIn(0xcfc, value[:])
+			got := uint32(pci.BytesToNum(value[:]))
+			if got != bases[0] && got != bases[1] {
+				t.Errorf("torn BAR read: %#x", got)
+
+				return
+			}
+		}
+	})
+	for range 2 {
+		workers.Go(func() {
+			for range 1000 {
+				for _, base := range bases {
+					device, off, ok := p.LookupMMIO(uint64(base) + 0x20)
+					if !ok {
+						continue
+					}
+					if device != dev || off != 0x20 {
+						t.Errorf("MMIO dispatch: device=%v offset=%#x", device, off)
+
+						return
+					}
+					device.MMIO(off, []byte{1}, true)
+				}
+			}
+		})
+	}
+	workers.Wait()
+	if dev.accesses.Load() == 0 {
+		t.Fatal("no MMIO access reached the device")
+	}
+
+	_ = p.PciConfDataOut(0xcfc, pci.NumToBytes(bases[1]))
+	if _, off, ok := p.LookupMMIO(uint64(bases[1]) + 0x20); !ok || off != 0x20 {
+		t.Fatalf("final BAR mapping: found=%v offset=%#x", ok, off)
+	}
+	if _, _, ok := p.LookupMMIO(uint64(bases[0]) + 0x20); ok {
+		t.Fatal("old BAR mapping still decodes")
+	}
+}
+
+func TestPCIConcurrentConfigurationAndRegistration(t *testing.T) {
+	t.Parallel()
+
+	p := pci.New(&testMMIODevice{})
+	_ = p.PciConfAddrOut(0xcf8, pci.NumToBytes(uint32(0x80000058)))
+	var workers sync.WaitGroup
+	workers.Go(func() {
+		for i := range 1000 {
+			_ = p.PciConfAddrOut(0xcf8, pci.NumToBytes(uint32(0x80000058+4*(i%2))))
+		}
+	})
+	workers.Go(func() {
+		for i := range 1000 {
+			_ = p.PciConfDataOut(0xcfc, pci.NumToBytes(uint32(i)))
+		}
+	})
+	workers.Go(func() {
+		var value [4]byte
+		for range 1000 {
+			_ = p.PciConfAddrIn(0xcf8, value[:])
+			_ = p.PciConfDataIn(0xcfc, value[:])
+			if _, _, ok := p.LookupMMIO(0xd0000020); !ok {
+				t.Error("registration lost an existing MMIO mapping")
+
+				return
+			}
+			devices := p.Devices()
+			devices[0] = nil // The returned slice must not alias the registry.
+		}
+	})
+	workers.Go(func() {
+		for range 31 {
+			p.AddDevices(pci.NewBridge())
+		}
+	})
+	workers.Wait()
+	if devices := p.Devices(); len(devices) != 32 || devices[0] == nil {
+		t.Fatalf("device registry corrupted: %v", devices)
+	}
+	_ = p.PciConfAddrOut(0xcf8, pci.NumToBytes(uint32(0x80000058)))
+	_ = p.PciConfDataOut(0xcfc, []byte{1, 2, 3, 4})
+	var value [4]byte
+	_ = p.PciConfDataIn(0xcfc, value[:])
+	if value != [4]byte{1, 2, 3, 4} {
+		t.Fatalf("configuration override lost: %v", value)
+	}
+}
+
+func TestPCIRegistrationCallbacksCanReadBus(t *testing.T) {
+	t.Parallel()
+
+	p := pci.New()
+	done := make(chan struct{})
+	go func() {
+		p.AddDevices(&reentrantMMIODevice{bus: p})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("registration held the bus lock during a device callback")
+	}
+}
+
+type reentrantMMIODevice struct {
+	testMMIODevice
+	bus      *pci.PCI
+	accesses atomic.Uint32
+}
+
+func (d *reentrantMMIODevice) GetDeviceHeader() pci.DeviceHeader {
+	_ = d.bus.Devices()
+
+	return d.testMMIODevice.GetDeviceHeader()
+}
+
+func (d *reentrantMMIODevice) Capabilities() []byte {
+	_ = d.bus.Devices()
+
+	return nil
+}
+
+func (d *reentrantMMIODevice) MMIO(_ uint64, _ []byte, _ bool) {
+	var value [4]byte
+	_ = d.bus.PciConfAddrIn(0xcf8, value[:])
+	d.accesses.Add(1)
+}

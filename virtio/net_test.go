@@ -557,3 +557,143 @@ func TestNetRXRejectsInvalidDescriptors(t *testing.T) {
 		})
 	}
 }
+
+func TestNetTxInvalidChains(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		setup func(*virtio.SplitQueue)
+	}{
+		{name: "short_header", setup: func(q *virtio.SplitQueue) { q.Desc[0].Len = 11 }},
+		{name: "cycle", setup: func(q *virtio.SplitQueue) { q.Desc[0].Flags, q.Desc[0].Next = 1, 0 }},
+		{
+			name:  "descriptor_out_of_range",
+			setup: func(q *virtio.SplitQueue) { q.Desc[0].Flags, q.Desc[0].Next = 1, virtio.QueueSize },
+		},
+		{name: "memory_out_of_range", setup: func(q *virtio.SplitQueue) { q.Desc[0].Addr = 4096 }},
+		{name: "writable_payload", setup: func(q *virtio.SplitQueue) { q.Desc[0].Flags = 2 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var backend bytes.Buffer
+			v := virtio.NewNet(9, &mockInjector{}, &backend, make([]byte, 4096))
+			t.Cleanup(func() { _ = v.Close() })
+			q := newSplitQueue()
+			q.Desc[0].Len = 128
+			q.Avail.Idx = 1
+			tc.setup(q)
+			v.VirtQueue[1] = q
+			if err := v.Tx(); !errors.Is(err, virtio.ErrNetDesc) {
+				t.Fatalf("Tx = %v, want ErrNetDesc", err)
+			}
+			if backend.Len() != 0 || q.Used.Idx != 0 {
+				t.Fatal("invalid packet was sent or completed")
+			}
+		})
+	}
+}
+
+type shortNetWriter struct{}
+
+func (shortNetWriter) Read([]byte) (int, error)    { return 0, io.EOF }
+func (shortNetWriter) Write(p []byte) (int, error) { return len(p) - 1, nil }
+
+func TestNetTxShortWrite(t *testing.T) {
+	t.Parallel()
+
+	v := virtio.NewNet(9, &mockInjector{}, shortNetWriter{}, make([]byte, 4096))
+	t.Cleanup(func() { _ = v.Close() })
+	q := newSplitQueue()
+	q.Desc[0].Len, q.Avail.Idx = 128, 1
+	v.VirtQueue[1] = q
+	if err := v.Tx(); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("Tx = %v, want ErrShortWrite", err)
+	}
+	if q.Used.Idx != 0 {
+		t.Fatal("incomplete packet was completed")
+	}
+}
+
+func TestNetResetDiscardsQueues(t *testing.T) {
+	t.Parallel()
+
+	v := virtio.NewNet(9, &mockInjector{}, &bytes.Buffer{}, make([]byte, 4096))
+	t.Cleanup(func() { _ = v.Close() })
+	for i := range 2 {
+		v.QueueReady(i, newSplitQueue())
+		v.LastAvailIdx[i] = 7
+	}
+	v.Reset()
+	if err := v.Tx(); !errors.Is(err, virtio.ErrVQNotInit) {
+		t.Fatalf("Tx after reset: %v", err)
+	}
+	if err := v.Rx(); !errors.Is(err, virtio.ErrVQNotInit) {
+		t.Fatalf("Rx after reset: %v", err)
+	}
+	if v.LastAvailIdx != [2]uint16{} {
+		t.Fatal("reset retained consumed queue indices")
+	}
+}
+
+func TestNetRxNegotiatedQueueWrap(t *testing.T) {
+	t.Parallel()
+
+	backend := newPacketBackend()
+	backend.packets <- []byte{0xaa, 0xbb, 0xcc}
+	mem := make([]byte, 4096)
+	v := virtio.NewNet(9, &mockInjector{}, backend, mem)
+	t.Cleanup(func() { _ = v.Close() })
+	q := newSplitQueue()
+	q.Size = 4
+	q.Desc[3] = virtio.SplitDesc{Addr: 256, Len: 64, Flags: 2}
+	q.Avail.Ring[0] = 3
+	q.Avail.Idx, q.Used.Idx = 5, 4
+	v.VirtQueue[0], v.LastAvailIdx[0] = q, 4
+	if err := v.Rx(); err != nil {
+		t.Fatal(err)
+	}
+	if q.Used.Idx != 5 || q.Used.Ring[0].ID != 3 || q.Used.Ring[0].Len != 15 {
+		t.Fatalf("wrapped completion = %+v, idx=%d", q.Used.Ring[0], q.Used.Idx)
+	}
+	if !bytes.Equal(mem[256+12:256+15], []byte{0xaa, 0xbb, 0xcc}) {
+		t.Fatal("wrapped packet copied to wrong buffer")
+	}
+	if q.Used.Ring[4] != (virtio.SplitUsedElem{}) {
+		t.Fatal("completion written outside negotiated ring")
+	}
+}
+
+func TestNetRxNegotiatedQueueBounds(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		setup func(*virtio.SplitQueue)
+	}{
+		{name: "head_out_of_range", setup: func(q *virtio.SplitQueue) { q.Avail.Ring[0] = 4 }},
+		{name: "next_out_of_range", setup: func(q *virtio.SplitQueue) { q.Desc[0].Flags, q.Desc[0].Next = 3, 4 }},
+		{name: "available_overrun", setup: func(q *virtio.SplitQueue) { q.Avail.Idx = 5 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			backend := newPacketBackend()
+			v := virtio.NewNet(9, &mockInjector{}, backend, make([]byte, 4096))
+			t.Cleanup(func() { _ = v.Close() })
+			q := newSplitQueue()
+			q.Size, q.Avail.Idx = 4, 1
+			q.Desc[0] = virtio.SplitDesc{Len: 64, Flags: 2}
+			q.Desc[4] = virtio.SplitDesc{Addr: 256, Len: 64, Flags: 2}
+			tc.setup(q)
+			v.VirtQueue[0] = q
+			if err := v.Rx(); !errors.Is(err, virtio.ErrNetDesc) {
+				t.Fatalf("Rx = %v, want ErrNetDesc", err)
+			}
+			if backend.reads.Load() != 0 || q.Used.Idx != 0 {
+				t.Fatal("invalid queue consumed a packet or published a completion")
+			}
+		})
+	}
+}

@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
+	"syscall"
 	"unsafe"
 )
 
@@ -74,28 +76,56 @@ type CPUIDEntry2 struct {
 	Padding  [3]uint32
 }
 
-// GetSupportedCPUID gets all supported CPUID entries for a vm.
+// GetSupportedCPUID gets all supported CPUID entries for a VM. Nent is an
+// optional initial capacity; the buffer grows if KVM reports E2BIG.
 func GetSupportedCPUID(kvmFd uintptr, kvmCPUID *CPUID) error {
-	var c *CPUID
+	cpuid, err := getSupportedCPUID(kvmCPUID.Nent, func(data []byte) error {
+		_, err := Ioctl(kvmFd,
+			IIOWR(kvmGetSupportedCPUID, 8),
+			uintptr(unsafe.Pointer(&data[0])))
 
-	data, err := kvmCPUID.Bytes()
+		return err
+	})
 	if err != nil {
 		return err
 	}
+	*kvmCPUID = *cpuid
 
-	if _, err = Ioctl(kvmFd,
-		IIOWR(kvmGetSupportedCPUID, unsafe.Sizeof(kvmCPUID)),
-		uintptr(unsafe.Pointer(&data[0]))); err != nil {
-		return err
+	return nil
+}
+
+// Leave room for future CPU leaves, but bound retries and memory use if a
+// kernel keeps rejecting the buffer. Current KVM limits are far below this.
+const maxSupportedCPUIDEntries = 4096
+
+func getSupportedCPUID(nent uint32, ioctl func([]byte) error) (*CPUID, error) {
+	if nent == 0 {
+		nent = 128
 	}
-
-	if c, err = NewCPUID(data); err != nil {
-		return err
+	if nent > maxSupportedCPUIDEntries {
+		return nil, fmt.Errorf("supported CPUID capacity %d exceeds %d: %w",
+			nent, maxSupportedCPUIDEntries, syscall.E2BIG)
 	}
+	for {
+		// struct kvm_cpuid2 has an 8-byte header and 40-byte entries.
+		data := make([]byte, 8+int(nent)*40)
+		binary.LittleEndian.PutUint32(data, nent)
+		err := ioctl(data)
+		if errors.Is(err, syscall.E2BIG) && nent < maxSupportedCPUIDEntries {
+			nent = min(nent*2, maxSupportedCPUIDEntries)
 
-	*kvmCPUID = *c
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("get supported CPUID with %d entries: %w", nent, err)
+		}
+		if returned := binary.LittleEndian.Uint32(data); returned > nent {
+			return nil, fmt.Errorf("supported CPUID returned %d entries for capacity %d: %w",
+				returned, nent, io.ErrUnexpectedEOF)
+		}
 
-	return err
+		return NewCPUID(data)
+	}
 }
 
 // SetCPUID2 sets entries for a vCPU.

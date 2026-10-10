@@ -1,9 +1,11 @@
 package virtio
 
 import (
+	"encoding/binary"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -348,10 +350,166 @@ func TestModernRejectsInvalidQueueMappings(t *testing.T) {
 			injected := 0
 			tr := newTestTransport(dev, make([]byte, 0x10000), &injected)
 			tr.queues[0] = queueState{desc: tc.desc, driver: tc.driver, device: tc.device, size: tc.size, enable: 1}
-			tr.activateQueue(0)
+			writeCfg(tr, 28, 1, 2)
 			if len(dev.ready) != 0 || tr.queues[0].enable != 0 {
 				t.Fatal("invalid queue mapping activated")
 			}
 		})
 	}
+}
+
+// reentrantModernDev reads transport registers from callbacks, as a device may
+// do while publishing a queue or stopping workers during reset.
+type reentrantModernDev struct {
+	mockModernDev
+	transport *ModernTransport
+	active    map[int]*SplitQueue
+	resets    int
+}
+
+func (d *reentrantModernDev) QueueReady(idx int, q *SplitQueue) {
+	_ = readCfg(d.transport, 20, 1)
+	if d.active == nil {
+		d.active = map[int]*SplitQueue{}
+	}
+	d.active[idx] = q
+}
+
+func (d *reentrantModernDev) Reset() {
+	_ = readCfg(d.transport, 20, 1)
+	d.active = nil
+	d.resets++
+}
+
+func TestModernConcurrentCommonConfiguration(t *testing.T) {
+	t.Parallel()
+
+	dev := &reentrantModernDev{mockModernDev: mockModernDev{
+		features: 0x00000002_a5a5a5a5,
+		numQ:     2,
+	}}
+	tr := NewModernTransport(dev, make([]byte, 0x10000), func() error { return nil })
+	dev.transport = tr
+	var workers sync.WaitGroup
+	workers.Go(func() {
+		for i := range 1000 {
+			writeCfg(tr, 0, uint64(i%2), 4)
+			writeCfg(tr, 8, uint64(i%2), 4)
+			writeCfg(tr, 12, uint64(i), 4)
+			writeCfg(tr, 16, uint64(i), 2)
+		}
+	})
+	workers.Go(func() {
+		for i := range 200 {
+			writeCfg(tr, 22, uint64(i%2), 2)
+			writeCfg(tr, 24, QueueSize, 2)
+			writeCfg(tr, 32, 0x1000, 4)
+			writeCfg(tr, 40, 0x2000, 4)
+			writeCfg(tr, 48, 0x3000, 4)
+			writeCfg(tr, 28, 1, 2)
+		}
+	})
+	workers.Go(func() {
+		for range 200 {
+			writeCfg(tr, 20, 0, 1)
+		}
+	})
+	workers.Go(func() {
+		var cfg [commonCfgLen]byte
+		for range 1000 {
+			tr.MMIO(commonCfgOffset, cfg[:], false)
+			selected := binary.LittleEndian.Uint32(cfg[0:])
+			features := binary.LittleEndian.Uint32(cfg[4:])
+			want := uint32(0xa5a5a5a5)
+			if selected == 1 {
+				want = 3 // Device bit 33 plus VIRTIO_F_VERSION_1.
+			}
+			if selected > 1 || features != want {
+				t.Errorf("inconsistent feature snapshot: selector=%d features=%#x", selected, features)
+
+				return
+			}
+			if binary.LittleEndian.Uint16(cfg[18:]) != 2 {
+				t.Error("queue count changed during configuration")
+
+				return
+			}
+		}
+	})
+	done := make(chan struct{})
+	go func() {
+		workers.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("configuration deadlocked during a reentrant device callback")
+	}
+
+	writeCfg(tr, 20, 0, 1)
+	if len(dev.active) != 0 || dev.resets != 201 || readCfg(tr, 28, 2) != 0 {
+		t.Fatal("reset retained a queue or lost a reset callback")
+	}
+}
+
+func TestModernResetWaitsForQueuePublication(t *testing.T) {
+	t.Parallel()
+
+	dev := &blockingQueueModernDev{
+		mockModernDev: mockModernDev{numQ: 1},
+		readyEntered:  make(chan struct{}),
+		releaseReady:  make(chan struct{}),
+		resetEntered:  make(chan struct{}),
+	}
+	tr := NewModernTransport(dev, make([]byte, 0x10000), func() error { return nil })
+	writeCfg(tr, 32, 0x1000, 4)
+	writeCfg(tr, 40, 0x2000, 4)
+	writeCfg(tr, 48, 0x3000, 4)
+	readyDone := make(chan struct{})
+	go func() {
+		writeCfg(tr, 28, 1, 2)
+		close(readyDone)
+	}()
+	<-dev.readyEntered
+	resetDone := make(chan struct{})
+	go func() {
+		writeCfg(tr, 20, 0, 1)
+		close(resetDone)
+	}()
+	select {
+	case <-dev.resetEntered:
+		close(dev.releaseReady)
+		t.Fatal("reset overtook an unfinished queue publication")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(dev.releaseReady)
+	<-readyDone
+	select {
+	case <-resetDone:
+	case <-time.After(time.Second):
+		t.Fatal("reset did not resume after queue publication")
+	}
+	if dev.active.Load() || readCfg(tr, 28, 2) != 0 {
+		t.Fatal("queue publication survived reset")
+	}
+}
+
+type blockingQueueModernDev struct {
+	mockModernDev
+	readyEntered chan struct{}
+	releaseReady chan struct{}
+	resetEntered chan struct{}
+	active       atomic.Bool
+}
+
+func (d *blockingQueueModernDev) QueueReady(_ int, _ *SplitQueue) {
+	close(d.readyEntered)
+	<-d.releaseReady
+	d.active.Store(true)
+}
+
+func (d *blockingQueueModernDev) Reset() {
+	close(d.resetEntered)
+	d.active.Store(false)
 }

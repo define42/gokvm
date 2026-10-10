@@ -396,9 +396,9 @@ func TestBlkClose(t *testing.T) {
 		t.Fatalf("Close: got %v, want nil", err)
 	}
 
-	// Second close should fail because the file descriptor is already closed.
-	if err := v.Close(); err == nil {
-		t.Fatal("second Close: got nil, want error")
+	// Closing an already stopped device is harmless.
+	if err := v.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
 	}
 }
 
@@ -641,39 +641,26 @@ func TestBlkIONilQueue(t *testing.T) {
 func TestLoadU16StoreAddU16(t *testing.T) {
 	t.Parallel()
 
-	var val uint16
+	for _, tc := range []struct {
+		name                 string
+		initial, delta, want uint16
+	}{
+		{name: "zero", initial: 0, delta: 0, want: 0},
+		{name: "increment", initial: 0, delta: 5, want: 5},
+		{name: "wrap", initial: 65535, delta: 2, want: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	if got := virtio.LoadU16(&val); got != 0 {
-		t.Fatalf("initial: got %d, want 0", got)
-	}
-
-	virtio.StoreAddU16(&val, 5)
-
-	if got := virtio.LoadU16(&val); got != 5 {
-		t.Fatalf("after +5: got %d, want 5", got)
-	}
-
-	// Concurrent modification: start N goroutines each incrementing by 1.
-	const N = 100
-
-	var wg sync.WaitGroup
-
-	wg.Add(N)
-
-	for i := 0; i < N; i++ {
-		go func() {
-			defer wg.Done()
-			virtio.StoreAddU16(&val, 1)
-		}()
-	}
-
-	wg.Wait()
-
-	got := virtio.LoadU16(&val)
-	t.Logf("after %d concurrent +1: val=%d", N, got)
-
-	if got < 5 {
-		t.Fatalf("value went backwards: %d", got)
+			value := tc.initial
+			if got := virtio.LoadU16(&value); got != tc.initial {
+				t.Fatalf("initial: got %d, want %d", got, tc.initial)
+			}
+			virtio.StoreAddU16(&value, tc.delta)
+			if got := virtio.LoadU16(&value); got != tc.want {
+				t.Fatalf("after increment: got %d, want %d", got, tc.want)
+			}
+		})
 	}
 }
 

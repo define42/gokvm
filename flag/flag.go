@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/define42/gokvm/ebda"
 )
 
 var ErrorInvalidSubcommands = errors.New("expected 'boot' or 'probe' subcommands")
@@ -21,6 +23,8 @@ var ErrRDPStats = errors.New("-rdp-stats requires -rdp")
 var ErrNetwork = errors.New("-net must be 'user' or 'none' and cannot be combined with -t")
 
 var ErrAudio = errors.New("-audio must be 'none' or 'rdp'; 'rdp' requires -rdp")
+
+var ErrCPUCount = fmt.Errorf("-c must be between 1 and %d", ebda.MaxVCPUs)
 
 type BootArgs struct {
 	Kernel         string
@@ -56,10 +60,7 @@ func parseBootArgs(args []string) (*BootArgs, error) {
 	bootCmd.StringVar(&c.ISO, "iso", "", "ISO image path or http(s) URL to boot")
 	//  refs: commit 1621292e73770aabbc146e72036de5e26f901e86 in kvmtool
 	bootCmd.StringVar(&c.Params, "p", `console=tty0 console=ttyS0 earlyprintk=serial `+
-		`noapic noacpi notsc nowatchdog `+
-		`nmi_watchdog=0 debug apic=debug show_lapic=all mitigations=off `+
-		`lapic tsc_early_khz=2000 `+
-		`dyndbg="file arch/x86/kernel/smpboot.c +plf ; file drivers/net/virtio_net.c +plf" `+
+		`noapic noacpi nowatchdog nmi_watchdog=0 mitigations=off lapic `+
 		`pci=realloc=off `+
 		`virtio_pci.force_legacy=1 rdinit=/init init=/init `+
 		`gokvm.ipv4_addr=192.168.20.1/24`,
@@ -86,7 +87,7 @@ func parseBootArgs(args []string) (*BootArgs, error) {
 	bootCmd.BoolVar(&c.RDPStats, "rdp-stats", false, "log RDP performance statistics every 5 seconds")
 	bootCmd.StringVar(&c.Audio, "audio", "", "audio output: rdp (virtio-snd playback through RDP) or none (default)")
 
-	bootCmd.IntVar(&c.NCPUs, "c", 1, "number of cpus")
+	bootCmd.IntVar(&c.NCPUs, "c", 1, fmt.Sprintf("number of cpus (1..%d)", ebda.MaxVCPUs))
 
 	msize := bootCmd.String("m", "1G",
 		"memory size: as number[gGmM], optional units, defaults to G")
@@ -97,6 +98,9 @@ func parseBootArgs(args []string) (*BootArgs, error) {
 
 	if err = bootCmd.Parse(args); err != nil {
 		return nil, err
+	}
+	if c.NCPUs < 1 || c.NCPUs > ebda.MaxVCPUs {
+		return nil, ErrCPUCount
 	}
 	var threadsSet bool
 	bootCmd.Visit(func(f *flag.Flag) {

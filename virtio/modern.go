@@ -2,6 +2,7 @@ package virtio
 
 import (
 	"encoding/binary"
+	"sync"
 	"sync/atomic"
 	"unsafe"
 )
@@ -133,9 +134,18 @@ type queueState struct {
 // ModernTransport implements the virtio 1.0 PCI transport. A device embeds it
 // and forwards the pci.CapsAndMMIO methods to it.
 type ModernTransport struct {
-	dev    ModernDevice
-	Mem    []byte
-	inject func() error
+	// writeMu preserves the order of configuration writes and their device
+	// callbacks. Device callbacks may not recursively issue common writes.
+	// commonMu protects register snapshots and is never held while
+	// calling the device, so callbacks may read configuration or raise IRQs.
+	writeMu  sync.Mutex
+	commonMu sync.RWMutex
+
+	dev       ModernDevice
+	Mem       []byte
+	inject    func() error
+	features  uint64
+	configLen int
 
 	deviceFeatureSel uint32
 	driverFeatureSel uint32
@@ -155,10 +165,12 @@ type ModernTransport struct {
 // (legacy INTx) interrupt line.
 func NewModernTransport(dev ModernDevice, mem []byte, inject func() error) *ModernTransport {
 	t := &ModernTransport{
-		dev:    dev,
-		Mem:    mem,
-		inject: inject,
-		queues: make([]queueState, dev.NumQueues()),
+		dev:       dev,
+		Mem:       mem,
+		inject:    inject,
+		features:  dev.DeviceFeatures() | featureVersion1,
+		configLen: dev.DeviceConfigLen(),
+		queues:    make([]queueState, dev.NumQueues()),
 	}
 
 	// Advertise the maximum queue size to the driver up front; it reads
@@ -228,13 +240,17 @@ func (t *ModernTransport) Capabilities() []byte {
 	// so all queues share the single notify doorbell.
 	caps = append(caps, virtioCap(20, cfgTypeNotify, capISRAt, notifyCfgOffset, notifyCfgLen)...)
 	caps = append(caps, virtioCap(16, cfgTypeISR, capDeviceAt, isrCfgOffset, isrCfgLen)...)
-	caps = append(caps, virtioCap(16, cfgTypeDevice, 0x00, deviceCfgOffset, uint32(t.dev.DeviceConfigLen()))...)
+	caps = append(caps, virtioCap(16, cfgTypeDevice, 0x00, deviceCfgOffset, uint32(t.configLen))...)
 
 	return caps
 }
 
 // MMIO dispatches a guest access within the BAR to the right structure.
 func (t *ModernTransport) MMIO(offset uint64, data []byte, isWrite bool) {
+	if len(data) == 0 {
+		return
+	}
+
 	switch {
 	case offset < commonCfgOffset+commonCfgLen:
 		t.mmioCommonCfg(offset-commonCfgOffset, data, isWrite)
@@ -260,7 +276,7 @@ func (t *ModernTransport) MMIO(offset uint64, data []byte, isWrite bool) {
 // deviceFeature returns the 32-bit window of the device feature set selected
 // by sel (0 = low bits, 1 = high bits including VIRTIO_F_VERSION_1).
 func (t *ModernTransport) deviceFeature(sel uint32) uint32 {
-	f := t.dev.DeviceFeatures() | featureVersion1
+	f := t.features
 
 	switch sel {
 	case 0:
@@ -281,7 +297,8 @@ func (t *ModernTransport) curQueue() *queueState {
 }
 
 // commonImage materializes the current state of the common configuration
-// structure so that reads of any width/offset can be served by slicing.
+// structure so that reads of any width/offset can be served by slicing. The
+// caller holds commonMu.
 func (t *ModernTransport) commonImage() [commonCfgLen]byte {
 	var b [commonCfgLen]byte
 
@@ -291,7 +308,7 @@ func (t *ModernTransport) commonImage() [commonCfgLen]byte {
 	le.PutUint32(b[8:], t.driverFeatureSel)
 	le.PutUint32(b[12:], t.driverFeature[t.driverFeatureSel&0x1])
 	le.PutUint16(b[16:], t.msixConfig)
-	le.PutUint16(b[18:], uint16(t.dev.NumQueues()))
+	le.PutUint16(b[18:], uint16(len(t.queues)))
 	b[20] = t.deviceStatus
 	b[21] = byte(atomic.LoadUint32(&t.configGen))
 	le.PutUint16(b[22:], t.queueSel)
@@ -323,14 +340,29 @@ func (t *ModernTransport) mmioCommonCfg(off uint64, data []byte, isWrite bool) {
 			end = commonCfgLen
 		}
 
+		t.commonMu.RLock()
 		img := t.commonImage()
+		t.commonMu.RUnlock()
 		copy(data, img[off:end])
 
 		return
 	}
 
-	le := binary.LittleEndian
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
 
+	// Stop workers before clearing their mappings. Other configuration writes
+	// wait for this callback, while register reads can proceed without deadlock.
+	if off == 20 && data[0] == 0 {
+		if dev, ok := t.dev.(interface{ Reset() }); ok {
+			dev.Reset()
+		}
+	}
+
+	le := binary.LittleEndian
+	var ready *SplitQueue
+	var readyIndex int
+	t.commonMu.Lock()
 	switch off {
 	case 0:
 		t.deviceFeatureSel = le.Uint32(data)
@@ -342,11 +374,6 @@ func (t *ModernTransport) mmioCommonCfg(off uint64, data []byte, isWrite bool) {
 		t.msixConfig = le.Uint16(data)
 	case 20:
 		if data[0] == 0 {
-			// Stop device workers before forgetting their guest-memory mappings.
-			if dev, ok := t.dev.(interface{ Reset() }); ok {
-				dev.Reset()
-			}
-
 			t.deviceFeatureSel = 0
 			t.driverFeatureSel = 0
 			t.driverFeature = [2]uint32{}
@@ -372,7 +399,8 @@ func (t *ModernTransport) mmioCommonCfg(off uint64, data []byte, isWrite bool) {
 		if q := t.curQueue(); q != nil {
 			q.enable = le.Uint16(data)
 			if q.enable == 1 {
-				t.activateQueue(int(t.queueSel))
+				readyIndex = int(t.queueSel)
+				ready = t.mapQueue(readyIndex)
 			}
 		}
 	// queue_desc/driver/device are 64-bit, each programmed as a low then a
@@ -389,6 +417,11 @@ func (t *ModernTransport) mmioCommonCfg(off uint64, data []byte, isWrite bool) {
 		writeQueueAddr(t.curQueue(), 2, 0, le.Uint32(data))
 	case 52:
 		writeQueueAddr(t.curQueue(), 2, 1, le.Uint32(data))
+	}
+	t.commonMu.Unlock()
+
+	if ready != nil {
+		t.dev.QueueReady(readyIndex, ready)
 	}
 }
 
@@ -409,9 +442,9 @@ func writeQueueAddr(q *queueState, which, half int, v uint32) {
 	}
 }
 
-// activateQueue maps the split virtqueue the driver programmed and hands it to
-// the device.
-func (t *ModernTransport) activateQueue(idx int) {
+// mapQueue validates and maps a programmed queue while commonMu is held. The
+// caller publishes the returned queue to the device after releasing commonMu.
+func (t *ModernTransport) mapQueue(idx int) *SplitQueue {
 	q := &t.queues[idx]
 	// SplitQueue uses fixed-size views. Validate each entire view before
 	// taking an unsafe pointer, even when the driver selects a smaller ring.
@@ -424,17 +457,15 @@ func (t *ModernTransport) activateQueue(idx int) {
 		!valid(q.device, uint64(unsafe.Sizeof(SplitUsed{})), 4) {
 		q.enable = 0
 
-		return
+		return nil
 	}
 
-	sq := &SplitQueue{
+	return &SplitQueue{
 		Desc:  (*[QueueSize]SplitDesc)(unsafe.Pointer(&t.Mem[q.desc])),
 		Avail: (*SplitAvail)(unsafe.Pointer(&t.Mem[q.driver])),
 		Used:  (*SplitUsed)(unsafe.Pointer(&t.Mem[q.device])),
 		Size:  q.size,
 	}
-
-	t.dev.QueueReady(idx, sq)
 }
 
 // setLoHi writes the low (half 0) or high (half 1) 32 bits of a 64-bit field.

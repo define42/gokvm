@@ -409,8 +409,8 @@ func TestVNCDisplayVGATextFallback(t *testing.T) {
 	defer d.Close()
 
 	mem := make([]byte, 0xc0000)
-	d.StartVGATextFallback(mem)
 	copy(mem[0xb8000:], []byte{'T', 0x0f, 'C', 0x0f})
+	d.StartVGATextFallback(mem)
 
 	conn, err := net.Dial("tcp", d.Addr())
 	if err != nil {
@@ -478,8 +478,8 @@ func TestVNCDisplayLinearFramebufferFallback(t *testing.T) {
 	defer d.Close()
 
 	mem := make([]byte, 0x1000)
-	d.StartLinearFramebufferFallback(mem, 0x100, 2, 1, 8)
 	copy(mem[0x100:], []byte{0x10, 0x20, 0x30, 0x00, 0x40, 0x50, 0x60, 0x00})
+	d.StartLinearFramebufferFallback(mem, 0x100, 2, 1, 8)
 
 	conn, err := net.Dial("tcp", d.Addr())
 	if err != nil {

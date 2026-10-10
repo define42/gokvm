@@ -1,9 +1,9 @@
 package vmm
 
 import (
-	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -254,6 +254,7 @@ func (v *VMM) Setup() error {
 	if err != nil {
 		return err
 	}
+	defer kern.Close()
 
 	isPVH, err := pvh.CheckPVH(kern)
 	if err != nil {
@@ -266,6 +267,7 @@ func (v *VMM) Setup() error {
 			return err
 		}
 
+		defer initrdFile.Close()
 		initrd = initrdFile
 	}
 
@@ -752,72 +754,64 @@ func padBuffer(buf *bytes.Buffer) {
 	}
 }
 
+// Boot runs the VM until a CPU stops or terminal input requests shutdown.
 func (v *VMM) Boot() error {
-	var err error
-	defer v.cleanupISO()
+	return v.BootContext(context.Background())
+}
 
+// BootContext coordinates CPU and terminal workers and returns the first real
+// execution error. Cancellation wakes CPUs even when KVM_RUN is blocked in HLT.
+func (v *VMM) BootContext(ctx context.Context) (bootErr error) {
+	defer v.cleanupISO()
+	defer func() { bootErr = errors.Join(bootErr, v.Close()) }()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	trace := v.TraceCount > 0
 	if err := v.SingleStep(trace); err != nil {
-		return fmt.Errorf("setting trace to %v:%w", trace, err)
+		return fmt.Errorf("setting trace to %v: %w", trace, err)
 	}
-
-	g := new(errgroup.Group)
-
-	for cpu := 0; cpu < v.NCPUs; cpu++ {
-		fmt.Printf("Start CPU %d of %d\r\n", cpu, v.NCPUs)
-
-		i := cpu
-
-		f := func() error {
-			err := v.VCPU(os.Stderr, i, v.TraceCount)
-			if err != nil {
-				// Serial input may still be waiting on stdin. Report the CPU
-				// failure now so it does not look like a guest boot hang.
-				log.Printf("CPU %d stopped: %v", i, err)
+	terminal := term.IsTerminal()
+	if terminal {
+		restore, err := term.SetRawMode()
+		if err != nil {
+			return err
+		}
+		defer restore()
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	// The stop worker is joined before Close can unmap any KVM state.
+	stopped := make(chan error, 1)
+	go func() { <-runCtx.Done(); stopped <- v.Stop() }()
+	var group errgroup.Group
+	for cpu := range v.NCPUs {
+		group.Go(func() error {
+			defer cancel()
+			err := v.VCPU(os.Stderr, cpu, v.TraceCount)
+			if errors.Is(err, machine.ErrMachineStopped) {
+				return nil
 			}
 
 			return err
-		}
-
-		g.Go(f)
+		})
 	}
+	if terminal {
+		group.Go(func() error {
+			defer cancel()
+			err := v.GetSerial().StartContext(runCtx, os.Stdin, v.InjectSerialIRQ)
+			if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
+				return nil
+			}
 
-	if !term.IsTerminal() {
-		fmt.Fprintln(os.Stderr, "this is not terminal and does not accept input")
-		select {}
+			return err
+		})
 	}
+	err := group.Wait()
+	cancel()
+	stopErr := <-stopped
 
-	restoreMode, err := term.SetRawMode()
-	if err != nil {
-		return err
-	}
-
-	defer restoreMode()
-
-	if err := v.SingleStep(trace); err != nil {
-		log.Printf("SingleStep(%v): %v", trace, err)
-
-		return err
-	}
-
-	in := bufio.NewReader(os.Stdin)
-
-	g.Go(func() error {
-		err := v.GetSerial().Start(*in, restoreMode, v.InjectSerialIRQ)
-		log.Printf("Serial exits: %v", err)
-
-		return err
-	})
-
-	fmt.Printf("Waiting for CPUs to exit\r\n")
-
-	if err := g.Wait(); err != nil {
-		log.Print(err)
-	}
-
-	fmt.Printf("All cpus done\n\r")
-
-	return nil
+	return errors.Join(err, stopErr, ctx.Err())
 }
 
 func (v *VMM) cleanupISO() {

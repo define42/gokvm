@@ -25,19 +25,22 @@ curl -s -O -L -C - --retry 5 \
   https://raw.githubusercontent.com/torvalds/linux/master/scripts/extract-vmlinux
 chmod a+x ./extract-vmlinux
 
-# Check that bzImage was compiled with linux.config
+# Check that bzImage was compiled with the requested configuration
 diff -u <(./extract-ikconfig ${bzImage}) ${config}
 
 # If needed, we build bzImage in local
 if [ $? -ne 0 ]; then
-  version=$(awk '/Kernel Configuration/ {print $3}' ./linux.config)
+  version=$(awk '/Kernel Configuration/ {print $3}' "${config}")
+  # Initial releases use linux-X.Y.tar.xz, although Kconfig records X.Y.0.
+  version=${version%.0}
   major_version=$(echo $version | awk -F\. '{print $1}')
   curl -s -O -L -C - --retry 5 \
     https://cdn.kernel.org/pub/linux/kernel/v${major_version}.x/linux-${version}.tar.xz \
     -o linux.tar.xz
 
   tar Jxf ./linux.tar.xz --one-top-level=_linux --strip-components 1
-  cp ${config} _linux/.config
+  cp "${config}" _linux/.config
+  make -C _linux olddefconfig
   make -j$(nproc) -C _linux
   cp _linux/arch/x86/boot/bzImage ${bzImage}
 fi

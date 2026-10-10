@@ -8,8 +8,10 @@ import (
 	"github.com/define42/gokvm/bootparam"
 )
 
+// MaxVCPUs is the maximum number of processors described by the boot MP table.
+const MaxVCPUs = 64
+
 const (
-	maxVCPUs           = 64
 	mpcTableOffset     = 0x40
 	mpcTableHeaderSize = 44
 	mpcCPUEntrySize    = 20
@@ -41,7 +43,7 @@ const (
 	mpAPICVersion = uint8(0x14)
 )
 
-var errInvalidVCPUNumber = fmt.Errorf("the number of vCPUs must be between 1 and %d", maxVCPUs)
+var errInvalidVCPUNumber = fmt.Errorf("the number of vCPUs must be between 1 and %d", MaxVCPUs)
 
 type (
 	// Extended BIOS Data Area (EBDA).
@@ -84,7 +86,7 @@ type (
 		lapic      uint32 // Local APIC addresss must be set.
 		_          uint32 // reserved
 
-		mpcCPU [maxVCPUs]mpcCPU
+		mpcCPU [MaxVCPUs]mpcCPU
 	}
 )
 
@@ -169,7 +171,7 @@ func apicAddr(apic uint32) uint32 {
 }
 
 func newMPCTable(nCPUs int) (*mpcTable, error) {
-	if nCPUs < 1 || nCPUs > maxVCPUs {
+	if nCPUs < 1 || nCPUs > MaxVCPUs {
 		return nil, errInvalidVCPUNumber
 	}
 

@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/define42/gokvm/ebda"
 	"github.com/define42/gokvm/flag"
 )
 
@@ -161,10 +162,7 @@ func TestParseBootArgsWithDefaults(t *testing.T) {
 	}
 
 	if c.Params != `console=tty0 console=ttyS0 earlyprintk=serial `+
-		`noapic noacpi notsc nowatchdog `+
-		`nmi_watchdog=0 debug apic=debug show_lapic=all mitigations=off `+
-		`lapic tsc_early_khz=2000 `+
-		`dyndbg="file arch/x86/kernel/smpboot.c +plf ; file drivers/net/virtio_net.c +plf" `+
+		`noapic noacpi nowatchdog nmi_watchdog=0 mitigations=off lapic `+
 		`pci=realloc=off `+
 		`virtio_pci.force_legacy=1 rdinit=/init init=/init `+
 		`gokvm.ipv4_addr=192.168.20.1/24` {
@@ -203,6 +201,51 @@ func TestParseBootArgsWithDefaults(t *testing.T) {
 
 	if c.TraceCount != 0 {
 		t.Errorf("trace: got %#x, want %#x", c.TraceCount, 1<<20)
+	}
+}
+
+func TestParseBootArgsCPUCount(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		count int
+		valid bool
+	}{
+		{name: "negative", count: -1},
+		{name: "zero", count: 0},
+		{name: "one", count: 1, valid: true},
+		{name: "maximum", count: ebda.MaxVCPUs, valid: true},
+		{name: "too-many", count: ebda.MaxVCPUs + 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c, _, err := flag.ParseArgs([]string{"gokvm", "boot", "-c", strconv.Itoa(tc.count)})
+			if !tc.valid {
+				if !errors.Is(err, flag.ErrCPUCount) {
+					t.Fatalf("got %v, want %v", err, flag.ErrCPUCount)
+				}
+
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c.NCPUs != tc.count {
+				t.Fatalf("got %d CPUs, want %d", c.NCPUs, tc.count)
+			}
+		})
+	}
+}
+
+func TestParseBootArgsPreservesExplicitCPUParams(t *testing.T) {
+	t.Parallel()
+	const params = `notsc tsc_early_khz=2000 debug apic=debug show_lapic=all nosmp dyndbg="file smpboot.c +p"`
+	c, _, err := flag.ParseArgs([]string{"gokvm", "boot", "-p", params})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Params != params || !c.ParamsSet {
+		t.Fatalf("explicit parameters changed: %+v", c)
 	}
 }
 

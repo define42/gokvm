@@ -2,7 +2,6 @@ package kvm
 
 import (
 	"errors"
-	"syscall"
 	"unsafe"
 )
 
@@ -191,13 +190,7 @@ func CreateVCPU(vmFd uintptr, vcpuID int) (uintptr, error) {
 
 // Run runs a single vcpu from the vcpufd from createvcpu.
 func Run(vcpuFd uintptr) error {
-	_, err := Ioctl(vcpuFd, IIO(kvmRun), uintptr(0))
-	if err != nil {
-		// refs: https://github.com/kvmtool/kvmtool/blob/415f92c33a227c02f6719d4594af6fad10f07abf/kvm-cpu.c#L44
-		if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EINTR) {
-			return nil
-		}
-	}
+	_, err := ioctlOnce(vcpuFd, IIO(kvmRun), 0)
 
 	return err
 }

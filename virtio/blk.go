@@ -3,10 +3,10 @@ package virtio
 import (
 	"encoding/binary"
 	"errors"
+	"io"
 	"log"
 	"sync"
 	"time"
-	"unsafe"
 
 	"github.com/define42/gokvm/disk"
 	"github.com/define42/gokvm/pci"
@@ -30,14 +30,15 @@ const (
 // call, preventing the compiler from caching the value
 // across iterations. This is needed for shared memory
 // fields (AvailRing.Idx, UsedRing.Idx) that are written
-// by KVM vCPU threads via unsafe.Pointer.
+// by KVM vCPU threads via unsafe.Pointer. Go goroutines must still
+// synchronize concurrent reads and writes; this is not an atomic load.
 //
 //go:noinline
 func LoadU16(p *uint16) uint16 { return *p }
 
-// StoreAddU16 atomically-enough increments a uint16
-// through a non-inlined function call, ensuring the
-// write is visible to other threads.
+// StoreAddU16 updates a shared ring index through a non-inlined call.
+// The caller must be the sole writer or externally serialize access;
+// this is not an atomic read-modify-write or a Go synchronization primitive.
 //
 //go:noinline
 func StoreAddU16(p *uint16, delta uint16) {
@@ -47,7 +48,10 @@ func StoreAddU16(p *uint16, delta uint16) {
 // Blk is a modern (virtio 1.0) block device.
 var _ pci.CapsAndMMIO = (*Blk)(nil)
 
-var errReadOnlyBlk = errors.New("virtio-blk: write to read-only device")
+var (
+	errReadOnlyBlk = errors.New("virtio-blk: write to read-only device")
+	ErrBlkDesc     = errors.New("invalid virtio-blk descriptor chain")
+)
 
 type Blk struct {
 	*ModernTransport
@@ -64,6 +68,8 @@ type Blk struct {
 	kick      chan interface{}
 	done      chan struct{}
 	closeOnce sync.Once
+	closeErr  error
+	queueMu   sync.Mutex
 
 	irq         uint8
 	IRQInjector IRQInjector
@@ -137,9 +143,20 @@ func (v *Blk) ReadDeviceConfig(offset uint64, data []byte) {
 func (v *Blk) WriteDeviceConfig(offset uint64, data []byte) {}
 
 func (v *Blk) QueueReady(idx int, q *SplitQueue) {
+	v.queueMu.Lock()
+	defer v.queueMu.Unlock()
 	if idx == blkQueue {
 		v.VirtQueue[idx] = q
+		v.LastAvailIdx[idx] = 0
 	}
+}
+
+// Reset discards queue mappings after any active I/O batch finishes.
+func (v *Blk) Reset() {
+	v.queueMu.Lock()
+	defer v.queueMu.Unlock()
+	v.VirtQueue = [blkNumQueues]*SplitQueue{}
+	v.LastAvailIdx = [blkNumQueues]uint16{}
 }
 
 func (v *Blk) Notify(idx int) {
@@ -183,83 +200,142 @@ type BlkReq struct {
 	Sector uint64
 }
 
-func (v *Blk) IO() error {
-	const sel = blkQueue
+type blkPendingRequest struct {
+	id, length uint32
+	status     *byte
+	data       []byte
+	offset     int64
+	result     byte
+	write      bool
+}
 
+func (v *Blk) IO() error {
+	v.queueMu.Lock()
+	defer v.queueMu.Unlock()
+	select {
+	case <-v.done:
+		return io.ErrClosedPipe
+	default:
+	}
+
+	const sel = blkQueue
 	q := v.VirtQueue[sel]
 	if q == nil {
 		return ErrVQNotInit
 	}
-
-	avail := q.Avail
-	used := q.Used
-
-	if v.LastAvailIdx[sel] == LoadU16(&avail.Idx) {
+	queueSize := uint16(QueueSize)
+	if q.Size != 0 && q.Size <= QueueSize {
+		queueSize = q.Size
+	}
+	// Snapshot a bounded batch. Publish no completion until its writes are
+	// durable, allowing one Sync to cover every queued write in the batch.
+	// BenchmarkBlkWriteBatch reduces eight queued writes from eight Syncs to one.
+	count := LoadU16(&q.Avail.Idx) - v.LastAvailIdx[sel]
+	if count == 0 {
 		return ErrNoTxPacket
 	}
-
-	for v.LastAvailIdx[sel] != LoadU16(&avail.Idx) {
-		descID := avail.Ring[v.LastAvailIdx[sel]%QueueSize]
-
-		// This structure holds both the index of the descriptor
-		// chain and the number of bytes written to memory as part
-		// of serving the request.
-		uidx := LoadU16(&used.Idx)
-		used.Ring[uidx%QueueSize].ID = uint32(descID)
-		used.Ring[uidx%QueueSize].Len = 0
-
-		var buf [3][]byte
-
-		for i := 0; i < 3; i++ {
-			desc := q.Desc[descID]
-			buf[i] = v.Mem[desc.Addr : desc.Addr+uint64(desc.Len)]
-
-			used.Ring[uidx%QueueSize].Len += desc.Len
-			descID = desc.Next
+	if count > queueSize {
+		return ErrBlkDesc
+	}
+	var pending [QueueSize]blkPendingRequest
+	// Snapshot validated request fields and slices before I/O. A guest may
+	// change descriptors while another request is blocked in the backing store;
+	// never reread unchecked addresses or next indices after this pass.
+	for i := uint16(0); i < count; i++ {
+		head := q.Avail.Ring[(v.LastAvailIdx[sel]+i)%queueSize]
+		if err := v.snapshotRequest(q, queueSize, head, &pending[i]); err != nil {
+			return err
 		}
-
-		// buf[0] contains type, reserved, and sector.
-		// buf[1] contains raw io data.
-		// buf[2] contains a status field.
-		//
-		// refs https://wiki.osdev.org/Virtio#Block_Device_Packets
-		blkReq := *(*BlkReq)(unsafe.Pointer(&buf[0][0]))
-		data := buf[1]
-
-		var ioErr error
-
-		isWrite := blkReq.Type&0x1 == 0x1
-		switch {
-		case isWrite && v.readOnly:
-			ioErr = errReadOnlyBlk
-		case isWrite:
-			_, ioErr = v.image.WriteAt(
-				data,
-				int64(blkReq.Sector*SectorSize),
-			)
-
-			if ioErr == nil {
-				ioErr = v.image.Sync()
-			}
-		default:
-			_, ioErr = v.image.ReadAt(
-				data,
-				int64(blkReq.Sector*SectorSize),
-			)
-		}
-
-		// Write status byte per virtio spec.
-		if ioErr != nil {
-			buf[2][0] = 1 // VIRTIO_BLK_S_IOERR
-		} else {
-			buf[2][0] = 0 // VIRTIO_BLK_S_OK
-		}
-
-		StoreAddU16(&used.Idx, 1)
-		v.LastAvailIdx[sel]++
 	}
 
+	needsSync := false
+	for i := uint16(0); i < count; i++ {
+		c := &pending[i]
+		if c.result == 2 {
+			continue
+		}
+		var ioErr error
+		switch {
+		case c.write && v.readOnly:
+			ioErr = errReadOnlyBlk
+		case c.write:
+			_, ioErr = v.image.WriteAt(c.data, c.offset)
+			needsSync = needsSync || ioErr == nil
+		default:
+			_, ioErr = v.image.ReadAt(c.data, c.offset)
+		}
+		if ioErr != nil {
+			c.result = 1 // VIRTIO_BLK_S_IOERR
+		}
+	}
+	if needsSync {
+		if err := v.image.Sync(); err != nil {
+			for i := uint16(0); i < count; i++ {
+				if pending[i].write {
+					pending[i].result = 1
+				}
+			}
+		}
+	}
+	usedIdx := LoadU16(&q.Used.Idx)
+	for i := uint16(0); i < count; i++ {
+		c := &pending[i]
+		*c.status = c.result
+		q.Used.Ring[(usedIdx+i)%queueSize] = SplitUsedElem{ID: c.id, Len: c.length}
+	}
+	StoreAddU16(&q.Used.Idx, count)
+	v.LastAvailIdx[sel] += count
+
 	return v.Interrupt()
+}
+
+// snapshotRequest retains only validated guest slices and command fields.
+func (v *Blk) snapshotRequest(q *SplitQueue, queueSize, descID uint16, c *blkPendingRequest) error {
+	c.id = uint32(descID)
+	var seen [QueueSize]bool
+	for j := uint16(0); j < queueSize; j++ {
+		if descID >= queueSize || seen[descID] {
+			return ErrBlkDesc
+		}
+		seen[descID] = true
+		desc := q.Desc[descID]
+		if desc.Addr > uint64(len(v.Mem)) || uint64(desc.Len) > uint64(len(v.Mem))-desc.Addr ||
+			(j == 0 && desc.Len < 16) {
+			return ErrBlkDesc
+		}
+		data := v.Mem[desc.Addr : desc.Addr+uint64(desc.Len)]
+		c.length += desc.Len
+		if j == 0 {
+			typ := binary.LittleEndian.Uint32(data)
+			c.write = typ == 1
+			c.offset = int64(binary.LittleEndian.Uint64(data[8:]) * SectorSize)
+			if typ != 0 && typ != 1 {
+				// Only IN/OUT are advertised. In particular, FLUSH must not
+				// be mistaken for a read; reject it using its status buffer.
+				c.result = 2 // VIRTIO_BLK_S_UNSUPP
+			}
+		} else if c.result != 2 && j == 1 {
+			c.data = data
+		}
+		last := j == 2
+		if c.result == 2 {
+			last = desc.Flags&descFNext == 0
+		}
+		if last {
+			if j == 0 || len(data) == 0 || (c.result == 2 && desc.Flags&descFWrite == 0) {
+				return ErrBlkDesc
+			}
+			c.status = &data[0]
+
+			break
+		}
+		descID = desc.Next
+	}
+	if c.status == nil {
+		return ErrBlkDesc
+	}
+
+	return nil
 }
 
 // Read and Write satisfy pci.Device. A modern device has no IO-port BAR, so
@@ -274,9 +350,12 @@ func (v *Blk) Size() uint64 { return 0 }
 
 func (v *Blk) Close() error {
 	log.Println("virtio-blk: Close called")
-	v.closeOnce.Do(func() { close(v.done) })
+	v.closeOnce.Do(func() {
+		close(v.done)
+		v.closeErr = v.image.Close()
+	})
 
-	return v.image.Close()
+	return v.closeErr
 }
 
 func NewBlk(path string, irq uint8, irqInjector IRQInjector, mem []byte) (*Blk, error) {

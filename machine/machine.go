@@ -12,6 +12,7 @@ import (
 	"os"
 	"reflect"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"unsafe"
@@ -157,46 +158,39 @@ type Machine struct {
 	devices        []iodev.Device
 	ioportHandlers [0x10000][2]func(port uint64, bytes []byte) error
 	stopped        uint32
+	runMu          sync.Mutex
+	runWG          sync.WaitGroup
+	deviceWG       sync.WaitGroup
+	threads        map[int]int
+	closeOnce      sync.Once
+	closeErr       error
+	vmCreated      bool
+	runMappings    [][]byte
 	vesaEnabled    bool
-}
-
-// Close stops vCPU goroutines and releases PCI device
-// resources (tap FDs, disk FDs, signal registrations).
-func (m *Machine) Close() error {
-	atomic.StoreUint32(&m.stopped, 1)
-
-	for _, r := range m.runs {
-		r.ImmediateExit = 1
-	}
-
-	for _, d := range m.pci.Devices {
-		if c, ok := d.(io.Closer); ok {
-			c.Close()
-		}
-	}
-
-	if m.kvmFile != nil {
-		_ = m.kvmFile.Close()
-		m.kvmFile = nil
-	}
-
-	return nil
 }
 
 // New creates a new KVM. This includes opening the kvm device, creating VM, creating
 // vCPUs, and attaching memory, disk (if needed), and tap (if needed).
-func New(kvmPath string, nCpus int, memSize int) (*Machine, error) {
+func New(kvmPath string, nCpus int, memSize int) (_ *Machine, initErr error) {
+	if nCpus < 1 || nCpus > ebda.MaxVCPUs {
+		return nil, fmt.Errorf("cpu count %d outside 1..%d: %w", nCpus, ebda.MaxVCPUs, ErrBadCPU)
+	}
 	if memSize < MinMemSize {
 		return nil, fmt.Errorf("memory size %d:%w", memSize, ErrMemTooSmall)
 	}
 
 	m := &Machine{}
+	defer func() {
+		if initErr != nil {
+			initErr = errors.Join(initErr, m.Close())
+		}
+	}()
 
 	m.pci = pci.New(pci.NewBridge())
 
 	var err error
 
-	m.kvmFile, m.kvmFd, m.vmFd, m.vcpuFds, m.runs, err = initVMandVCPU(kvmPath, nCpus)
+	err = m.initVMandVCPU(kvmPath, nCpus)
 	if err != nil {
 		return nil, err
 	}
@@ -204,14 +198,12 @@ func New(kvmPath string, nCpus int, memSize int) (*Machine, error) {
 	// initCPUIDs here manually
 	for cpuNr := range m.runs {
 		if err := m.initCPUID(cpuNr); err != nil {
-			_ = m.Close()
-
 			return nil, err
 		}
 	}
 
 	if m.memMapping, m.mem, err = mapGuestMemory(memSize); err != nil {
-		return m, err
+		return nil, err
 	}
 
 	err = kvm.SetUserMemoryRegion(m.vmFd, &kvm.UserspaceMemoryRegion{
@@ -219,7 +211,7 @@ func New(kvmPath string, nCpus int, memSize int) (*Machine, error) {
 		UserspaceAddr: uint64(uintptr(unsafe.Pointer(&m.mem[0]))),
 	})
 	if err != nil {
-		return m, err
+		return nil, err
 	}
 
 	// Poison memory.
@@ -257,10 +249,10 @@ func (m *Machine) AddUserNet() error {
 
 func (m *Machine) addNetwork(backend io.ReadWriter) {
 	v := virtio.NewNet(virtioNetIRQ, m, backend, m.mem)
-	go v.TxThreadEntry()
-	go v.RxThreadEntry()
+	m.deviceWG.Go(v.TxThreadEntry)
+	m.deviceWG.Go(v.RxThreadEntry)
 	// 00:01.0 for Virtio net
-	m.pci.Devices = append(m.pci.Devices, v)
+	m.pci.AddDevices(v)
 }
 
 func (m *Machine) AddDisk(diskPath string) error {
@@ -269,9 +261,9 @@ func (m *Machine) AddDisk(diskPath string) error {
 		return err
 	}
 
-	go v.IOThreadEntry()
+	m.deviceWG.Go(v.IOThreadEntry)
 	// 00:02.0 for Virtio blk
-	m.pci.Devices = append(m.pci.Devices, v)
+	m.pci.AddDevices(v)
 
 	return nil
 }
@@ -282,14 +274,14 @@ func (m *Machine) AddReadOnlyDisk(diskPath string) error {
 		return err
 	}
 
-	go v.IOThreadEntry()
-	m.pci.Devices = append(m.pci.Devices, v)
+	m.deviceWG.Go(v.IOThreadEntry)
+	m.pci.AddDevices(v)
 
 	return nil
 }
 
 func (m *Machine) AddReadOnlyCDROM(r io.ReaderAt, size int64) {
-	m.pci.Devices = append(m.pci.Devices, pci.NewIDEController())
+	m.pci.AddDevices(pci.NewIDEController())
 
 	for _, dev := range iodev.NewATAPICDROM(r, size, m.InjectIDEPrimaryIRQ) {
 		m.AddDevice(dev)
@@ -306,9 +298,9 @@ func (m *Machine) AddGPUDisplay(display virtio.Display) error {
 		resizable.SetResizeHandler(v.SetDisplaySize)
 	}
 
-	go v.IOThreadEntry()
+	m.deviceWG.Go(v.IOThreadEntry)
 	// 00:03.0 for Virtio gpu
-	m.pci.Devices = append(m.pci.Devices, v)
+	m.pci.AddDevices(v)
 
 	return nil
 }
@@ -316,8 +308,8 @@ func (m *Machine) AddGPUDisplay(display virtio.Display) error {
 // AddSound attaches a clocked virtio-snd playback device to the audio sink.
 func (m *Machine) AddSound(sink virtio.SoundSink) {
 	v := virtio.NewSound(virtioSoundIRQ, m.InjectVirtioSoundIRQ, m.mem, sink)
-	m.pci.Devices = append(m.pci.Devices, v)
-	go v.IOThreadEntry()
+	m.pci.AddDevices(v)
+	m.deviceWG.Go(v.IOThreadEntry)
 }
 
 func (m *Machine) AddPS2Input() virtio.VNCInput {
@@ -331,10 +323,10 @@ func (m *Machine) AddVirtioInput() virtio.VNCInput {
 	keyboard := virtio.NewInputKeyboard(virtioInputKeyboardIRQ, m.InjectVirtioInputKeyboardIRQ, m.mem)
 	pointer := virtio.NewInputTablet(virtioInputPointerIRQ, m.InjectVirtioInputPointerIRQ, m.mem)
 
-	go keyboard.IOThreadEntry()
-	go pointer.IOThreadEntry()
+	m.deviceWG.Go(keyboard.IOThreadEntry)
+	m.deviceWG.Go(pointer.IOThreadEntry)
 
-	m.pci.Devices = append(m.pci.Devices, keyboard, pointer)
+	m.pci.AddDevices(keyboard, pointer)
 
 	return virtio.NewInputPair(keyboard, pointer)
 }
@@ -927,34 +919,21 @@ func (m *Machine) SingleStep(onoff bool) error {
 // RunInfiniteLoop runs the guest cpu until there is an error.
 // If the error is ErrExitDebug, this function can be called again.
 func (m *Machine) RunInfiniteLoop(cpu int) error {
-	// https://www.kernel.org/doc/Documentation/virtual/kvm/api.txt
-	// - vcpu ioctls: These query and set attributes that control the operation
-	//   of a single virtual cpu.
-	//
-	//   vcpu ioctls should be issued from the same thread that was used to create
-	//   the vcpu, except for asynchronous vcpu ioctl that are marked as such in
-	//   the documentation.  Otherwise, the first ioctl after switching threads
-	//   could see a performance impact.
-	//
-	// - device ioctls: These query and set attributes that control the operation
-	//   of a single device.
-	//
-	//   device ioctls must be issued from the same process (address space) that
-	//   was used to create the VM.
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+	fd, err := m.beginRun(cpu)
+	if err != nil {
+		return err
+	}
+	defer m.endRun(cpu)
 
+	return m.runInfiniteLoop(cpu, fd)
+}
+
+func (m *Machine) runInfiniteLoop(cpu int, fd uintptr) error {
 	for {
-		isContinue, err := m.RunOnce(cpu)
-		if isContinue {
-			if err != nil {
-				fmt.Printf("%v\r\n", err)
-			}
-
-			continue
-		}
-
-		if err != nil {
+		again, err := m.runOnce(cpu, fd)
+		if err != nil || !again {
 			return err
 		}
 	}
@@ -962,17 +941,32 @@ func (m *Machine) RunInfiniteLoop(cpu int) error {
 
 // RunOnce runs the guest vCPU until it exits.
 func (m *Machine) RunOnce(cpu int) (bool, error) {
-	fd, err := m.CPUToFD(cpu)
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	fd, err := m.beginRun(cpu)
 	if err != nil {
 		return false, err
 	}
+	defer m.endRun(cpu)
 
-	_ = kvm.Run(fd)
+	return m.runOnce(cpu, fd)
+}
 
+func (m *Machine) runOnce(cpu int, fd uintptr) (bool, error) {
 	if atomic.LoadUint32(&m.stopped) != 0 {
-		log.Printf("RunOnce: stopped flag set, exiting")
-
 		return false, ErrMachineStopped
+	}
+	err := kvm.Run(fd)
+	if atomic.LoadUint32(&m.stopped) != 0 {
+		return false, ErrMachineStopped
+	}
+	// An interrupted/retryable run has no valid exit reason. Do not replay the
+	// previous I/O exit; return to the loop so cancellation is checked again.
+	if errors.Is(err, syscall.EINTR) || errors.Is(err, syscall.EAGAIN) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("run vCPU %d: %w", cpu, err)
 	}
 
 	exit := kvm.ExitType(m.runs[cpu].ExitReason)
@@ -1014,8 +1008,6 @@ func (m *Machine) RunOnce(cpu int) (bool, error) {
 		}
 
 		return true, err
-	case kvm.EXITUNKNOWN:
-		return true, err
 	case kvm.EXITINTR:
 		// When a signal is sent to the thread hosting the VM it will result in EINTR
 		// refs https://gist.github.com/mcastelino/df7e65ade874f6890f618dc51778d83a
@@ -1023,7 +1015,8 @@ func (m *Machine) RunOnce(cpu int) (bool, error) {
 	case kvm.EXITDEBUG:
 		return false, kvm.ErrDebug
 
-	case kvm.EXITDCR,
+	case kvm.EXITUNKNOWN,
+		kvm.EXITDCR,
 		kvm.EXITEXCEPTION,
 		kvm.EXITFAILENTRY,
 		kvm.EXITHYPERCALL,
@@ -1153,7 +1146,7 @@ func (m *Machine) initIOPortHandlers() {
 	}
 
 	// PCI devices
-	for _, dev := range m.pci.Devices {
+	for _, dev := range m.pci.Devices() {
 		m.registerIOPortHandler(dev.IOPort(), dev.IOPort()+dev.Size(), dev.Read, dev.Write)
 	}
 }
@@ -1331,8 +1324,8 @@ func show(indent string, l ...interface{}) string {
 
 // CPUToFD translates a CPU number to an fd.
 func (m *Machine) CPUToFD(cpu int) (uintptr, error) {
-	if cpu > len(m.vcpuFds) {
-		return 0, fmt.Errorf("cpu %d out of range 0-%d:%w", cpu, len(m.vcpuFds), ErrBadCPU)
+	if cpu < 0 || cpu >= len(m.vcpuFds) {
+		return 0, fmt.Errorf("cpu %d outside [0, %d): %w", cpu, len(m.vcpuFds), ErrBadCPU)
 	}
 
 	return m.vcpuFds[cpu], nil
@@ -1437,90 +1430,80 @@ func GetReg(r *kvm.Regs, reg x86asm.Reg) (*uint64, error) {
 	return nil, fmt.Errorf("register %v%w", reg, ErrUnsupported)
 }
 
-// InitKVM takes care of the general kvm setup without dependencies to runtime target.
-func initVMandVCPU(
-	kvmPath string,
-	nCpus int,
-) (*os.File, uintptr, uintptr, []uintptr, []*kvm.RunData, error) {
+// initVMandVCPU records each resource immediately, so New can release partial
+// initialization through the same Close path used after a successful run.
+func (m *Machine) initVMandVCPU(kvmPath string, nCpus int) error {
 	var err error
-
-	devKVM, err := os.OpenFile(kvmPath, os.O_RDWR, 0o644)
+	m.kvmFile, err = os.OpenFile(kvmPath, os.O_RDWR, 0)
 	if err != nil {
-		return nil, 0, 0, nil, nil, err
+		return err
 	}
-	closeOnError := true
-	defer func() {
-		if closeOnError {
-			_ = devKVM.Close()
-		}
-	}()
-
-	kvmFd := devKVM.Fd()
-	vmFd := uintptr(0)
-	vcpuFds := make([]uintptr, nCpus)
-	runs := make([]*kvm.RunData, nCpus)
-
-	if vmFd, err = kvm.CreateVM(kvmFd); err != nil {
-		return nil, 0, 0, nil, nil, fmt.Errorf("CreateVM: %w", err)
-	}
-
-	if err := kvm.SetTSSAddr(vmFd, pvh.KVMTSSStart); err != nil {
-		return nil, 0, 0, nil, nil, err
-	}
-
-	if err := kvm.SetIdentityMapAddr(vmFd, pvh.KVMIdentityMapStart); err != nil {
-		return nil, 0, 0, nil, nil, err
-	}
-
-	if err := kvm.CreateIRQChip(vmFd); err != nil {
-		return nil, 0, 0, nil, nil, err
-	}
-
-	if err := kvm.CreatePIT2(vmFd); err != nil {
-		return nil, 0, 0, nil, nil, err
-	}
-
-	mmapSize, err := kvm.GetVCPUMMmapSize(kvmFd)
+	m.kvmFd = m.kvmFile.Fd()
+	supported, err := kvm.CheckExtension(m.kvmFd, kvm.CapImmediateExit)
 	if err != nil {
-		return nil, 0, 0, nil, nil, err
+		return err
+	}
+	if supported == 0 {
+		return fmt.Errorf("KVM immediate exit: %w", ErrUnsupported)
+	}
+	m.vmFd, err = kvm.CreateVM(m.kvmFd)
+	if err != nil {
+		return fmt.Errorf("create VM: %w", err)
+	}
+	m.vmCreated = true
+	if err := kvm.SetTSSAddr(m.vmFd, pvh.KVMTSSStart); err != nil {
+		return err
+	}
+	if err := kvm.SetIdentityMapAddr(m.vmFd, pvh.KVMIdentityMapStart); err != nil {
+		return err
+	}
+	if err := kvm.CreateIRQChip(m.vmFd); err != nil {
+		return err
+	}
+	if err := kvm.CreatePIT2(m.vmFd); err != nil {
+		return err
+	}
+	mmapSize, err := kvm.GetVCPUMMmapSize(m.kvmFd)
+	if err != nil {
+		return err
+	}
+	for cpu := range nCpus {
+		fd, err := kvm.CreateVCPU(m.vmFd, cpu)
+		if err != nil {
+			return err
+		}
+		m.vcpuFds = append(m.vcpuFds, fd)
+		mapping, err := syscall.Mmap(int(fd), 0, int(mmapSize), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+		if err != nil {
+			return err
+		}
+		m.runMappings = append(m.runMappings, mapping)
+		m.runs = append(m.runs, (*kvm.RunData)(unsafe.Pointer(&mapping[0])))
 	}
 
-	for cpu := 0; cpu < nCpus; cpu++ {
-		// Create vCPU
-		vcpuFds[cpu], err = kvm.CreateVCPU(vmFd, cpu)
-		if err != nil {
-			return nil, 0, 0, nil, nil, err
-		}
-
-		// init kvm_run structure
-		r, err := syscall.Mmap(int(vcpuFds[cpu]), 0, int(mmapSize),
-			syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
-		if err != nil {
-			return nil, 0, 0, nil, nil, err
-		}
-
-		runs[cpu] = (*kvm.RunData)(unsafe.Pointer(&r[0]))
-	}
-
-	closeOnError = false
-
-	return devKVM, kvmFd, vmFd, vcpuFds, runs, nil
+	return nil
 }
 
 func (m *Machine) VCPU(stdout io.Writer, cpu, traceCount int) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	fd, err := m.beginRun(cpu)
+	if err != nil {
+		return err
+	}
+	defer m.endRun(cpu)
 	trace := traceCount > 0
 
-	var err error
 	// Consider ANOTHER option, maxInsCount, which would
 	// exit this loop after a certain number of instructions
 	// were run.
 	for tc := 0; ; tc++ {
-		err = m.RunInfiniteLoop(cpu)
+		err = m.runInfiniteLoop(cpu, fd)
 		if err == nil {
-			continue
+			return nil
 		}
 
-		if !errors.Is(err, kvm.ErrDebug) {
+		if !trace || !errors.Is(err, kvm.ErrDebug) {
 			return fmt.Errorf("CPU %d: %w", cpu, err)
 		}
 

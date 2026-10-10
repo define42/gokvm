@@ -61,6 +61,7 @@ type Net struct {
 	closeErr  error
 	queueMu   [netNumQueues]sync.Mutex
 	rxPacket  [netHdrLen + 65536]byte
+	txPacket  [netHdrLen + 65536]byte
 
 	irq         uint8
 	IRQInjector IRQInjector
@@ -118,8 +119,19 @@ func (v *Net) QueueReady(idx int, q *SplitQueue) {
 
 	v.queueMu[idx].Lock()
 	v.VirtQueue[idx] = q
+	v.LastAvailIdx[idx] = 0
 	v.queueMu[idx].Unlock()
 	v.Notify(idx)
+}
+
+// Reset waits for both queue workers before forgetting guest mappings.
+func (v *Net) Reset() {
+	v.queueMu[netRxQueue].Lock()
+	defer v.queueMu[netRxQueue].Unlock()
+	v.queueMu[netTxQueue].Lock()
+	defer v.queueMu[netTxQueue].Unlock()
+	v.VirtQueue = [netNumQueues]*SplitQueue{}
+	v.LastAvailIdx = [netNumQueues]uint16{}
 }
 
 func (v *Net) Notify(idx int) {
@@ -184,11 +196,19 @@ func (v *Net) Rx() error {
 	avail := q.Avail
 	used := q.Used
 
-	if v.LastAvailIdx[sel] == LoadU16(&avail.Idx) {
+	queueSize := uint16(QueueSize)
+	if q.Size != 0 && q.Size <= QueueSize {
+		queueSize = q.Size
+	}
+	count := LoadU16(&avail.Idx) - v.LastAvailIdx[sel]
+	if count == 0 {
 		return ErrNoRxBuf
 	}
+	if count > queueSize {
+		return ErrNetDesc
+	}
 
-	head := avail.Ring[v.LastAvailIdx[sel]%QueueSize]
+	head := avail.Ring[v.LastAvailIdx[sel]%queueSize]
 	buffers, capacity, err := v.rxBuffers(q, head)
 	if err != nil {
 		return err
@@ -205,9 +225,9 @@ func (v *Net) Rx() error {
 	packet[10] = 1 // virtio_net_hdr_v1.num_buffers
 
 	uidx := LoadU16(&used.Idx)
-	used.Ring[uidx%QueueSize] = SplitUsedElem{ID: uint32(head)}
+	used.Ring[uidx%queueSize] = SplitUsedElem{ID: uint32(head)}
 	if len(packet) <= capacity {
-		used.Ring[uidx%QueueSize].Len = uint32(len(packet))
+		used.Ring[uidx%queueSize].Len = uint32(len(packet))
 		for _, buf := range buffers {
 			copied := copy(buf, packet)
 			packet = packet[copied:]
@@ -230,12 +250,17 @@ func (v *Net) rxBuffers(q *SplitQueue, head uint16) ([][]byte, int, error) {
 	var buffers [][]byte
 	capacity := 0
 	descID := head
-	for range QueueSize {
-		if descID >= QueueSize {
+	queueSize := uint16(QueueSize)
+	if q.Size != 0 && q.Size <= QueueSize {
+		queueSize = q.Size
+	}
+	for range queueSize {
+		if descID >= queueSize {
 			return nil, 0, ErrNetDesc
 		}
 		desc := q.Desc[descID]
-		if desc.Flags&descFWrite == 0 || desc.Addr > uint64(len(v.Mem)) ||
+		if desc.Flags&descFWrite == 0 || desc.Flags & ^uint16(descFWrite|descFNext) != 0 ||
+			desc.Addr > uint64(len(v.Mem)) ||
 			uint64(desc.Len) > uint64(len(v.Mem))-desc.Addr {
 			return nil, 0, ErrNetDesc
 		}
@@ -300,39 +325,54 @@ func (v *Net) Tx() error {
 		return ErrNoTxPacket
 	}
 
-	for v.LastAvailIdx[sel] != LoadU16(&avail.Idx) {
-		buf := []byte{}
-		descID := avail.Ring[v.LastAvailIdx[sel]%QueueSize]
-
-		uidx := LoadU16(&used.Idx)
-		used.Ring[uidx%QueueSize].ID = uint32(descID)
-		used.Ring[uidx%QueueSize].Len = 0
-
+	queueSize := uint16(QueueSize)
+	if q.Size != 0 && q.Size <= QueueSize {
+		queueSize = q.Size
+	}
+	count := LoadU16(&avail.Idx) - v.LastAvailIdx[sel]
+	if count > queueSize {
+		return ErrNetDesc
+	}
+	for range count {
+		select {
+		case <-v.done:
+			return ErrNoTxPacket
+		default:
+		}
+		// A private reusable packet buffer keeps a fragmented guest packet to
+		// one copy per descriptor. BenchmarkNetTx measures zero allocations
+		// for both individual fragmented packets and eight-packet batches.
+		buf := v.txPacket[:0]
+		head := avail.Ring[v.LastAvailIdx[sel]%queueSize]
+		descID := head
+		var seen [QueueSize]bool
 		for {
+			if descID >= queueSize || seen[descID] {
+				return ErrNetDesc
+			}
+			seen[descID] = true
 			desc := q.Desc[descID]
-
-			b := make([]byte, desc.Len)
-			copy(b, v.Mem[desc.Addr:desc.Addr+uint64(desc.Len)])
-
-			buf = append(buf, b...)
-
-			used.Ring[uidx%QueueSize].Len += desc.Len
-
-			if desc.Flags&descFNext != 0 {
-				descID = desc.Next
-			} else {
+			if desc.Flags & ^uint16(descFNext) != 0 || desc.Addr > uint64(len(v.Mem)) ||
+				uint64(desc.Len) > uint64(len(v.Mem))-desc.Addr || int(desc.Len) > cap(buf)-len(buf) {
+				return ErrNetDesc
+			}
+			buf = append(buf, v.Mem[desc.Addr:desc.Addr+uint64(desc.Len)]...)
+			if desc.Flags&descFNext == 0 {
 				break
 			}
+			descID = desc.Next
 		}
-
-		// Skip struct virtio_net_hdr_v1.
-		// refs https://github.com/torvalds/linux/blob/38f80f42/include/uapi/linux/virtio_net.h#L178-L191
-		buf = buf[netHdrLen:]
-
-		if _, err := v.tap.Write(buf); err != nil {
+		if len(buf) < netHdrLen {
+			return ErrNetDesc
+		}
+		payload := buf[netHdrLen:]
+		if n, err := v.tap.Write(payload); err != nil {
 			return err
+		} else if n != len(payload) {
+			return io.ErrShortWrite
 		}
-
+		uidx := LoadU16(&used.Idx)
+		used.Ring[uidx%queueSize] = SplitUsedElem{ID: uint32(head), Len: uint32(len(buf))}
 		StoreAddU16(&used.Idx, 1)
 		v.LastAvailIdx[sel]++
 	}

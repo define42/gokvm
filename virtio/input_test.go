@@ -2,7 +2,9 @@ package virtio
 
 import (
 	"encoding/binary"
+	"errors"
 	"slices"
+	"sync"
 	"testing"
 )
 
@@ -326,5 +328,97 @@ func TestInputTabletButtonsWheelAndBounds(t *testing.T) {
 	v.PointerEventInBounds(1, 0, 0, 800, -1)
 	if len(v.pending) != before {
 		t.Fatal("invalid framebuffer bounds generated input")
+	}
+}
+
+func TestInputConcurrentConfigurationAndQueues(t *testing.T) {
+	t.Parallel()
+
+	v := NewInputKeyboard(5, func() error { return nil }, make([]byte, 0x1000))
+	q := newInputSplitQueue()
+	queueInputBuffer(q, 0, 0x100)
+	queueInputBuffer(q, 1, 0x108)
+	status := newInputSplitQueue()
+	status.Avail.Idx = 1
+	var workers sync.WaitGroup
+	workers.Go(func() {
+		for i := range 1000 {
+			selection := []byte{inputCfgIDName, 0}
+			if i%2 != 0 {
+				selection = []byte{inputCfgEvBits, evKey}
+			}
+			v.WriteDeviceConfig(0, selection)
+		}
+	})
+	workers.Go(func() {
+		var cfg [inputConfigLen]byte
+		for range 1000 {
+			v.ReadDeviceConfig(0, cfg[:])
+			switch cfg[0] {
+			case 0: // Reset/default configuration.
+			case inputCfgIDName:
+				if string(cfg[inputUnionOff:inputUnionOff+int(cfg[2])]) != "gokvm keyboard" {
+					t.Error("input name/configuration selector snapshot was torn")
+
+					return
+				}
+			case inputCfgEvBits:
+				if cfg[1] != evKey || !inputBitSet(cfg[inputUnionOff:], keyA) {
+					t.Error("input event bitmap/configuration selector snapshot was torn")
+
+					return
+				}
+			default:
+				t.Errorf("unexpected input selector %d", cfg[0])
+
+				return
+			}
+		}
+	})
+	workers.Go(func() {
+		for range 200 {
+			v.QueueReady(inputEventQueue, q)
+			v.QueueReady(inputStatusQueue, status)
+			v.Reset()
+		}
+	})
+	workers.Go(func() {
+		for range 1000 {
+			v.KeyEvent(true, 'a')
+			_ = v.flushEvents()
+			_ = v.drainStatusQueue()
+		}
+	})
+	workers.Wait()
+	v.Reset()
+	if err := v.flushEvents(); !errors.Is(err, ErrVQNotInit) {
+		t.Fatalf("reset retained event queue: %v", err)
+	}
+	if err := v.drainStatusQueue(); !errors.Is(err, ErrVQNotInit) {
+		t.Fatalf("reset retained status queue: %v", err)
+	}
+	if _, ok := v.popPending(); ok {
+		t.Fatal("reset retained pending input")
+	}
+}
+
+func TestInputQueueReplacementStartsAtFirstDescriptor(t *testing.T) {
+	t.Parallel()
+
+	v := NewInputKeyboard(5, func() error { return nil }, make([]byte, 0x1000))
+	for range 2 {
+		q := newInputSplitQueue()
+		queueInputBuffer(q, 0, 0x100)
+		v.QueueReady(inputEventQueue, q)
+		v.KeyEvent(true, 'a')
+		// QueueReady may consume a pending SYN event from the previous queue.
+		if LoadU16(&q.Used.Idx) == 0 {
+			if err := v.flushEvents(); err != nil {
+				t.Fatalf("replacement queue skipped first descriptor: %v", err)
+			}
+		}
+		if LoadU16(&q.Used.Idx) != 1 {
+			t.Fatal("replacement queue did not start at its first available descriptor")
+		}
 	}
 }

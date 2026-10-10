@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"sync"
 )
 
 const (
@@ -21,6 +22,7 @@ type IRQInjector interface {
 }
 
 type Serial struct {
+	mu  sync.Mutex
 	IER byte
 	LCR byte
 
@@ -42,6 +44,8 @@ func New(irqInjector IRQInjector) (*Serial, error) {
 }
 
 func (s *Serial) SetOutput(w io.Writer) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.output = w
 }
 
@@ -54,6 +58,8 @@ func (s *Serial) dlab() bool {
 }
 
 func (s *Serial) In(port uint64, values []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	port -= COM1Addr
 
 	switch {
@@ -94,6 +100,8 @@ func (s *Serial) In(port uint64, values []byte) error {
 }
 
 func (s *Serial) Out(port uint64, values []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	port -= COM1Addr
 
 	var err error

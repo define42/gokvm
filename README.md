@@ -64,7 +64,10 @@ The repository also provides `make bzImage initrd` to prepare its sample kernel
 and u-root initrd. These targets download build tools and guest artifacts and may
 compile a kernel locally. See the [Makefile](Makefile),
 [kernel script](scripts/get_kernel.bash), and [initrd script](scripts/get_initrd.bash)
-for their additional host dependencies.
+for their additional host dependencies. Both sample kernel configurations enable
+KVM guest clocks and paravirtual spinlocks. Rebuild existing kernel images to
+apply configuration changes; changing the config files alone does not update an
+already built kernel.
 
 ## Features
 
@@ -91,7 +94,7 @@ flags; there is no VM configuration file.
 | `-i path` | Unset | Optional initrd for direct kernel boot. |
 | `-iso path-or-url` | Unset | Linux ISO path or HTTP(S) URL; takes precedence over `-k` and `-i`. |
 | `-p parameters` | Built-in kernel command line | Replace the kernel command line; ISO boot otherwise uses its boot config plus gokvm defaults. |
-| `-c count` | `1` | Number of guest vCPUs. |
+| `-c count` | `1` | Number of guest vCPUs, from 1 to 64. |
 | `-m size` | `1G` | Guest RAM; `K`, `M`, and `G` use binary units. Unitless values mean GiB. |
 | `-d path` | Unset | Existing writable raw or qcow2 disk, exposed as `/dev/vda`. |
 | `-net user\|none` | `none` | Built-in networking or no network; mutually exclusive with `-t`. |
@@ -144,6 +147,9 @@ Attach an existing raw or qcow2 disk with `-d`:
 The format is detected from the file contents. The disk is writable and appears
 as `/dev/vda`; when combined with `-iso`, the read-only ISO follows it as another
 virtio-blk device. `-d` attaches storage; a kernel or ISO is still needed to boot.
+Block writes are synchronized before successful completion is reported to the
+guest. Requests already pending in one queue batch share a sync; writeback caching
+and the optional FLUSH command are not advertised.
 
 The qcow2 backend supports standalone v2/v3 images with 16-bit refcounts.
 Backing files, internal snapshots, encryption, compressed or shared data

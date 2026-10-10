@@ -179,7 +179,8 @@ type InputDevice struct {
 	VirtQueue    [inputNumQueues]*SplitQueue
 	LastAvailIdx [inputNumQueues]uint16
 
-	mu       sync.Mutex
+	mu       sync.Mutex // Configuration selectors, queue mappings and pending events.
+	closed   bool
 	pending  []inputEvent
 	buttons  uint8
 	lastX    uint16
@@ -235,6 +236,9 @@ func (d *InputDevice) ReadDeviceConfig(offset uint64, data []byte) {
 }
 
 func (d *InputDevice) WriteDeviceConfig(offset uint64, data []byte) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	for i, v := range data {
 		switch offset + uint64(i) {
 		case 0:
@@ -246,9 +250,18 @@ func (d *InputDevice) WriteDeviceConfig(offset uint64, data []byte) {
 }
 
 func (d *InputDevice) QueueReady(idx int, q *SplitQueue) {
-	if idx >= 0 && idx < inputNumQueues {
-		d.VirtQueue[idx] = q
+	if idx < 0 || idx >= inputNumQueues {
+		return
 	}
+	d.mu.Lock()
+	if d.closed {
+		d.mu.Unlock()
+
+		return
+	}
+	d.VirtQueue[idx] = q
+	d.LastAvailIdx[idx] = 0
+	d.mu.Unlock()
 
 	if idx == inputEventQueue {
 		_ = d.flushEvents()
@@ -407,8 +420,31 @@ func (d *InputDevice) IOPort() uint64 { return 0 }
 
 func (d *InputDevice) Size() uint64 { return 0 }
 
+// Reset abandons old guest queue mappings while excluding queue consumers.
+func (d *InputDevice) Reset() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.resetLocked()
+}
+
+func (d *InputDevice) resetLocked() {
+	d.VirtQueue = [inputNumQueues]*SplitQueue{}
+	d.LastAvailIdx = [inputNumQueues]uint16{}
+	d.configSelect, d.configSubsel = 0, 0
+	d.pending = nil
+	d.buttons = 0
+	d.lastX, d.lastY = 0, 0
+	d.hasPoint = false
+}
+
 func (d *InputDevice) Close() error {
-	d.closeOnce.Do(func() { close(d.done) })
+	d.closeOnce.Do(func() {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		d.closed = true
+		d.resetLocked()
+		close(d.done)
+	})
 
 	return nil
 }
@@ -422,6 +458,9 @@ func (d *InputDevice) enqueue(events ...inputEvent) {
 }
 
 func (d *InputDevice) enqueueLocked(events ...inputEvent) {
+	if d.closed {
+		return
+	}
 	if len(d.pending)+len(events) > inputMaxPendingEvents {
 		drop := len(d.pending) + len(events) - inputMaxPendingEvents
 		if drop > len(d.pending) {
@@ -436,6 +475,10 @@ func (d *InputDevice) popPending() (inputEvent, bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	return d.popPendingLocked()
+}
+
+func (d *InputDevice) popPendingLocked() (inputEvent, bool) {
 	if len(d.pending) == 0 {
 		return inputEvent{}, false
 	}
@@ -447,13 +490,18 @@ func (d *InputDevice) popPending() (inputEvent, bool) {
 	return ev, true
 }
 
-func (d *InputDevice) pushFront(ev inputEvent) {
+func (d *InputDevice) flushEvents() error {
 	d.mu.Lock()
-	d.pending = append([]inputEvent{ev}, d.pending...)
+	err := d.flushEventsLocked()
 	d.mu.Unlock()
+	if err != nil {
+		return err
+	}
+
+	return d.Interrupt()
 }
 
-func (d *InputDevice) flushEvents() error {
+func (d *InputDevice) flushEventsLocked() error {
 	q := d.VirtQueue[inputEventQueue]
 	if q == nil {
 		return ErrVQNotInit
@@ -463,7 +511,7 @@ func (d *InputDevice) flushEvents() error {
 		return errNoInputEvent
 	}
 
-	ev, ok := d.popPending()
+	ev, ok := d.popPendingLocked()
 	if !ok {
 		return errNoInputEvent
 	}
@@ -471,7 +519,7 @@ func (d *InputDevice) flushEvents() error {
 	head := q.Avail.Ring[d.LastAvailIdx[inputEventQueue]%QueueSize]
 	usedLen, written := d.writeEvent(q, head, ev)
 	if !written {
-		d.pushFront(ev)
+		d.pending = append([]inputEvent{ev}, d.pending...)
 
 		return errNoInputEvent
 	}
@@ -482,7 +530,7 @@ func (d *InputDevice) flushEvents() error {
 	StoreAddU16(&q.Used.Idx, 1)
 	d.LastAvailIdx[inputEventQueue]++
 
-	return d.Interrupt()
+	return nil
 }
 
 func (d *InputDevice) writeEvent(q *SplitQueue, head uint16, ev inputEvent) (uint32, bool) {
@@ -524,6 +572,17 @@ func (d *InputDevice) writeEvent(q *SplitQueue, head uint16, ev inputEvent) (uin
 }
 
 func (d *InputDevice) drainStatusQueue() error {
+	d.mu.Lock()
+	err := d.drainStatusQueueLocked()
+	d.mu.Unlock()
+	if err != nil {
+		return err
+	}
+
+	return d.Interrupt()
+}
+
+func (d *InputDevice) drainStatusQueueLocked() error {
 	q := d.VirtQueue[inputStatusQueue]
 	if q == nil {
 		return ErrVQNotInit
@@ -542,10 +601,13 @@ func (d *InputDevice) drainStatusQueue() error {
 		d.LastAvailIdx[inputStatusQueue]++
 	}
 
-	return d.Interrupt()
+	return nil
 }
 
 func (d *InputDevice) configImage() [inputConfigLen]byte {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	var cfg [inputConfigLen]byte
 	cfg[0] = d.configSelect
 	cfg[1] = d.configSubsel

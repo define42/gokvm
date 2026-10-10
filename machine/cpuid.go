@@ -7,10 +7,7 @@ import (
 )
 
 func (m *Machine) initCPUID(cpu int) error {
-	cpuid := kvm.CPUID{
-		Nent:    100,
-		Entries: make([]kvm.CPUIDEntry2, 100),
-	}
+	var cpuid kvm.CPUID
 	if err := kvm.GetSupportedCPUID(m.kvmFd, &cpuid); err != nil {
 		return err
 	}

@@ -3,6 +3,7 @@ package pci
 import (
 	"bytes"
 	"encoding/binary"
+	"sync"
 )
 
 // Configuration Space Access Mechanism #1
@@ -106,9 +107,21 @@ func (h DeviceHeader) Bytes() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// registeredDevice stores metadata that is fixed for the lifetime of a PCI
+// function. Device callbacks run only while registering, outside the bus lock.
+type registeredDevice struct {
+	dev      Device
+	header   DeviceHeader
+	caps     []byte
+	barSizes [6]uint64
+	mmio     CapsAndMMIO
+	mmioBAR  int
+}
+
 type PCI struct {
+	mu      sync.RWMutex
 	addr    address
-	Devices []Device
+	devices []registeredDevice
 
 	// A single size-probe can be in flight at a time: the guest writes
 	// 0xffffffff to a BAR then immediately reads it back. probeSlot is -1
@@ -127,12 +140,55 @@ type PCI struct {
 }
 
 func New(devices ...Device) *PCI {
-	return &PCI{
-		Devices:        devices,
+	p := &PCI{
 		probeSlot:      -1,
 		barOverride:    map[int]map[int]uint32{},
 		configOverride: map[int]map[int]byte{},
 	}
+	p.AddDevices(devices...)
+
+	return p
+}
+
+// AddDevices appends PCI functions in slot order. Headers, capabilities and BAR
+// sizes must be fully initialized before registration and remain fixed afterward.
+// Guest configuration writes are owned by the bus, not the device metadata.
+func (p *PCI) AddDevices(devices ...Device) {
+	registered := make([]registeredDevice, 0, len(devices))
+	for _, dev := range devices {
+		entry := registeredDevice{dev: dev, header: dev.GetDeviceHeader()}
+		entry.barSizes[0] = dev.Size()
+		if cm, ok := dev.(CapsAndMMIO); ok {
+			entry.caps = append([]byte(nil), cm.Capabilities()...)
+			bar := cm.MMIOBARIndex()
+			if bar >= 0 && bar < len(entry.barSizes) {
+				entry.mmio, entry.mmioBAR = cm, bar
+				entry.barSizes[bar] = cm.MMIOSize()
+			}
+		}
+		registered = append(registered, entry)
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.devices) == 0 {
+		p.probeSlot = -1
+	}
+	p.devices = append(p.devices, registered...)
+}
+
+// Devices returns a snapshot of the registered functions. Mutating the returned
+// slice does not change the bus; callbacks on its devices run without a bus lock.
+func (p *PCI) Devices() []Device {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	devices := make([]Device, len(p.devices))
+	for i, entry := range p.devices {
+		devices[i] = entry.dev
+	}
+
+	return devices
 }
 
 // barAtOffset returns the BAR index (0-5) addressed by a config-space byte
@@ -147,23 +203,17 @@ func barAtOffset(offset int) int {
 
 // barSize returns the size of a device's BAR. Modern devices report the
 // size of their memory BAR; every device reports its legacy IO BAR as BAR0.
+// The caller holds mu.
 func (p *PCI) barSize(slot, bar int) uint64 {
-	if cm, ok := p.Devices[slot].(CapsAndMMIO); ok && bar == cm.MMIOBARIndex() {
-		return cm.MMIOSize()
-	}
-
-	if bar == 0 {
-		return p.Devices[slot].Size()
-	}
-
-	return 0
+	return p.devices[slot].barSizes[bar]
 }
 
 // barBase returns the guest-physical base address a device's BAR currently
 // decodes at, with the low type bits masked off. It honors a guest-assigned
 // override when present, otherwise the value baked into the device header.
+// The caller holds mu.
 func (p *PCI) barBase(slot, bar int) uint64 {
-	raw := p.Devices[slot].GetDeviceHeader().BAR[bar]
+	raw := p.devices[slot].header.BAR[bar]
 	if v, ok := p.barOverride[slot][bar]; ok {
 		raw = v
 	}
@@ -177,9 +227,9 @@ func (p *PCI) barBase(slot, bar int) uint64 {
 
 // configSpace builds the 256-byte PCI configuration space image for a slot:
 // the 64-byte header followed by the device's capability list, with any
-// guest-assigned BAR overrides applied.
+// guest-assigned BAR overrides applied. The caller holds mu.
 func (p *PCI) configSpace(slot int) ([]byte, error) {
-	b, err := p.Devices[slot].GetDeviceHeader().Bytes()
+	b, err := p.devices[slot].header.Bytes()
 	if err != nil {
 		return nil, err
 	}
@@ -187,9 +237,7 @@ func (p *PCI) configSpace(slot int) ([]byte, error) {
 	cfg := make([]byte, 256)
 	copy(cfg, b)
 
-	if cm, ok := p.Devices[slot].(CapsAndMMIO); ok {
-		copy(cfg[0x40:], cm.Capabilities())
-	}
+	copy(cfg[0x40:], p.devices[slot].caps)
 
 	for bar, v := range p.barOverride[slot] {
 		copy(cfg[0x10+bar*4:], NumToBytes(v))
@@ -207,17 +255,18 @@ func (p *PCI) configSpace(slot int) ([]byte, error) {
 // LookupMMIO finds the modern device whose memory BAR decodes addr and
 // returns it together with the BAR-relative offset.
 func (p *PCI) LookupMMIO(addr uint64) (CapsAndMMIO, uint64, bool) {
-	for slot, dev := range p.Devices {
-		cm, ok := dev.(CapsAndMMIO)
-		if !ok {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	for slot, entry := range p.devices {
+		if entry.mmio == nil {
 			continue
 		}
 
-		base := p.barBase(slot, cm.MMIOBARIndex())
-		size := cm.MMIOSize()
-
-		if size > 0 && addr >= base && addr < base+size {
-			return cm, addr - base, true
+		base := p.barBase(slot, entry.mmioBAR)
+		size := entry.barSizes[entry.mmioBAR]
+		if addr >= base && addr-base < size {
+			return entry.mmio, addr - base, true
 		}
 	}
 
@@ -225,6 +274,9 @@ func (p *PCI) LookupMMIO(addr uint64) (CapsAndMMIO, uint64, bool) {
 }
 
 func (p *PCI) PciConfDataIn(port uint64, values []byte) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	fillAbsent := func() {
 		for i := range values {
 			values[i] = 0xff
@@ -254,7 +306,7 @@ func (p *PCI) PciConfDataIn(port uint64, values []byte) error {
 
 	slot := int(p.addr.getDeviceNumber())
 
-	if slot >= len(p.Devices) {
+	if slot >= len(p.devices) {
 		fillAbsent()
 
 		return nil
@@ -298,6 +350,9 @@ func (p *PCI) PciConfDataIn(port uint64, values []byte) error {
 }
 
 func (p *PCI) PciConfDataOut(port uint64, values []byte) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	offset := int(p.addr.getRegisterOffset() + uint32(port-0xCFC))
 
 	if !p.addr.isEnable() {
@@ -314,12 +369,15 @@ func (p *PCI) PciConfDataOut(port uint64, values []byte) error {
 
 	slot := int(p.addr.getDeviceNumber())
 
-	if slot >= len(p.Devices) {
+	if slot >= len(p.devices) {
 		return nil
 	}
 
 	bar := barAtOffset(offset)
 	if bar < 0 {
+		if p.configOverride == nil {
+			p.configOverride = map[int]map[int]byte{}
+		}
 		if p.configOverride[slot] == nil {
 			p.configOverride[slot] = map[int]byte{}
 		}
@@ -344,12 +402,15 @@ func (p *PCI) PciConfDataOut(port uint64, values []byte) error {
 	// Capture guest-assigned base addresses for modern devices' memory
 	// BARs so reads return the assigned value and MMIO decoding follows
 	// the driver. Legacy IO BARs keep their header-baked address.
-	if cm, ok := p.Devices[slot].(CapsAndMMIO); ok && bar == cm.MMIOBARIndex() {
+	if entry := p.devices[slot]; entry.mmio != nil && bar == entry.mmioBAR {
+		if p.barOverride == nil {
+			p.barOverride = map[int]map[int]uint32{}
+		}
 		if p.barOverride[slot] == nil {
 			p.barOverride[slot] = map[int]uint32{}
 		}
 
-		cur := p.Devices[slot].GetDeviceHeader().BAR[bar]
+		cur := p.devices[slot].header.BAR[bar]
 		if v, ok := p.barOverride[slot][bar]; ok {
 			cur = v
 		}
@@ -363,6 +424,9 @@ func (p *PCI) PciConfDataOut(port uint64, values []byte) error {
 }
 
 func (p *PCI) PciConfAddrIn(port uint64, values []byte) error {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
 	if len(values) != 4 {
 		return nil
 	}
@@ -373,6 +437,9 @@ func (p *PCI) PciConfAddrIn(port uint64, values []byte) error {
 }
 
 func (p *PCI) PciConfAddrOut(port uint64, values []byte) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	if len(values) != 4 {
 		return nil
 	}
