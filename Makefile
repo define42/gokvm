@@ -131,10 +131,13 @@ rdp:
 		echo "FreeRDP client not found; run make freerdp or set RDP_CLIENT=/path/to/xfreerdp." >&2; \
 		exit 1; \
 	fi; \
-	set --; \
-	case "$$("$$client" /buildconfig 2>&1)" in \
-		*WITH_GFX_H264=ON*) set -- /gfx:AVC420 ;; \
-		*) echo "FreeRDP has no H.264 support; connecting with bitmap updates." >&2 ;; \
+	if ! config=$$("$$client" /buildconfig 2>&1); then \
+		echo "Cannot check FreeRDP H.264 support: $$config" >&2; \
+		exit 1; \
+	fi; \
+	case "$$config" in \
+		*WITH_GFX_H264=ON*|*WITH_GFX_H264=TRUE*) ;; \
+		*) echo "FreeRDP H.264 support is required; run make freerdp or set RDP_CLIENT to an H.264-capable client." >&2; exit 1 ;; \
 	esac; \
 	exec "$$client" /v:127.0.0.1:3390 /sec:tls /u:console /p:console \
-		/cert:ignore /dynamic-resolution "$$@"
+		/cert:ignore /dynamic-resolution /gfx:AVC420
