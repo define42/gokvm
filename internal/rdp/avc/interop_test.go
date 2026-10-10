@@ -38,9 +38,11 @@ func TestFFmpegCompatibility(t *testing.T) {
 		expected = append(expected, want)
 	}
 
+	// Preserve the full-range samples advertised in the SPS; yuv420p would
+	// rescale them to limited range before this test compares the bytes.
 	command := exec.Command(ffmpeg, //nolint:gosec // Executable came from the system PATH; all arguments are fixed.
 		"-hide_banner", "-loglevel", "error", "-f", "h264", "-i", "pipe:0",
-		"-map", "0:v:0", "-f", "rawvideo", "-pix_fmt", "yuv420p", "pipe:1")
+		"-map", "0:v:0", "-f", "rawvideo", "-pix_fmt", "yuvj420p", "pipe:1")
 	command.Stdin = bytes.NewReader(stream.Bytes())
 	var stderr bytes.Buffer
 	command.Stderr = &stderr
