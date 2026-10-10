@@ -324,4 +324,10 @@ func WelsInitEncodingFuncs(pFuncList *SWelsFuncPtrList, uiCpuFlag uint32) {
 	pFuncList.pfQuantizationDc4x4 = WelsQuant4x4Dc_c
 	pFuncList.pfQuantizationFour4x4 = WelsQuantFour4x4_c
 	pFuncList.pfQuantizationFour4x4Max = WelsQuantFour4x4Max_c
+
+	if uiCpuFlag&common.WELS_CPU_SSE2 != 0 {
+		pFuncList.pfDctT4 = WelsDctT4_sse2
+		pFuncList.pfDctFourT4 = WelsDctFourT4_sse2
+	}
+	initQuantizationSIMD(pFuncList, uiCpuFlag)
 }

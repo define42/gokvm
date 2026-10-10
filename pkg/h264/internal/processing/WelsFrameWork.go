@@ -1,5 +1,7 @@
 package processing
 
+import "github.com/define42/gokvm/pkg/h264/internal/common"
+
 // Port of codec/processing/src/common/WelsFrameWork.cpp.
 
 /* interface API implement */
@@ -66,11 +68,11 @@ func DestroySpecificVpInterface(pCtx IWelsVP) EResult {
 
 ///////////////////////////////////////////////////////////////////////////////
 
-// NewCVpFrameWork is the CVpFrameWork constructor. CPU feature flags are
-// always 0 (only the _c paths are ported).
+// NewCVpFrameWork is the CVpFrameWork constructor.
 func NewCVpFrameWork(uiThreadsNum uint32, eReturn *EResult) *CVpFrameWork {
 	f := &CVpFrameWork{}
-	var uiCPUFlag uint32 = 0
+	iCoreNum := int32(1)
+	uiCPUFlag := common.WelsCPUFeatureDetect(&iCoreNum)
 
 	for i := int32(0); i < MAX_STRATEGY_NUM; i++ {
 		f.m_pStgChain[i] = f.CreateStrategy(EMethods(i+1), int32(uiCPUFlag))

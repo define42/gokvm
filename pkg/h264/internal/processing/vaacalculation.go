@@ -20,6 +20,7 @@ func (c *CVAACalculation) InitVaaFuncs(sVaaFuncs *SVaaFuncs, iCpuFlag int32) {
 	sVaaFuncs.pfVAACalcSadSsd = VAACalcSadSsd_c
 	sVaaFuncs.pfVAACalcSadSsdBgd = VAACalcSadSsdBgd_c
 	sVaaFuncs.pfVAACalcSadVar = VAACalcSadVar_c
+	initVaaSIMDFuncs(sVaaFuncs, uint32(iCpuFlag))
 }
 
 func (c *CVAACalculation) Process(iType int32, pSrcPixMap *SPixMap, pRefPixMap *SPixMap) EResult {

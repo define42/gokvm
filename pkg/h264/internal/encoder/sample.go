@@ -256,6 +256,41 @@ func WelsInitSampleSadFunc(pFuncList *SWelsFuncPtrList, uiCpuFlag uint32) {
 	s.pfSample4Sad[BLOCK_8x4] = common.WelsSampleSadFour8x4_c
 	s.pfSample4Sad[BLOCK_4x8] = common.WelsSampleSadFour4x8_c
 
+	if uiCpuFlag&common.WELS_CPU_SSE2 != 0 {
+		s.pfSampleSad[BLOCK_16x16] = common.WelsSampleSad16x16_sse2
+		s.pfSampleSad[BLOCK_16x8] = common.WelsSampleSad16x8_sse2
+		s.pfSampleSad[BLOCK_8x16] = common.WelsSampleSad8x16_sse2
+		s.pfSampleSad[BLOCK_8x8] = common.WelsSampleSad8x8_sse2
+		s.pfSampleSad[BLOCK_4x4] = common.WelsSampleSad4x4_sse2
+		s.pfSampleSad[BLOCK_8x4] = common.WelsSampleSad8x4_sse2
+		s.pfSampleSad[BLOCK_4x8] = common.WelsSampleSad4x8_sse2
+
+		s.pfSample4Sad[BLOCK_16x16] = common.WelsSampleSadFour16x16_sse2
+		s.pfSample4Sad[BLOCK_16x8] = common.WelsSampleSadFour16x8_sse2
+		s.pfSample4Sad[BLOCK_8x16] = common.WelsSampleSadFour8x16_sse2
+		s.pfSample4Sad[BLOCK_8x8] = common.WelsSampleSadFour8x8_sse2
+		s.pfSample4Sad[BLOCK_4x4] = common.WelsSampleSadFour4x4_sse2
+		s.pfSample4Sad[BLOCK_8x4] = common.WelsSampleSadFour8x4_sse2
+		s.pfSample4Sad[BLOCK_4x8] = common.WelsSampleSadFour4x8_sse2
+	}
+
+	if uiCpuFlag&common.WELS_CPU_SSE41 != 0 && uiCpuFlag&common.WELS_CPU_SSSE3 != 0 {
+		s.pfSampleSatd[BLOCK_16x16] = WelsSampleSatd16x16_sse41
+		s.pfSampleSatd[BLOCK_16x8] = WelsSampleSatd16x8_sse41
+		s.pfSampleSatd[BLOCK_8x16] = WelsSampleSatd8x16_sse41
+		s.pfSampleSatd[BLOCK_8x8] = WelsSampleSatd8x8_sse41
+		s.pfSampleSatd[BLOCK_4x4] = WelsSampleSatd4x4_sse41
+		s.pfSampleSatd[BLOCK_8x4] = WelsSampleSatd8x4_sse41
+		s.pfSampleSatd[BLOCK_4x8] = WelsSampleSatd4x8_sse41
+
+		if uiCpuFlag&common.WELS_CPU_AVX2 != 0 {
+			s.pfSampleSatd[BLOCK_16x16] = WelsSampleSatd16x16_avx2
+			s.pfSampleSatd[BLOCK_16x8] = WelsSampleSatd16x8_avx2
+			s.pfSampleSatd[BLOCK_8x16] = WelsSampleSatd8x16_avx2
+			s.pfSampleSatd[BLOCK_8x8] = WelsSampleSatd8x8_avx2
+		}
+	}
+
 	s.pfIntra4x4Combined3Satd = nil
 	s.pfIntra8x8Combined3Satd = nil
 	s.pfIntra8x8Combined3Sad = nil

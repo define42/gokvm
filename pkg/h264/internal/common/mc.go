@@ -338,8 +338,8 @@ func McChroma_c(pSrc []uint8, iSrcOff int, iSrcStride int32, pDst []uint8, iDstO
 	}
 }
 
-// InitMcFunc fills pMcFuncs with the C implementations (uiCpuFlag is
-// ignored: no SIMD paths are ported).
+// InitMcFunc fills pMcFuncs with scalar implementations and replaces the hot
+// luma kernels when the current CPU supports their instruction set.
 func InitMcFunc(pMcFuncs *SMcFunc, uiCpuFlag uint32) {
 	pMcFuncs.PfLumaHalfpelHor = McHorVer20_c
 	pMcFuncs.PfLumaHalfpelVer = McHorVer02_c
@@ -347,4 +347,12 @@ func InitMcFunc(pMcFuncs *SMcFunc, uiCpuFlag uint32) {
 	pMcFuncs.PfSampleAveraging = PixelAvg_c
 	pMcFuncs.PMcChromaFunc = McChroma_c
 	pMcFuncs.PMcLumaFunc = McLuma_c
+
+	if uiCpuFlag&WELS_CPU_SSE2 != 0 {
+		pMcFuncs.PfLumaHalfpelHor = McHorVer20_sse2
+		pMcFuncs.PfLumaHalfpelVer = McHorVer02_sse2
+		pMcFuncs.PfLumaHalfpelCen = McHorVer22_sse2
+		pMcFuncs.PfSampleAveraging = PixelAvg_sse2
+		pMcFuncs.PMcLumaFunc = McLuma_sse2
+	}
 }

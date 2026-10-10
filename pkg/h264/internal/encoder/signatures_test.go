@@ -37,6 +37,10 @@ var (
 	_ PQuantizationFunc           = WelsQuantFour4x4_c
 	_ PQuantizationDcFunc         = WelsQuant4x4Dc_c
 	_ PQuantizationMaxFunc        = WelsQuantFour4x4Max_c
+	_ PQuantizationFunc           = WelsQuant4x4_sse2
+	_ PQuantizationFunc           = WelsQuantFour4x4_sse2
+	_ PQuantizationDcFunc         = WelsQuant4x4Dc_sse2
+	_ PQuantizationMaxFunc        = WelsQuantFour4x4Max_sse2
 	_ PQuantizationHadamardFunc   = WelsHadamardQuant2x2_c
 	_ PQuantizationSkipFunc       = WelsHadamardQuant2x2Skip_c
 	_ PTransformHadamard4x4Func   = WelsHadamardT4Dc_c

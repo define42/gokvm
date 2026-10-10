@@ -1,7 +1,8 @@
 package common
 
-// Port of codec/common/inc/cpu_core.h (WELS CPU feature flags). The flags
-// are kept for completeness; WelsCPUFeatureDetect always returns 0.
+// Port of codec/common/inc/cpu_core.h (WELS CPU feature flags). Keep these
+// values in sync with OpenH264 because the architecture dispatch code treats
+// them as an ABI.
 const (
 	WELS_CPU_MMX      = 0x00000001 /* mmx */
 	WELS_CPU_MMXEXT   = 0x00000002 /* mmx-ext*/
@@ -23,7 +24,7 @@ const (
 	WELS_CPU_AES   = 0x00010000 /* AES instruction extensions */
 	WELS_CPU_FMA   = 0x00020000 /* AVX VEX FMA instruction sets */
 	WELS_CPU_AVX   = 0x00000800 /* Advanced Vector eXtentions */
-	WELS_CPU_AVX2  = 0x00000000 /* !AVX2 (HAVE_AVX2 is never defined in the Go port) */
+	WELS_CPU_AVX2  = 0x00040000 /* AVX2 */
 
 	WELS_CPU_AVX512F  = 0x00080000 /* AVX512F */
 	WELS_CPU_AVX512CD = 0x00100000 /* AVX512CD */
