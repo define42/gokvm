@@ -23,7 +23,7 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-var errDownloadISO = errors.New("download ISO failed")
+var errDownloadBootImage = errors.New("download boot image failed")
 
 var errNetworkConfig = errors.New("network must be 'user' or 'none' and cannot be combined with a TAP interface")
 
@@ -32,6 +32,8 @@ var errAudioConfig = errors.New("audio must be 'none' or 'rdp'; 'rdp' requires a
 var errRDPH264ThreadsConfig = errors.New("RDP H.264 slices must be 0 (auto) or 1..16; a slice count requires H.264")
 
 var errRDPStatsConfig = errors.New("RDP statistics require an RDP listener")
+
+var errUKIBootSource = errors.New("UKI cannot be combined with ISO, kernel, or initrd")
 
 // These parameters describe gaps in gokvm's direct Linux boot environment, not
 // ISO-specific policy. The ISO's own boot config still supplies the distro
@@ -50,6 +52,7 @@ type Config struct {
 	Kernel         string
 	Initrd         string
 	ISO            string
+	UKI            string
 	Params         string
 	ParamsSet      bool
 	TapIfName      string
@@ -101,6 +104,9 @@ func (v *VMM) validateRDPPerformanceConfig() error {
 
 // Init instantiates a machine.
 func (v *VMM) Init() (initErr error) {
+	if err := v.validateBootSource(); err != nil {
+		return err
+	}
 	if err := v.validateRDPPerformanceConfig(); err != nil {
 		return err
 	}
@@ -244,6 +250,12 @@ func (v *VMM) display(input virtio.VNCInput) (result virtio.Display, displayErr 
 }
 
 func (v *VMM) Setup() error {
+	if err := v.validateBootSource(); err != nil {
+		return err
+	}
+	if v.UKI != "" {
+		return v.setupUKI()
+	}
 	if v.ISO != "" {
 		return v.setupISO()
 	}
@@ -288,7 +300,7 @@ func (v *VMM) Setup() error {
 }
 
 func (v *VMM) setupISO() error {
-	isoFile, cleanup, err := openISOSource(v.ISO)
+	isoFile, cleanup, err := openBootSource(v.ISO)
 	if err != nil {
 		return err
 	}
@@ -318,10 +330,7 @@ func (v *VMM) setupISO() error {
 		return err
 	}
 
-	params := v.Params
-	if !v.ParamsSet {
-		params = isoBootParams(files.Cmdline)
-	}
+	params := v.bootParams(files.Cmdline)
 
 	log.Printf("ISO El Torito boot: kernel=%s initrd=%s", files.KernelPath, files.InitrdPath)
 
@@ -387,10 +396,10 @@ func hasTinyCoreGUI(r *iso9660.Reader) bool {
 	return true
 }
 
-func openISOSource(source string) (*os.File, func(), error) {
+func openBootSource(source string) (*os.File, func(), error) {
 	u, err := url.Parse(source)
 	if err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return downloadISO(source)
+		return downloadBootSource(source)
 	}
 
 	file, err := os.Open(source)
@@ -401,7 +410,7 @@ func openISOSource(source string) (*os.File, func(), error) {
 	return file, func() { _ = file.Close() }, nil
 }
 
-func downloadISO(source string) (*os.File, func(), error) {
+func downloadBootSource(source string) (*os.File, func(), error) {
 	resp, err := http.Get(source) //nolint:gosec // User-supplied boot media URL.
 	if err != nil {
 		return nil, nil, err
@@ -409,10 +418,10 @@ func downloadISO(source string) (*os.File, func(), error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, nil, fmt.Errorf("%w %s: %s", errDownloadISO, source, resp.Status)
+		return nil, nil, fmt.Errorf("%w %s: %s", errDownloadBootImage, source, resp.Status)
 	}
 
-	file, err := os.CreateTemp("", "gokvm-*.iso")
+	file, err := os.CreateTemp("", "gokvm-boot-*")
 	if err != nil {
 		return nil, nil, err
 	}
@@ -435,7 +444,7 @@ func downloadISO(source string) (*os.File, func(), error) {
 		return nil, nil, err
 	}
 
-	log.Printf("downloaded ISO %s to %s", source, file.Name())
+	log.Printf("downloaded boot image %s to %s", source, file.Name())
 
 	return file, cleanup, nil
 }
@@ -445,25 +454,88 @@ func isoBootParams(cmdline string) string {
 }
 
 func mergeKernelParams(cmdline string, defaults []string) string {
-	fields := strings.Fields(cmdline)
-	merged := make([]string, 0, len(defaults)+len(fields))
-
+	fields := kernelParamFields(cmdline)
+	missing := make([]string, 0, len(defaults))
 	for _, param := range defaults {
 		if !hasKernelParam(fields, param) {
-			merged = append(merged, param)
+			missing = append(missing, param)
+		}
+	}
+	if len(missing) == 0 {
+		return cmdline
+	}
+	prefix := strings.Join(missing, " ")
+	if cmdline == "" {
+		return prefix
+	}
+
+	// Keep quoted values and whitespace in the embedded command line intact.
+	return prefix + " " + cmdline
+}
+
+// kernelParamFields follows Linux next_arg: double quotes group whitespace,
+// while single quotes and backslashes are ordinary characters. Only the
+// parsed names and values are normalized; the original command line is kept.
+func kernelParamFields(cmdline string) []string {
+	var fields []string
+	for pos := 0; pos < len(cmdline); {
+		for pos < len(cmdline) && strings.IndexByte(" \t\n\r\v\f\xa0", cmdline[pos]) >= 0 {
+			pos++
+		}
+		start := pos
+		inQuote := false
+		for pos < len(cmdline) {
+			ch := cmdline[pos]
+			if strings.IndexByte(" \t\n\r\v\f\xa0", ch) >= 0 && !inQuote {
+				break
+			}
+			if ch == '"' {
+				inQuote = !inQuote
+			}
+			pos++
+		}
+		if start == pos {
+			break
+		}
+
+		field := cmdline[start:pos]
+		quoted := strings.HasPrefix(field, `"`)
+		if quoted {
+			field = field[1:]
+		}
+		name, value, hasValue := strings.Cut(field, "=")
+		valueQuoted := hasValue && strings.HasPrefix(value, `"`)
+		if (quoted || valueQuoted) && strings.HasSuffix(field, `"`) {
+			if hasValue {
+				value = strings.TrimSuffix(value, `"`)
+			} else {
+				name = strings.TrimSuffix(name, `"`)
+			}
+		}
+		if valueQuoted {
+			value = strings.TrimPrefix(value, `"`)
+		}
+		if !hasValue && name == "--" {
+			// Linux passes the remaining arguments to init, not its parser.
+			break
+		}
+		if hasValue {
+			fields = append(fields, name+"="+value)
+		} else {
+			fields = append(fields, name)
 		}
 	}
 
-	merged = append(merged, fields...)
-
-	return strings.Join(merged, " ")
+	return fields
 }
 
 func hasKernelParam(fields []string, param string) bool {
 	paramName := kernelParamName(param)
 	for _, field := range fields {
 		if paramName == "console" {
-			if field == param {
+			device, _, _ := strings.Cut(field, ",")
+			defaultDevice, _, _ := strings.Cut(param, ",")
+			if device == defaultDevice {
 				return true
 			}
 

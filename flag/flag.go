@@ -26,6 +26,8 @@ var ErrAudio = errors.New("-audio must be 'none' or 'rdp'; 'rdp' requires -rdp")
 
 var ErrCPUCount = fmt.Errorf("-c must be between 1 and %d", ebda.MaxVCPUs)
 
+var ErrUKIBootSource = errors.New("-uki cannot be combined with -iso, -k, or -i")
+
 type BootArgs struct {
 	Kernel         string
 	MemSize        int
@@ -33,6 +35,7 @@ type BootArgs struct {
 	Dev            string
 	Initrd         string
 	ISO            string
+	UKI            string
 	Params         string
 	ParamsSet      bool
 	TapIfName      string
@@ -58,6 +61,7 @@ func parseBootArgs(args []string) (*BootArgs, error) {
 	bootCmd.StringVar(&c.Kernel, "k", "./bzImage", "kernel image path")
 	bootCmd.StringVar(&c.Initrd, "i", "", "initrd path")
 	bootCmd.StringVar(&c.ISO, "iso", "", "ISO image path or http(s) URL to boot")
+	bootCmd.StringVar(&c.UKI, "uki", "", "x86-64 Unified Kernel Image path or http(s) URL to boot directly")
 	//  refs: commit 1621292e73770aabbc146e72036de5e26f901e86 in kvmtool
 	bootCmd.StringVar(&c.Params, "p", `console=tty0 console=ttyS0 earlyprintk=serial `+
 		`noapic noacpi nowatchdog nmi_watchdog=0 mitigations=off lapic `+
@@ -111,6 +115,9 @@ func parseBootArgs(args []string) (*BootArgs, error) {
 			threadsSet = true
 		}
 	})
+	if err := selectUKIBootSource(bootCmd, c); err != nil {
+		return nil, err
+	}
 	if (c.RDPCert == "") != (c.RDPKey == "") || (c.RDPCert != "" && c.RDP == "") {
 		return nil, ErrRDPOptions
 	}
@@ -139,6 +146,25 @@ func parseBootArgs(args []string) (*BootArgs, error) {
 	}
 
 	return c, nil
+}
+
+func selectUKIBootSource(cmd *flag.FlagSet, c *BootArgs) error {
+	if c.UKI == "" {
+		return nil
+	}
+	var explicitPayload bool
+	cmd.Visit(func(f *flag.Flag) {
+		if f.Name == "k" || f.Name == "i" {
+			explicitPayload = true
+		}
+	})
+	if c.ISO != "" || explicitPayload {
+		return ErrUKIBootSource
+	}
+	// The CLI's default kernel does not apply to an embedded UKI payload.
+	c.Kernel = ""
+
+	return nil
 }
 
 type ProbeArgs struct{}

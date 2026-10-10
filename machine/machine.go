@@ -1,7 +1,6 @@
 package machine
 
 import (
-	"bytes"
 	"debug/elf"
 	"encoding/binary"
 	"encoding/hex"
@@ -19,6 +18,7 @@ import (
 
 	"github.com/define42/gokvm/bootparam"
 	"github.com/define42/gokvm/ebda"
+	"github.com/define42/gokvm/internal/guestmem"
 	"github.com/define42/gokvm/internal/usernet"
 	"github.com/define42/gokvm/iodev"
 	"github.com/define42/gokvm/kvm"
@@ -34,7 +34,6 @@ const (
 	bootParamAddr = 0x10000
 	cmdlineAddr   = 0x20000
 
-	initrdAddr  = 0xf000000
 	highMemBase = 0x100000
 	bootStack   = 0x80000
 
@@ -206,19 +205,17 @@ func New(kvmPath string, nCpus int, memSize int) (_ *Machine, initErr error) {
 		return nil, err
 	}
 
-	err = kvm.SetUserMemoryRegion(m.vmFd, &kvm.UserspaceMemoryRegion{
-		Slot: 0, Flags: 0, GuestPhysAddr: 0, MemorySize: uint64(memSize),
-		UserspaceAddr: uint64(uintptr(unsafe.Pointer(&m.mem[0]))),
-	})
-	if err != nil {
+	if err := m.registerMemory(); err != nil {
 		return nil, err
 	}
 
-	// Poison memory.
-	// 0 is valid instruction and if you start running in the middle of all those
-	// 0's it is impossible to diagnore.
-	for i := highMemBase; i < len(m.mem); i += len(Poison) {
-		copy(m.mem[i:], Poison)
+	// Preserve diagnostic poison for small VMs. Large VMs remain demand-paged
+	// so creating a 6 GiB guest does not immediately commit 6 GiB of host RAM.
+	// In particular, never touch the reserved PCI MMIO hole.
+	if uint64(memSize) <= guestmem.MMIOStart {
+		for i := highMemBase; i < len(m.mem); i += len(Poison) {
+			copy(m.mem[i:], Poison)
+		}
 	}
 
 	return m, nil
@@ -376,6 +373,15 @@ func (m *Machine) RunData() []*kvm.RunData {
 }
 
 func (m *Machine) LoadPVH(kern, initrd io.ReaderAt, cmdline string) error {
+	if kern == nil {
+		return fmt.Errorf("%w: missing PVH kernel image", errBootImage)
+	}
+	if len(m.mem) < MinMemSize {
+		return ErrMemTooSmall
+	}
+	if err := validateCommandLine(cmdline, maxBootCommandLine); err != nil {
+		return err
+	}
 	// Set EDBA-Pointer
 	edbaval := uint32(bootparam.EBDAStart >> 4)
 	edbabytes := make([]byte, 4)
@@ -417,29 +423,41 @@ func (m *Machine) LoadPVH(kern, initrd io.ReaderAt, cmdline string) error {
 		return err
 	}
 
+	images, occupied, err := m.elfImages(fwElf)
+	if err != nil {
+		return err
+	}
 	ripAddr := fwElf.Entry
-
 	for _, entry := range fwElf.Progs {
-		switch entry.Type {
-		case elf.PT_LOAD:
-			_, err := entry.ReadAt(m.mem[entry.Paddr:], 0)
-			if err != nil && !errors.Is(err, io.EOF) {
-				return err
-			}
-		case elf.PT_NOTE:
-			if entry.Filesz == 0 {
-				return errPTNoteHasNoFSize
-			}
-
-			addr, _ := pvh.ParsePVHEntry(kern, entry)
-
-			if fwElf.Entry != uint64(addr) {
-				ripAddr = uint64(addr)
-			}
-		default:
-			// Other program header types are not loaded.
+		if entry.Type != elf.PT_NOTE {
+			continue
+		}
+		if entry.Filesz == 0 {
+			return errPTNoteHasNoFSize
+		}
+		if addr, err := pvh.ParsePVHEntry(kern, entry); err == nil {
+			ripAddr = uint64(addr)
 		}
 	}
+	if ripAddr >= guestmem.MMIOStart || !entryInImages(ripAddr, images) {
+		return fmt.Errorf("%w: PVH entry %#x is outside bootable low RAM", errBootImage, ripAddr)
+	}
+	rd, err := m.initrdImage(initrd, uint64(^uint32(0)), occupied)
+	if err != nil {
+		return err
+	}
+	for _, image := range images {
+		if err := m.readBootImage(image); err != nil {
+			return fmt.Errorf("PVH kernel: %w", err)
+		}
+	}
+	if initrd != nil {
+		if err := m.readBootImage(rd); err != nil {
+			return fmt.Errorf("PVH initrd: %w", err)
+		}
+	}
+	copy(m.mem[cmdlineAddr:], cmdline)
+	m.mem[cmdlineAddr+len(cmdline)] = 0
 
 	for _, cpu := range m.vcpuFds {
 		if err := pvh.InitRegs(cpu, ripAddr); err != nil {
@@ -454,16 +472,7 @@ func (m *Machine) LoadPVH(kern, initrd io.ReaderAt, cmdline string) error {
 	pvhstartinfo := pvh.NewStartInfo(bootparam.EBDAStart, cmdlineAddr)
 
 	if initrd != nil {
-		initrdSize, err := initrd.ReadAt(m.mem[initrdAddr:], 0)
-		if err != nil && initrdSize == 0 && !errors.Is(err, io.EOF) {
-			return fmt.Errorf("initrd: (%v, %w)", initrdSize, err)
-		}
-
-		// Load kernel command-line parameters
-		copy(m.mem[cmdlineAddr:], cmdline)
-		m.mem[cmdlineAddr+len(cmdline)] = 0 // for null terminated string
-
-		ramdiskmod := pvh.NewModListEntry(initrdAddr, uint64(initrdSize), 0)
+		ramdiskmod := pvh.NewModListEntry(rd.addr, rd.size, 0)
 
 		pvhstartinfo.NrModules += 1
 		pvhstartinfo.ModlistPAddr = pvh.PVHModlistStart
@@ -481,19 +490,9 @@ func (m *Machine) LoadPVH(kern, initrd io.ReaderAt, cmdline string) error {
 	}
 
 	memmapentries := make([]*pvh.HVMMemMapTableEntry, 0)
-
-	entry0 := pvh.NewMemMapTableEntry(0,
-		bootparam.EBDAStart,
-		bootparam.E820Ram)
-
-	memmapentries = append(memmapentries, entry0)
-
-	entry := pvh.NewMemMapTableEntry(
-		pvh.HighRAMStart,
-		uint64(len(m.mem)-pvh.HighRAMStart),
-		bootparam.E820Ram)
-
-	memmapentries = append(memmapentries, entry)
+	for _, entry := range m.memoryMap() {
+		memmapentries = append(memmapentries, pvh.NewMemMapTableEntry(entry.Addr, entry.Size, entry.Type))
+	}
 
 	pvhstartinfo.MemMapEntries = uint32(len(memmapentries))
 
@@ -524,7 +523,8 @@ func (m *Machine) LoadPVH(kern, initrd io.ReaderAt, cmdline string) error {
 	}
 
 	m.AddDevice(&iodev.FWDebug{}) // Port 0x402
-	m.AddDevice(iodev.NewCMOS(uint64(len(m.mem)), 0x0))
+	low, high := m.ramSizes()
+	m.AddDevice(iodev.NewCMOS(low, high))
 	m.AddDevice(iodev.NewACPIPMTimer())
 	m.initIOPortHandlers()
 
@@ -534,171 +534,18 @@ func (m *Machine) LoadPVH(kern, initrd io.ReaderAt, cmdline string) error {
 // LoadLinux loads a bzImage or ELF file, an optional initrd, and
 // optional params.
 func (m *Machine) LoadLinux(kernel, initrd io.ReaderAt, params string) error {
-	var (
-		DefaultKernelAddr = uint64(highMemBase)
-		err               error
-	)
-
-	e, err := ebda.New(len(m.vcpuFds))
+	entry, amd64, err := m.prepareLinuxBoot(kernel, initrd, params)
 	if err != nil {
 		return err
 	}
-
-	bytes, err := e.Bytes()
-	if err != nil {
+	if err := m.SetupRegs(entry, bootParamAddr, amd64); err != nil {
 		return err
 	}
-
-	copy(m.mem[bootparam.EBDAStart:], bytes)
-
-	// Load initrd
-	var initrdSize int
-	if initrd != nil {
-		initrdSize, err = initrd.ReadAt(m.mem[initrdAddr:], 0)
-		if err != nil && initrdSize == 0 && !errors.Is(err, io.EOF) {
-			return fmt.Errorf("initrd: (%v, %w)", initrdSize, err)
-		}
-	}
-
-	// Load kernel command-line parameters
-	copy(m.mem[cmdlineAddr:], params)
-	m.mem[cmdlineAddr+len(params)] = 0 // for null terminated string
-
-	// try to read as ELF. If it fails, no problem,
-	// next effort is to read as a bzimage.
-	var isElfFile bool
-
-	k, err := elf.NewFile(kernel)
-	if err == nil {
-		isElfFile = true
-	}
-
-	bootParam := &bootparam.BootParam{}
-
-	// might be a bzimage
-	if !isElfFile {
-		// Load Boot Param
-		bootParam, err = bootparam.New(kernel)
-		if err != nil {
-			return err
-		}
-	}
-
-	// refs https://github.com/kvmtool/kvmtool/blob/0e1882a49f81cb15d328ef83a78849c0ea26eecc/x86/bios.c#L66-L86
-	bootParam.AddE820Entry(
-		bootparam.RealModeIvtBegin,
-		bootparam.EBDAStart-bootparam.RealModeIvtBegin,
-		bootparam.E820Ram,
-	)
-	bootParam.AddE820Entry(
-		bootparam.EBDAStart,
-		bootparam.VGARAMBegin-bootparam.EBDAStart,
-		bootparam.E820Reserved,
-	)
-	bootParam.AddE820Entry(
-		bootparam.MBBIOSBegin,
-		bootparam.MBBIOSEnd-bootparam.MBBIOSBegin,
-		bootparam.E820Reserved,
-	)
-	if m.vesaEnabled && vesaFramebufferEnd <= uint64(len(m.mem)) {
-		bootParam.AddE820Entry(
-			highMemBase,
-			vesaFramebufferBase-highMemBase,
-			bootparam.E820Ram,
-		)
-		bootParam.AddE820Entry(
-			vesaFramebufferBase,
-			vesaFramebufferReserveSize,
-			bootparam.E820Reserved,
-		)
-		bootParam.AddE820Entry(
-			vesaFramebufferEnd,
-			uint64(len(m.mem))-vesaFramebufferEnd,
-			bootparam.E820Ram,
-		)
-	} else {
-		bootParam.AddE820Entry(
-			highMemBase,
-			uint64(len(m.mem)-highMemBase),
-			bootparam.E820Ram,
-		)
-	}
-
-	bootParam.Hdr.VidMode = 0xFFFF                                                                  // Proto ALL
-	bootParam.Hdr.TypeOfLoader = 0xFF                                                               // Proto 2.00+
-	bootParam.Hdr.RamdiskImage = initrdAddr                                                         // Proto 2.00+
-	bootParam.Hdr.RamdiskSize = uint32(initrdSize)                                                  // Proto 2.00+
-	bootParam.Hdr.LoadFlags |= bootparam.CanUseHeap | bootparam.LoadedHigh | bootparam.KeepSegments // Proto 2.00+
-	bootParam.Hdr.HeapEndPtr = 0xFE00                                                               // Proto 2.01+
-	bootParam.Hdr.ExtLoaderVer = 0                                                                  // Proto 2.02+
-	bootParam.Hdr.CmdlinePtr = cmdlineAddr                                                          // Proto 2.06+
-	bootParam.Hdr.CmdlineSize = uint32(len(params) + 1)                                             // Proto 2.06+
-
-	bytes, err = bootParam.Bytes()
-	if err != nil {
-		return err
-	}
-
-	copy(m.mem[bootParamAddr:], bytes)
-
-	var (
-		amd64    bool
-		kernSize int
-	)
-
-	switch isElfFile {
-	case false:
-		// Load kernel
-		// copy to g.mem with offset setupsz
-		//
-		// The 32-bit (non-real-mode) kernel starts at offset (setup_sects+1)*512 in
-		// the kernel file (again, if setup_sects == 0 the real value is 4.) It should
-		// be loaded at address 0x10000 for Image/zImage kernels and highMemBase for bzImage kernels.
-		//
-		// refs: https://www.kernel.org/doc/html/latest/x86/boot.html#loading-the-rest-of-the-kernel
-		setupsz := int(bootParam.Hdr.SetupSects+1) * 512
-
-		kernSize, err = kernel.ReadAt(m.mem[DefaultKernelAddr:], int64(setupsz))
-
-		if err != nil && !errors.Is(err, io.EOF) {
-			return fmt.Errorf("kernel: (%v, %w)", kernSize, err)
-		}
-	case true:
-		if k.Class == elf.ELFCLASS64 {
-			amd64 = true
-		}
-
-		DefaultKernelAddr = k.Entry
-
-		for i, p := range k.Progs {
-			if p.Type != elf.PT_LOAD {
-				continue
-			}
-
-			log.Printf("Load elf segment @%#x from file %#x %#x bytes", p.Paddr, p.Off, p.Filesz)
-
-			n, err := p.ReadAt(m.mem[p.Paddr:], 0)
-			if !errors.Is(err, io.EOF) || uint64(n) != p.Filesz {
-				return fmt.Errorf("reading ELF prog %d@%#x: %d/%d bytes, err %w", i, p.Paddr, n, p.Filesz, err)
-			}
-
-			kernSize += n
-		}
-	}
-
-	if kernSize == 0 {
-		return ErrZeroSizeKernel
-	}
-
-	if err := m.SetupRegs(DefaultKernelAddr, bootParamAddr, amd64); err != nil {
-		return err
-	}
-
 	if m.serial, err = serial.New(m); err != nil {
 		return err
 	}
-
-	m.AddDevice(iodev.NewCMOS(uint64(len(m.mem)), 0x0))
+	low, high := m.ramSizes()
+	m.AddDevice(iodev.NewCMOS(low, high))
 	m.AddDevice(&iodev.Noop{Port: 0x80, Psize: 0xA0})
 	m.initIOPortHandlers()
 	if m.vesaEnabled {
@@ -1279,20 +1126,20 @@ func (m *Machine) InjectVirtioInputPointerIRQ() error {
 
 // ReadAt implements io.ReadAt for the kvm guest pvh.
 func (m *Machine) ReadAt(b []byte, off int64) (int, error) {
-	mem := bytes.NewReader(m.mem)
+	if off < 0 || !guestmem.ValidRange(m.mem, uint64(off), uint64(len(b))) {
+		return 0, io.EOF
+	}
 
-	return mem.ReadAt(b, off)
+	return copy(b, m.mem[off:]), nil
 }
 
-// WriteAt implements io.WriteAt for the kvm guest pvh.
+// WriteAt implements io.WriterAt for guest RAM, excluding MMIO reservations.
 func (m *Machine) WriteAt(b []byte, off int64) (int, error) {
-	if off > int64(len(m.mem)) {
+	if off < 0 || !guestmem.ValidRange(m.mem, uint64(off), uint64(len(b))) {
 		return 0, syscall.EFBIG
 	}
 
-	n := copy(m.mem[off:], b)
-
-	return n, nil
+	return copy(m.mem[off:], b), nil
 }
 
 func showone(indent string, in interface{}) string {
@@ -1347,7 +1194,7 @@ func (m *Machine) VtoP(cpu int, vaddr uint64) (int64, error) {
 
 	// There can exist a valid translation for memory that does not exist.
 	// For now, we call that an error.
-	if t.Valid == 0 || t.PhysicalAddress > uint64(len(m.mem)) {
+	if t.Valid == 0 || !guestmem.ValidRange(m.mem, t.PhysicalAddress, 1) {
 		return -1, fmt.Errorf("%#x:valid not set:%w", vaddr, ErrBadVA)
 	}
 

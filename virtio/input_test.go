@@ -136,6 +136,71 @@ func TestInputKeyboardDeliversEvents(t *testing.T) {
 	}
 }
 
+func TestInputKeyboardShiftedPunctuation(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		keysym uint32
+		code   uint16
+	}{
+		{"exclamation", '!', key1},
+		{"at", '@', key2},
+		{"hash", '#', key3},
+		{"dollar", '$', key4},
+		{"percent", '%', key5},
+		{"caret", '^', key6},
+		{"ampersand", '&', key7},
+		{"asterisk", '*', key8},
+		{"left parenthesis", '(', key9},
+		{"right parenthesis", ')', key0},
+		{"underscore", '_', keyMinus},
+		{"plus", '+', keyEqual},
+		{"left brace", '{', keyLeftBrace},
+		{"right brace", '}', keyRightBrace},
+		{"pipe", '|', keyBackslash},
+		{"colon", ':', keySemicolon},
+		{"quote", '"', keyApostrophe},
+		{"tilde", '~', keyGrave},
+		{"less than", '<', keyComma},
+		{"greater than", '>', keyDot},
+		{"question", '?', keySlash},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			mem := make([]byte, 0x1000)
+			v := NewInputKeyboard(5, func() error { return nil }, mem)
+			q := newInputSplitQueue()
+			for i := range uint16(9) {
+				queueInputBuffer(q, i, 0x100+uint64(i)*inputEventLen)
+			}
+			v.QueueReady(inputEventQueue, q)
+			v.KeyEvent(true, 0xffe1) // Shift_L, supplied by the remote client.
+			v.KeyEvent(true, tc.keysym)
+			v.KeyEvent(false, tc.keysym)
+			v.KeyEvent(false, 0xffe1)
+			for i, ev := range []inputEvent{
+				{typ: evKey, code: keyLeftShift, value: 1},
+				synEvent(),
+				{typ: evKey, code: tc.code, value: 1},
+				synEvent(),
+				{typ: evKey, code: tc.code, value: 0},
+				synEvent(),
+				{typ: evKey, code: keyLeftShift, value: 0},
+				synEvent(),
+			} {
+				if err := v.flushEvents(); err != nil {
+					t.Fatalf("flush event %d: %v", i, err)
+				}
+				addr := 0x100 + i*inputEventLen
+				assertInputEvent(t, mem[addr:addr+inputEventLen], ev.typ, ev.code, ev.value)
+			}
+			if err := v.flushEvents(); !errors.Is(err, errNoInputEvent) || q.Used.Idx != 8 {
+				t.Fatalf("shifted punctuation produced extra events: used=%d, error=%v", q.Used.Idx, err)
+			}
+		})
+	}
+}
+
 func TestInputPointerDeliversRelativeButtonAndWheelEvents(t *testing.T) {
 	t.Parallel()
 

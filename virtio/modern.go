@@ -5,6 +5,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"unsafe"
+
+	"github.com/define42/gokvm/internal/guestmem"
 )
 
 // Modern (virtio 1.0) PCI transport.
@@ -449,7 +451,7 @@ func (t *ModernTransport) mapQueue(idx int) *SplitQueue {
 	// SplitQueue uses fixed-size views. Validate each entire view before
 	// taking an unsafe pointer, even when the driver selects a smaller ring.
 	valid := func(addr, size, align uint64) bool {
-		return addr%align == 0 && addr <= uint64(len(t.Mem)) && size <= uint64(len(t.Mem))-addr
+		return addr%align == 0 && guestmem.ValidRange(t.Mem, addr, size)
 	}
 	if q.size == 0 || q.size > QueueSize || q.size&(q.size-1) != 0 ||
 		!valid(q.desc, uint64(unsafe.Sizeof([QueueSize]SplitDesc{})), 16) ||

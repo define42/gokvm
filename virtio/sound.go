@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/define42/gokvm/internal/guestmem"
 	"github.com/define42/gokvm/pci"
 )
 
@@ -284,8 +285,8 @@ func (s *Sound) chain(q *SplitQueue, head uint16, limit int) ([][]byte, [][]byte
 		}
 		seen[head] = true
 		d := q.Desc[head]
-		if d.Flags & ^uint16(descFNext|descFWrite) != 0 || d.Addr > uint64(len(s.Mem)) ||
-			uint64(d.Len) > uint64(len(s.Mem))-d.Addr {
+		if d.Flags & ^uint16(descFNext|descFWrite) != 0 ||
+			!guestmem.ValidRange(s.Mem, d.Addr, uint64(d.Len)) {
 			return nil, nil, 0, 0, false
 		}
 		segment := s.Mem[d.Addr : d.Addr+uint64(d.Len)]

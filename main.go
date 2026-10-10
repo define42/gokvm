@@ -21,6 +21,7 @@ func main() {
 			Kernel:         bootArgs.Kernel,
 			Initrd:         bootArgs.Initrd,
 			ISO:            bootArgs.ISO,
+			UKI:            bootArgs.UKI,
 			Params:         bootArgs.Params,
 			ParamsSet:      bootArgs.ParamsSet,
 			TapIfName:      bootArgs.TapIfName,

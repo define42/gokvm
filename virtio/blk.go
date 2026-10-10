@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/define42/gokvm/disk"
+	"github.com/define42/gokvm/internal/guestmem"
 	"github.com/define42/gokvm/pci"
 )
 
@@ -299,7 +300,7 @@ func (v *Blk) snapshotRequest(q *SplitQueue, queueSize, descID uint16, c *blkPen
 		}
 		seen[descID] = true
 		desc := q.Desc[descID]
-		if desc.Addr > uint64(len(v.Mem)) || uint64(desc.Len) > uint64(len(v.Mem))-desc.Addr ||
+		if !guestmem.ValidRange(v.Mem, desc.Addr, uint64(desc.Len)) ||
 			(j == 0 && desc.Len < 16) {
 			return ErrBlkDesc
 		}

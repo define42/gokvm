@@ -1,6 +1,7 @@
 GOLANGCI_LINT_VERSION = v2.12.2
 
 GO ?= $(shell go env GOROOT)/bin/go
+NETDESK_UKI ?= ../NetDesk/dist/netdesk.efi
 RDP_CLIENT ?= $(shell if [ -x ./tools/freerdp/bin/xfreerdp ]; then \
 	printf '%s\n' ./tools/freerdp/bin/xfreerdp; \
 	else command -v xfreerdp3 2>/dev/null || command -v xfreerdp 2>/dev/null; fi)
@@ -119,6 +120,12 @@ slax: generate
 	CGO_ENABLED=0 $(GO) build -o gokvm .
 	./gokvm boot -iso ./slax.iso -c 4 -m 2G -net user -rdp 127.0.0.1:3390 \
 		-rdp-h264 -rdp-h264-threads 4
+
+.PHONY: netdesk
+netdesk: generate
+	CGO_ENABLED=0 $(GO) build -o gokvm .
+	./gokvm boot -uki "$(NETDESK_UKI)" -c 2 -m 6G -net user -rdp 127.0.0.1:3390 \
+		-rdp-h264 -rdp-h264-threads 2
 
 .PHONY: freerdp
 freerdp:

@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/define42/gokvm/internal/guestmem"
 	"github.com/define42/gokvm/pci"
 )
 
@@ -260,8 +261,7 @@ func (v *Net) rxBuffers(q *SplitQueue, head uint16) ([][]byte, int, error) {
 		}
 		desc := q.Desc[descID]
 		if desc.Flags&descFWrite == 0 || desc.Flags & ^uint16(descFWrite|descFNext) != 0 ||
-			desc.Addr > uint64(len(v.Mem)) ||
-			uint64(desc.Len) > uint64(len(v.Mem))-desc.Addr {
+			!guestmem.ValidRange(v.Mem, desc.Addr, uint64(desc.Len)) {
 			return nil, 0, ErrNetDesc
 		}
 		buffers = append(buffers, v.Mem[desc.Addr:desc.Addr+uint64(desc.Len)])
@@ -352,8 +352,8 @@ func (v *Net) Tx() error {
 			}
 			seen[descID] = true
 			desc := q.Desc[descID]
-			if desc.Flags & ^uint16(descFNext) != 0 || desc.Addr > uint64(len(v.Mem)) ||
-				uint64(desc.Len) > uint64(len(v.Mem))-desc.Addr || int(desc.Len) > cap(buf)-len(buf) {
+			if desc.Flags & ^uint16(descFNext) != 0 ||
+				!guestmem.ValidRange(v.Mem, desc.Addr, uint64(desc.Len)) || int(desc.Len) > cap(buf)-len(buf) {
 				return ErrNetDesc
 			}
 			buf = append(buf, v.Mem[desc.Addr:desc.Addr+uint64(desc.Len)]...)

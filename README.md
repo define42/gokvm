@@ -18,7 +18,8 @@ console, and VNC/RDP desktops for exploring virtualization from user space.
   to `/dev/kvm`. Nested hosts must expose KVM to the environment running gokvm.
 - Go 1.26.0 or newer to build from source, plus Git to clone the repository.
   A C compiler and native codec libraries are not needed to build gokvm.
-- A Linux kernel and optional initrd, or a supported Linux live ISO. VNC and RDP
+- A Linux kernel and optional initrd, a supported Linux live ISO, or an x86-64
+  Unified Kernel Image (UKI). VNC and RDP
   also require a client on the machine where you want to view the guest.
 
 ### Installation
@@ -73,7 +74,7 @@ already built kernel.
 
 | Area | Support |
 | --- | --- |
-| CPU and boot | KVM acceleration, multiple vCPUs, direct Linux and PVH boot, Linux ISO discovery through El Torito and boot configs |
+| CPU and boot | KVM acceleration, multiple vCPUs, direct Linux and PVH boot, x86-64 UKI loading, Linux ISO discovery through El Torito and boot configs |
 | Storage | Modern virtio-blk, writable raw/qcow2 disks, read-only ISO media |
 | Networking | Modern virtio-net, built-in IPv4 DHCP/DNS and outbound TCP/UDP, or a host-managed TAP interface |
 | Display and input | Modern virtio-gpu 2D framebuffer, PNG output, VNC/RDP keyboard and mouse input |
@@ -93,7 +94,8 @@ flags; there is no VM configuration file.
 | `-k path` | `./bzImage` | Linux kernel image; PVH is detected automatically. |
 | `-i path` | Unset | Optional initrd for direct kernel boot. |
 | `-iso path-or-url` | Unset | Linux ISO path or HTTP(S) URL; takes precedence over `-k` and `-i`. |
-| `-p parameters` | Built-in kernel command line | Replace the kernel command line; ISO boot otherwise uses its boot config plus gokvm defaults. |
+| `-uki path-or-url` | Unset | x86-64 Unified Kernel Image; cannot be combined with `-iso`, `-k`, or `-i`. |
+| `-p parameters` | Built-in kernel command line | Replace the kernel command line; ISO/UKI boot otherwise uses the image's arguments plus gokvm defaults. |
 | `-c count` | `1` | Number of guest vCPUs, from 1 to 64. |
 | `-m size` | `1G` | Guest RAM; `K`, `M`, and `G` use binary units. Unitless values mean GiB. |
 | `-d path` | Unset | Existing writable raw or qcow2 disk, exposed as `/dev/vda`. |
@@ -137,6 +139,46 @@ file for the lifetime of the VM; it is not cached between runs. For example:
 ./gokvm boot -iso http://www.tinycorelinux.net/17.x/x86/release/TinyCore-current.iso \
   -m 512M -vnc 127.0.0.1:5900
 ```
+
+Boot a [NetDesk](https://github.com/define42/NetDesk) Unified Kernel Image:
+
+```bash
+./gokvm boot -uki ./netdesk.efi -m 6G -c 2 -net user \
+  -rdp 127.0.0.1:3390
+```
+
+Connect an RDP client to `127.0.0.1:3390`, or replace `-rdp` with
+`-vnc 127.0.0.1:5900` for VNC. The image contains the complete desktop and
+needs no attached disk. Six GiB matches NetDesk's reference VM configuration;
+allow additional host memory for gokvm and other applications.
+
+For a local NetDesk checkout, `make netdesk` builds gokvm and boots
+`../NetDesk/dist/netdesk.efi` with 6 GiB RAM, two vCPUs, user networking, and
+H.264 RDP on `127.0.0.1:3390`. Connect with `make rdp` in another terminal.
+Use `make netdesk NETDESK_UKI=/path/to/netdesk.efi` to select another image.
+
+`-uki` reads a single-profile x86-64 PE32+ UKI's `.linux`, `.initrd`, and optional
+`.cmdline` sections, then boots the embedded Linux bzImage directly. It does not
+execute the EFI stub, provide UEFI services, or verify Secure Boot signatures.
+Arbitrary EFI programs and UKIs that depend on EFI-stub features are unsupported.
+The embedded command line is combined with gokvm's direct-boot defaults; an
+explicit `-p` replaces it entirely. Kernel and initramfs payloads stream directly
+into guest RAM. HTTP(S) URLs are also accepted; downloaded UKIs are removed once
+their payloads have been loaded.
+
+Guests larger than 3.25 GiB use separate low and high RAM regions, with the PCI
+device address space reserved below 4 GiB. The requested `-m` size is RAM, so the
+device address hole does not reduce it.
+
+To run the optional NetDesk desktop smoke test with a local image and `/dev/kvm`:
+
+```bash
+GOKVM_NETDESK_UKI=/path/to/netdesk.efi go test -tags=integration ./vmm \
+  -run '^TestNetDeskUKIDesktopBoot$' -timeout 6m -v
+```
+
+The test checks NetDesk's desktop readiness, graphics, VNC pointer and keyboard
+input, and Chromium access to a local HTTP server through the guest network.
 
 Attach an existing raw or qcow2 disk with `-d`:
 
@@ -188,9 +230,9 @@ no native H.264 library.
 With `make slax` running, use `make rdp` in another terminal to open FreeRDP and
 connect to `127.0.0.1:3390` with automatic resizing. Run `make freerdp` first to
 build the local H.264 client using the [dependencies below](#h264-graphics).
-`make rdp` prefers `tools/freerdp/bin/xfreerdp` and enables AVC420. Without the
-local build, it finds `xfreerdp3` or `xfreerdp` on your PATH and reports a fallback
-to bitmap updates if that client lacks H.264. To use a custom client, run
+`make rdp` prefers `tools/freerdp/bin/xfreerdp` and requires H.264 AVC420 support.
+Without the local build, it finds `xfreerdp3` or `xfreerdp` on your PATH and exits
+with an error if that client lacks H.264. To use a custom client, run
 `make rdp RDP_CLIENT=/path/to/xfreerdp`. The local connection accepts the
 console's self-signed TLS certificate.
 
@@ -368,7 +410,7 @@ To build FreeRDP 3.32.1 locally with OpenH264 decoding, install the following
 build dependencies on Debian or Ubuntu:
 
 ```bash
-sudo apt install build-essential cmake curl pkg-config libssl-dev libopenh264-dev \
+sudo apt install build-essential cmake curl pkg-config libssl-dev libicu-dev libopenh264-dev \
   libx11-dev libxext-dev libxfixes-dev libxrandr-dev libxrender-dev libxcursor-dev \
   libxi-dev libxinerama-dev libxkbfile-dev libasound2-dev libpulse-dev libxv-dev \
   zlib1g-dev

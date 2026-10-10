@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/define42/gokvm/internal/guestmem"
 	"golang.org/x/image/font"
 	"golang.org/x/image/font/basicfont"
 	"golang.org/x/image/math/fixed"
@@ -215,7 +216,8 @@ func (d *framebuffer) StartVGATextFallback(mem []byte) {
 // GPU supplies a frame. Guest memory must remain valid until display closure.
 func (d *framebuffer) StartLinearFramebufferFallback(mem []byte, base, width, height, stride int) {
 	if base < 0 || base > len(mem) || width <= 0 || height <= 0 ||
-		stride <= 0 || width > stride/4 || height > (len(mem)-base)/stride {
+		stride <= 0 || width > stride/4 || height > (len(mem)-base)/stride ||
+		!guestmem.ValidRange(mem, uint64(base), uint64(stride*height)) {
 		return
 	}
 

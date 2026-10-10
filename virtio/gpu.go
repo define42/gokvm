@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/define42/gokvm/internal/guestmem"
 	"github.com/define42/gokvm/pci"
 )
 
@@ -455,8 +456,8 @@ func (g *GPU) collectChain(q *SplitQueue, head uint16) ([]byte, []writableSeg) {
 		}
 		visited[descID] = true
 		desc := q.Desc[descID]
-		if desc.Flags & ^uint16(descFWrite|descFNext) != 0 || desc.Addr > uint64(len(g.Mem)) ||
-			uint64(desc.Len) > uint64(len(g.Mem))-desc.Addr {
+		if desc.Flags & ^uint16(descFWrite|descFNext) != 0 ||
+			!guestmem.ValidRange(g.Mem, desc.Addr, uint64(desc.Len)) {
 			return nil, nil
 		}
 
@@ -496,7 +497,7 @@ func (g *GPU) writeResponse(wr []writableSeg, resp []byte) uint32 {
 		}
 
 		end := seg.addr + n
-		if seg.addr < uint64(len(g.Mem)) && end <= uint64(len(g.Mem)) {
+		if guestmem.ValidRange(g.Mem, seg.addr, n) {
 			copy(g.Mem[seg.addr:end], resp[:n])
 		}
 
@@ -802,7 +803,7 @@ func (g *GPU) backingRead(res *gpuResource, off uint64, dst []byte) {
 			}
 
 			src := e.addr + skip
-			if src+n <= uint64(len(g.Mem)) {
+			if guestmem.ValidRange(g.Mem, src, n) {
 				copy(dst[:n], g.Mem[src:src+n])
 			}
 
@@ -842,7 +843,7 @@ func (g *GPU) cmdResourceAttachBacking(req []byte) []byte {
 		}
 
 		addr, length := le.Uint64(req[off:]), le.Uint32(req[off+8:])
-		if addr > uint64(len(g.Mem)) || uint64(length) > uint64(len(g.Mem))-addr {
+		if !guestmem.ValidRange(g.Mem, addr, uint64(length)) {
 			return g.respNoData(gpuRespErrInvalidParameter)
 		}
 		entries = append(entries, gpuMemEntry{addr: addr, length: length})

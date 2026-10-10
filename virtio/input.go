@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/define42/gokvm/internal/guestmem"
 	"github.com/define42/gokvm/pci"
 )
 
@@ -551,7 +552,7 @@ func (d *InputDevice) writeEvent(q *SplitQueue, head uint16, ev inputEvent) (uin
 			}
 
 			end := desc.Addr + uint64(n)
-			if n > 0 && desc.Addr < uint64(len(d.Mem)) && end <= uint64(len(d.Mem)) {
+			if n > 0 && guestmem.ValidRange(d.Mem, desc.Addr, uint64(n)) {
 				copy(d.Mem[desc.Addr:end], raw[written:written+n])
 				written += n
 			}
@@ -902,6 +903,29 @@ func inputKeyCode(keysym uint32) (uint16, bool) {
 		',':    keyComma,
 		'.':    keyDot,
 		'/':    keySlash,
+		// VNC/RDP send modifier transitions separately. Shifted keysyms
+		// still identify the same physical key on the US keyboard.
+		'!': key1,
+		'@': key2,
+		'#': key3,
+		'$': key4,
+		'%': key5,
+		'^': key6,
+		'&': key7,
+		'*': key8,
+		'(': key9,
+		')': key0,
+		'_': keyMinus,
+		'+': keyEqual,
+		'{': keyLeftBrace,
+		'}': keyRightBrace,
+		'|': keyBackslash,
+		':': keySemicolon,
+		'"': keyApostrophe,
+		'~': keyGrave,
+		'<': keyComma,
+		'>': keyDot,
+		'?': keySlash,
 	}[keysym]
 
 	return code, ok
